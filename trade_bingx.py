@@ -529,4 +529,7 @@ with app:
     print("LOGGED AS:", me.id, me.first_name, me.username)
  
     
-app.run()
+if __name__ == "__main__":
+    log("BOOT", "Bot started")
+    app.run()
+

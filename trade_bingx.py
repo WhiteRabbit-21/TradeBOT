@@ -38,8 +38,17 @@ DRY_RUN = False #true не відправляє ордери, False-відпра
 # ---------- TG ----------
 api_id = int(os.getenv("TG_API_ID"))
 api_hash = os.getenv("TG_API_HASH")
+tg_session = os.getenv("TG_SESSION_STRING")
 
-app = Client("my_account_session", api_id=api_id, api_hash=api_hash)
+if not tg_session:
+    raise ValueError("TG_SESSION_STRING is missing in env")
+
+app = Client(
+    name="tradebot",
+    api_id=api_id,
+    api_hash=api_hash,
+    session_string=tg_session,  # <-- ключове
+)
 # ---------- BINGX ----------
 BINGX_API_KEY = os.getenv("BINGX_API_KEY")
 BINGX_API_SECRET = os.getenv("BINGX_API_SECRET")
@@ -236,7 +245,6 @@ def parse_new_signal(text: str) -> NewSignal | None:
         side=side, base=base, sl=sl, lev=lev, risk_pct=risk_pct,
         tp_price=tp_price, tp_rr=tp_rr, tp_pct=tp_pct
     )
-
 
 
 def validate_sl_tp(side: str, price: float, sl: float, tp: float) -> bool:
@@ -516,6 +524,9 @@ def on_channel(client, message):
     except Exception as e:
         log("ERROR", f"Trade failed: {e}")
 
-    
+with app:
+    me = app.get_me()
+    print("LOGGED AS:", me.id, me.first_name, me.username)
+ 
     
 app.run()

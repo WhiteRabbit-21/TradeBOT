@@ -31,6 +31,8 @@ def log(status, msg=""):
 
 load_dotenv()
 
+TARGET_CHANNEL_ID = int(os.getenv("TARGET_CHANNEL_ID"))
+
 DRY_RUN = False #true не відправляє ордери, False-відправляє
 
 # ---------- TG ----------
@@ -387,24 +389,20 @@ def place_sl_tp_market_oneway(symbol: str, entry_side: str, qty: float, sl: floa
 # ---------- SAVED MESSAGES FILTER ----------
 MY_ID = None  # визначимо один раз
 
-@app.on_message(filters.private & filters.me)  # ти відправляєш собі повідомлення у Saved
-def on_saved(client, message):
-    global MY_ID
-    if MY_ID is None:
-        me = client.get_me()
-        MY_ID = me.id
-        log("ME", f"Logged as {me.first_name} (@{me.username}), my_id={MY_ID}")
-        log("START", "Listening ONLY Saved Messages...")
-
-    # Saved Messages має chat.id == твоєму user_id
-    if message.chat.id != MY_ID:
-        return
-
+@app.on_message(filters.chat(TARGET_CHANNEL_ID))
+def on_channel(client, message):
     text = message.text or message.caption or ""
+
+    # --- лог базовий (щоб бачити що реально прилетіло) ---
+    log("MSG", f"Channel({message.chat.id}) msg: {text[:120]}")
+
+    if not text.strip():
+        log("SKIP", "Empty message")
+        return
 
     # ==== CLOSE SIGNAL CHECK ====
     base_to_close = parse_close_signal(text)
-    log("CLOSE_DBG", f"text='{text}' -> base_to_close={base_to_close}")
+    log("CLOSE_DBG", f"base_to_close={base_to_close}")
 
     if base_to_close:
         log("PARSE", f"CLOSE detected: {base_to_close}")
@@ -416,8 +414,7 @@ def on_saved(client, message):
         close_position_full_oneway(base_to_close)
         return
 
-    log("MSG", f"Saved message: {text[:80]}")
-
+    # ==== NEW SIGNAL PARSE ====
     sig = parse_new_signal(text)
     if not sig:
         log("SKIP", "Not a NEW signal format")
@@ -425,13 +422,14 @@ def on_saved(client, message):
 
     log("PARSE", f"{sig.side.upper()} {sig.base} SL={sig.sl} Lev={sig.lev} Risk={sig.risk_pct}%")
 
+    # ==== resolve symbol ====
     symbol = resolve_symbol(sig.base)
     if not symbol:
         log("ERROR", f"Symbol not found on BingX swap: {sig.base}/USDT")
         return
     log("SYMBOL", symbol)
 
-    # --- fetch price ---
+    # ==== fetch price ====
     try:
         ticker = exchange.fetch_ticker(symbol)
         price = float(ticker["last"])
@@ -440,7 +438,7 @@ def on_saved(client, message):
         log("ERROR", f"fetch_ticker failed: {e}")
         return
 
-    # ====== RR / % TP ======
+    # ====== RR / % / PRICE TP ======
     entry = price
     tp_final = None
 
@@ -460,16 +458,20 @@ def on_saved(client, message):
         log("SKIP", "TP is missing (no price/rr/%)")
         return
 
-    tp_final = float(exchange.price_to_precision(symbol, tp_final))
-    log("TP", f"tp_prec={tp_final}")
-    # =========================
+    # округлюємо TP під біржу
+    try:
+        tp_final = float(exchange.price_to_precision(symbol, tp_final))
+        log("TP", f"tp_prec={tp_final}")
+    except Exception as e:
+        log("ERROR", f"price_to_precision failed: {e}")
+        return
 
-    # ТЕПЕР перевіряємо SL/TP (використовуємо tp_final!)
+    # ==== validate SL/TP vs entry ====
     if not validate_sl_tp(sig.side, entry, sig.sl, tp_final):
         log("SKIP", f"Bad SL/TP vs price. price={entry} SL={sig.sl} TP={tp_final}")
         return
 
-    # --- balance & qty ---
+    # ==== balance & qty ====
     try:
         usdt_free = get_usdt_free()
         qty = calc_qty(usdt_free, sig.risk_pct, sig.lev, entry)
@@ -479,7 +481,7 @@ def on_saved(client, message):
         log("ERROR", f"balance/qty failed: {e}")
         return
 
-    # Округлення під крок біржі
+    # ==== precision qty ====
     try:
         qty = float(exchange.amount_to_precision(symbol, qty))
         log("QTY", f"qty_prec={qty}")
@@ -491,20 +493,23 @@ def on_saved(client, message):
         log("SKIP", "qty became 0 after precision (too small risk% or wrong balance)")
         return
 
+    # ==== DRY RUN ====
     if DRY_RUN:
         log("DRY_RUN", "Order NOT sent (test mode)")
         return
 
-    # фактичне відкриття угоди
+    # ==== EXECUTE TRADE ====
     try:
+        # leverage
         log("LEV", f"Setting leverage x{sig.lev}")
         set_leverage(symbol, sig.lev)
 
+        # open position
         log("ORDER", f"Opening {sig.side.upper()} {symbol} qty={qty}")
         resp = open_market(symbol, sig.side, qty)
         log("SUCCESS", f"Order placed id={resp.get('id')}")
 
-        # ставимо захист (використовуємо tp_final!)
+        # protective orders
         sl_order, tp_order = place_sl_tp_market_oneway(symbol, sig.side, qty, sig.sl, tp_final)
         log("PROTECT", f"SL id={sl_order.get('id')} | TP id={tp_order.get('id')}")
 

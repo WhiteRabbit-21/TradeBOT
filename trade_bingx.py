@@ -438,6 +438,8 @@ def on_channel(client, message):
 
 
 # ===================== MAIN =====================
+import time
+
 if __name__ == "__main__":
     log("BOOT", "Bot starting...")
 
@@ -447,14 +449,10 @@ if __name__ == "__main__":
         log("ME", f"LOGGED AS: {me.id} {me.first_name} @{me.username}")
         log("RUN", f"Listening channel_id={TARGET_CHANNEL_ID} ...")
 
-        # Баланс печатаем уже после старта (и не даем упасть всему процессу)
-        try:
-            usdt_free = get_usdt_free()
-            log("BAL", f"USDT free={usdt_free}")
-        except Exception as e:
-            log("BAL_ERR", str(e))
-
-        idle()
+        # heartbeat чтобы точно видеть что живой
+        while True:
+            time.sleep(60)
+            log("HB", "alive")
 
     except Exception as e:
         log("FATAL", f"Startup crashed: {e}")
@@ -466,3 +464,4 @@ if __name__ == "__main__":
             log("STOP", "Client stopped")
         except Exception:
             pass
+

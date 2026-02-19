@@ -524,12 +524,20 @@ def on_channel(client, message):
     except Exception as e:
         log("ERROR", f"Trade failed: {e}")
 
-with app:
-    me = app.get_me()
-    print("LOGGED AS:", me.id, me.first_name, me.username)
- 
-    
 if __name__ == "__main__":
-    log("BOOT", "Bot started")
-    app.run()
+    log("BOOT", "Bot starting...")
+
+    try:
+        me = app.get_me()
+        log("ME", f"LOGGED AS: {me.id} {me.first_name} @{me.username}")
+    except Exception as e:
+        log("ME_ERR", f"get_me failed: {e}")
+
+    try:
+        app.run()
+        log("EXIT", "app.run() returned (process is exiting)")
+    except Exception as e:
+        log("FATAL", f"app.run crashed: {e}")
+        raise
+
 

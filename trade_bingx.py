@@ -5,6 +5,7 @@ import os
 from pyrogram import Client, filters
 import ccxt
 from dotenv import load_dotenv
+from pyrogram import idle
 
 load_dotenv()
 
@@ -528,16 +529,23 @@ if __name__ == "__main__":
     log("BOOT", "Bot starting...")
 
     try:
+        app.start()  # запускаємо клієнт
+
         me = app.get_me()
         log("ME", f"LOGGED AS: {me.id} {me.first_name} @{me.username}")
-    except Exception as e:
-        log("ME_ERR", f"get_me failed: {e}")
 
-    try:
-        app.run()
-        log("EXIT", "app.run() returned (process is exiting)")
+        log("RUN", "Client started, waiting for messages...")
+
+        idle()  # тримає процес живим
+
     except Exception as e:
-        log("FATAL", f"app.run crashed: {e}")
+        log("FATAL", f"Startup crashed: {e}")
         raise
+    finally:
+        try:
+            app.stop()
+            log("STOP", "Client stopped")
+        except Exception:
+            pass
 
 

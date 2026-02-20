@@ -126,19 +126,21 @@ if ENABLE_SAVED:
 
 
 # -------------------- RUN --------------------
+from pyrogram import idle
+
 if __name__ == "__main__":
     log("BOOT", "Bot starting...")
-    log("ENV", f"TG_API_ID={TG_API_ID} TG_API_HASH={'YES' if TG_API_HASH else 'NO'} "
-               f"TG_SESSION_STRING={'YES' if TG_SESSION_STRING else 'NO'} TG_BOT_TOKEN={'YES' if TG_BOT_TOKEN else 'NO'}")
-    log("ENV", f"TARGET_CHANNEL_ID={TARGET_CHANNEL_ID} ENABLE_SAVED={ENABLE_SAVED}")
 
     try:
         print("Before start()")
         app.start()
         print("After start()")
-        idle()
+
+        idle()  # <-- ОСЬ ГОЛОВНЕ
+
         print("After idle()")
         app.stop()
+
     except Exception as e:
         log("FATAL", f"app crashed: {e}")
         raise

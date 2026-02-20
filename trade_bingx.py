@@ -2,7 +2,7 @@ import os
 import sys
 from datetime import datetime
 from dotenv import load_dotenv
-
+from pyrogram import idle
 from pyrogram import Client, filters
 
 load_dotenv()
@@ -133,9 +133,12 @@ if __name__ == "__main__":
     log("ENV", f"TARGET_CHANNEL_ID={TARGET_CHANNEL_ID} ENABLE_SAVED={ENABLE_SAVED}")
 
     try:
-        print("Before run()")
-        app.run()
-        print("After run()")
+        print("Before start()")
+        app.start()
+        print("After start()")
+        idle()
+        print("After idle()")
+        app.stop()
     except Exception as e:
-        log("FATAL", f"app.run() crashed: {e}")
+        log("FATAL", f"app crashed: {e}")
         raise

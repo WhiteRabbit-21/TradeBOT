@@ -449,11 +449,14 @@ import time
 if __name__ == "__main__":
     log("BOOT", "Bot starting...")
 
-    # 1) перевіряємо, що заданий ID чату/каналу
-    if TARGET_CHANNEL_ID is None:
-        raise ValueError("TARGET_CHANNEL_ID is not set. Add it to .env / Railway Variables")
+    try:
+        if TARGET_CHANNEL_ID is None:
+            log("RUN", "Listening Saved Messages only (TARGET_CHANNEL_ID not set)")
+        else:
+            log("RUN", f"Listening TARGET_CHANNEL_ID={TARGET_CHANNEL_ID} ...")
 
-    log("RUN", f"Listening TARGET_CHANNEL_ID={TARGET_CHANNEL_ID} ...")
+        app.run()
 
-    # 2) запускаємо pyrogram (тримає процес живим)
-    app.run()
+    except Exception as e:
+        log("FATAL", f"app.run() crashed: {e}")
+        raise

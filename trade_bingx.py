@@ -123,7 +123,9 @@ if __name__ == "__main__":
     log("ENV", f"TARGET_CHANNEL_ID={TARGET_CHANNEL_ID} ENABLE_SAVED={ENABLE_SAVED}")
 
     try:
+        print("Before run()")
         app.run()
+        print("After run()")
     except Exception as e:
         log("FATAL", f"app.run() crashed: {e}")
         raise

@@ -1,7 +1,9 @@
+import os
 import re
+import time
+import traceback
 from dataclasses import dataclass
 from datetime import datetime
-import os
 
 import ccxt
 from dotenv import load_dotenv
@@ -13,39 +15,59 @@ load_dotenv()
 
 def must_env(name: str) -> str:
     v = os.getenv(name)
-    if not v:
+    if v is None or v == "":
         raise ValueError(f"Missing env var: {name}")
     return v
 
+def env_flag(name: str) -> str:
+    return "YES" if os.getenv(name) else "NO"
+
+def env_preview(name: str) -> str:
+    v = os.getenv(name)
+    if not v:
+        return "None"
+    return v[:6] + "…" if len(v) > 6 else v
+
+def parse_bool_env(name: str, default: bool = True) -> bool:
+    v = os.getenv(name)
+    if v is None:
+        return default
+    return v.strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+# ===================== LOG =====================
 LOG_DIR = "logs"
 os.makedirs(LOG_DIR, exist_ok=True)
 today = datetime.now().strftime("%Y-%m-%d")
 LOG_FILE = os.path.join(LOG_DIR, f"trade_{today}.txt")
 
-DRY_RUN = False  # True = не отправляет ордера
+def log(status, msg=""):
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    line = f"[{now}] [{status}] {msg}"
+    print(line, flush=True)
+    try:
+        with open(LOG_FILE, "a", encoding="utf-8") as f:
+            f.write(line + "\n")
+    except Exception as e:
+        print("LOG WRITE ERROR:", e, flush=True)
+
+
+# ===================== CONFIG =====================
+DRY_RUN = parse_bool_env("DRY_RUN", default=True)
+HEARTBEAT_SEC = int(os.getenv("HEARTBEAT_SEC", "300"))
 
 # TG
 api_id = int(must_env("TG_API_ID"))
 api_hash = must_env("TG_API_HASH")
 tg_session = must_env("TG_SESSION_STRING")
 
-TARGET_CHANNEL_ID = int(must_env("TARGET_CHANNEL_ID"))
+# Channel ID (optional: якщо нема — канал-хендлер не вмикається)
+TARGET_CHANNEL_ID_RAW = os.getenv("TARGET_CHANNEL_ID")
+TARGET_CHANNEL_ID = int(TARGET_CHANNEL_ID_RAW) if TARGET_CHANNEL_ID_RAW else None
 
 # BingX
 BINGX_API_KEY = must_env("BINGX_API_KEY")
 BINGX_API_SECRET = must_env("BINGX_API_SECRET")
-
-
-# ===================== LOG =====================
-def log(status, msg=""):
-    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    line = f"[{now}] [{status}] {msg}"
-    print(line)
-    try:
-        with open(LOG_FILE, "a", encoding="utf-8") as f:
-            f.write(line + "\n")
-    except Exception as e:
-        print("LOG WRITE ERROR:", e)
 
 
 # ===================== PYROGRAM CLIENT =====================
@@ -55,56 +77,6 @@ app = Client(
     api_hash=api_hash,
     session_string=tg_session,
 )
-
-
-# ===================== TRIGGERS / PATTERNS =====================
-CLOSE_TRIGGERS = [
-    r"\btake\s*profit\b",
-    r"\btp\s*hit\b",
-    r"\btp\s*reached\b",
-    r"\bclose\b",
-    r"\bexit\b",
-    r"\bclosing\b",
-    r"\bsecured\s*profit\b",
-    r"\bachieved\b",
-]
-
-SYMBOL_PATTERNS = [
-    r"\bCLOSE\s+([A-Z]{2,10})USDT\b",       # close UNIUSDT
-    r"\bCLOSE\s+([A-Z]{2,10})\b",           # close UNI
-    r"\bTP\s+([A-Z]{2,10})\b",              # TP UNI
-    r"\bIN\s+([A-Z]{2,10})\b",              # in UNI
-    r"\bON\s+([A-Z]{2,10})\b",              # on UNI
-    r"#\s*([A-Z]{2,10})USDT\b",             # #UNIUSDT
-    r"\b(LONG|SHORT)\s+([A-Z0-9._-]{2,15})\b",
-    r"\b([A-Z]{2,10})USDT\b",               # UNIUSDT
-]
-
-
-def parse_close_signal(text: str):
-    if not text:
-        return None
-
-    if not any(re.search(p, text, flags=re.I) for p in CLOSE_TRIGGERS):
-        return None
-
-    for p in SYMBOL_PATTERNS:
-        m = re.search(p, text, flags=re.I)
-        if not m:
-            continue
-
-        if len(m.groups()) == 2 and m.group(2):
-            sym = m.group(2)
-        else:
-            sym = m.group(1)
-
-        sym = sym.strip().upper()
-        if sym in {"TP", "IN", "ON", "LONG", "SHORT", "CLOSE"}:
-            continue
-
-        return sym
-
-    return None
 
 
 # ===================== EXCHANGE =====================
@@ -149,7 +121,54 @@ def resolve_symbol(base: str, quote: str = "USDT") -> str | None:
     return None
 
 
-# ===================== SIGNAL PARSER =====================
+# ===================== PARSERS =====================
+CLOSE_TRIGGERS = [
+    r"\btake\s*profit\b",
+    r"\btp\s*hit\b",
+    r"\btp\s*reached\b",
+    r"\bclose\b",
+    r"\bexit\b",
+    r"\bclosing\b",
+    r"\bsecured\s*profit\b",
+    r"\bachieved\b",
+]
+
+SYMBOL_PATTERNS = [
+    r"\bCLOSE\s+([A-Z]{2,10})USDT\b",
+    r"\bCLOSE\s+([A-Z]{2,10})\b",
+    r"\bTP\s+([A-Z]{2,10})\b",
+    r"\bIN\s+([A-Z]{2,10})\b",
+    r"\bON\s+([A-Z]{2,10})\b",
+    r"#\s*([A-Z]{2,10})USDT\b",
+    r"\b(LONG|SHORT)\s+([A-Z0-9._-]{2,15})\b",
+    r"\b([A-Z]{2,10})USDT\b",
+]
+
+def parse_close_signal(text: str):
+    if not text:
+        return None
+
+    if not any(re.search(p, text, flags=re.I) for p in CLOSE_TRIGGERS):
+        return None
+
+    for p in SYMBOL_PATTERNS:
+        m = re.search(p, text, flags=re.I)
+        if not m:
+            continue
+
+        if len(m.groups()) == 2 and m.group(2):
+            sym = m.group(2)
+        else:
+            sym = m.group(1)
+
+        sym = sym.strip().upper()
+        if sym in {"TP", "IN", "ON", "LONG", "SHORT", "CLOSE"}:
+            continue
+        return sym
+
+    return None
+
+
 @dataclass
 class NewSignal:
     side: str
@@ -168,21 +187,28 @@ def parse_new_signal(text: str) -> NewSignal | None:
     t = text.strip()
 
     side = None
-    if re.search(r"\bshort\b", t, re.I): side = "short"
-    if re.search(r"\blong\b", t, re.I): side = "long"
+    if re.search(r"\bshort\b", t, re.I):
+        side = "short"
+    if re.search(r"\blong\b", t, re.I):
+        side = "long"
     if side is None:
         return None
 
     base = None
-    m = re.search(r"#\s*([A-Z0-9._-]{2,20})", t, re.I)
+    # #BTCUSDT або #BTC
+    m = re.search(r"#\s*([A-Z0-9._-]{2,30})", t, re.I)
     if m:
         tag = m.group(1).upper()
         base = tag[:-4] if tag.endswith("USDT") else tag
+
+    # Long BTCUSDT / Short BTC
     if base is None:
-        m = re.search(r"\b(?:long|short)\s+([A-Z0-9._-]{2,20})\b", t, re.I)
+        m = re.search(r"\b(?:long|short)\s+([A-Z0-9._-]{2,30})\b", t, re.I)
         if m:
             sym = m.group(1).upper()
-            base = sym[:-4] if sym.endswith("USDT") else sym
+            if sym not in {"MARKET", "ENTRY", "NOW"}:
+                base = sym[:-4] if sym.endswith("USDT") else sym
+
     if base is None:
         return None
 
@@ -191,10 +217,11 @@ def parse_new_signal(text: str) -> NewSignal | None:
         return None
     sl = float(m_sl.group(1))
 
-    m_lev = re.search(r"\bLev(?:erage)?\s*x?\s*([0-9]{1,3})\b", t, re.I)
+    # leverage: "Leverage 10x" / "Lev 10" / "Lev: 10x"
+    m_lev = re.search(r"\bLev(?:erage)?\b.*?(?:([0-9]{1,3})\s*[xX]|[xX]\s*([0-9]{1,3})|[:=]?\s*([0-9]{1,3}))\b", t, re.I)
     if not m_lev:
         return None
-    lev = int(m_lev.group(1))
+    lev = int(m_lev.group(1) or m_lev.group(2) or m_lev.group(3))
 
     m_risk = re.search(r"\b(?:With|Margin)\s*[:=]?\s*([0-9]+(?:\.[0-9]+)?)\s*%\s*balance\b", t, re.I)
     if not m_risk:
@@ -231,34 +258,28 @@ def validate_sl_tp(side: str, price: float, sl: float, tp: float) -> bool:
         return sl > price and tp < price
     return sl < price and tp > price
 
-
 def calc_tp_from_rr(side: str, entry: float, sl: float, rr: float) -> float:
     risk = abs(entry - sl)
     if risk <= 0:
         raise ValueError("Bad SL/entry: risk=0")
     return entry - risk * rr if side == "short" else entry + risk * rr
 
-
 def calc_tp_from_pct(side: str, entry: float, pct: float) -> float:
     k = pct / 100.0
     return entry * (1.0 - k) if side == "short" else entry * (1.0 + k)
-
 
 def get_usdt_free() -> float:
     bal = exchange.fetch_balance({"type": "swap"})
     usdt = bal.get("USDT") or {}
     return float(usdt.get("free") or 0.0)
 
-
 def calc_qty(balance_usdt: float, risk_pct: float, lev: int, price: float) -> float:
     margin = balance_usdt * (risk_pct / 100.0)
     notional = margin * lev
     return notional / price
 
-
 def set_leverage(symbol, lev):
     return exchange.set_leverage(lev, symbol, params={"side": "BOTH"})
-
 
 def open_market(symbol: str, side: str, qty: float):
     order_side = "buy" if side == "long" else "sell"
@@ -270,7 +291,6 @@ def open_market(symbol: str, side: str, qty: float):
         params={"positionSide": "BOTH", "reduceOnly": False},
     )
 
-
 def close_position_full_oneway(base: str):
     symbol = resolve_symbol(base)
     if not symbol:
@@ -278,7 +298,6 @@ def close_position_full_oneway(base: str):
         return
 
     positions = exchange.fetch_positions([symbol], {"type": "swap"})
-
     pos = None
     for p in positions:
         contracts = p.get("contracts")
@@ -304,7 +323,6 @@ def close_position_full_oneway(base: str):
         log("CLOSE_DBG", f"Side fallback by qty sign -> {side}")
 
     close_side = "sell" if side == "long" else "buy"
-
     log("CLOSE", f"Closing 100% {symbol} qty={qty} side={side}")
 
     exchange.create_order(
@@ -315,7 +333,6 @@ def close_position_full_oneway(base: str):
         params={"reduceOnly": True, "positionSide": "BOTH"},
     )
     log("CLOSE", "Close order sent")
-
 
 def place_sl_tp_market_oneway(symbol: str, entry_side: str, qty: float, sl: float, tp: float):
     close_side = "sell" if entry_side == "long" else "buy"
@@ -330,133 +347,78 @@ def place_sl_tp_market_oneway(symbol: str, entry_side: str, qty: float, sl: floa
     return sl_order, tp_order
 
 
-# ===================== HANDLER: CHANNEL =====================
-# TARGET CHAT listener (channel / supergroup / group)
-@app.on_message(filters.chat(TARGET_CHANNEL_ID) & (filters.text | filters.caption))
-def on_target(client, message):
+# ===================== DIAG: TWO HANDLERS =====================
+_last_hb = 0.0
 
-    text = (message.text or message.caption or "").strip()
-    log("MSG", f"Target({message.chat.type}) message: {text[:200]}")
+def heartbeat_tick():
+    global _last_hb
+    now = time.time()
+    if now - _last_hb >= HEARTBEAT_SEC:
+        _last_hb = now
+        log("HB", "alive")
 
-    if not text:
-        log("SKIP", "Empty message")
-        return
 
-    # 1) NEW SIGNAL
-    sig = parse_new_signal(text)
-    if sig:
-        log("PARSE", f"NEW: {sig.side.upper()} {sig.base} SL={sig.sl} Lev={sig.lev} Risk={sig.risk_pct}%")
+# --- Handler 1: Saved Messages ---
+MY_ID = None
 
-        symbol = resolve_symbol(sig.base)
-        if not symbol:
-            log("ERROR", f"Symbol not found on BingX swap: {sig.base}/USDT")
+@app.on_message(filters.private & filters.me & (filters.text | filters.caption))
+def on_saved_debug(client, message):
+    global MY_ID
+    try:
+        heartbeat_tick()
+
+        if MY_ID is None:
+            me = client.get_me()
+            MY_ID = me.id
+            log("ME", f"Logged as {me.first_name} (@{me.username}), my_id={MY_ID}")
+            log("SAVED", "Saved handler READY (listening Saved Messages)")
+
+        if message.chat.id != MY_ID:
+            log("SAVED_SKIP", f"private chat but not Saved: chat_id={message.chat.id}")
             return
-        log("SYMBOL", symbol)
 
-        # price
+        text = (message.text or message.caption or "").strip()
+        log("SAVED_IN", f"Saved message received: {text[:160]}")
+
+    except Exception as e:
+        log("SAVED_ERR", f"{e}")
+        log("SAVED_TRACE", traceback.format_exc())
+
+
+# --- Handler 2: Channel/Chat by ID (only if TARGET_CHANNEL_ID set) ---
+if TARGET_CHANNEL_ID is not None:
+    @app.on_message(filters.chat(TARGET_CHANNEL_ID) & (filters.text | filters.caption))
+    def on_channel_debug(client, message):
         try:
-            ticker = exchange.fetch_ticker(symbol)
-            price = float(ticker["last"])
-            log("PRICE", str(price))
+            heartbeat_tick()
+
+            text = (message.text or message.caption or "").strip()
+            log("CHAN_IN", f"Channel handler fired! type={message.chat.type} chat_id={message.chat.id} msg_id={message.id} text={text[:160]}")
+
         except Exception as e:
-            log("ERROR", f"fetch_ticker failed: {e}")
-            return
-
-        # TP calc
-        entry = price
-        tp_final = None
-
-        if sig.tp_price is not None:
-            tp_final = sig.tp_price
-            log("TP_MODE", f"price TP={tp_final}")
-        elif sig.tp_rr is not None:
-            tp_final = calc_tp_from_rr(sig.side, entry, sig.sl, sig.tp_rr)
-            log("TP_MODE", f"RR {sig.tp_rr} -> TP {tp_final}")
-        elif sig.tp_pct is not None:
-            tp_final = calc_tp_from_pct(sig.side, entry, sig.tp_pct)
-            log("TP_MODE", f"{sig.tp_pct}% -> TP {tp_final}")
-
-        if tp_final is None:
-            log("SKIP", "TP is missing (no price/rr/%)")
-            return
-
-        try:
-            tp_final = float(exchange.price_to_precision(symbol, tp_final))
-            log("TP", f"tp_prec={tp_final}")
-        except Exception as e:
-            log("ERROR", f"price_to_precision failed: {e}")
-            return
-
-        if not validate_sl_tp(sig.side, entry, sig.sl, tp_final):
-            log("SKIP", f"Bad SL/TP vs price. price={entry} SL={sig.sl} TP={tp_final}")
-            return
-
-        # qty
-        try:
-            usdt_free = get_usdt_free()
-            qty = calc_qty(usdt_free, sig.risk_pct, sig.lev, entry)
-            log("BAL", f"USDT free={usdt_free}")
-            log("QTY", f"qty_raw≈{qty}")
-            qty = float(exchange.amount_to_precision(symbol, qty))
-            log("QTY", f"qty_prec={qty}")
-        except Exception as e:
-            log("ERROR", f"balance/qty failed: {e}")
-            return
-
-        if qty <= 0:
-            log("SKIP", "qty became 0 after precision")
-            return
-
-        if DRY_RUN:
-            log("DRY_RUN", "Order NOT sent (test mode)")
-            return
-
-        # place orders
-        try:
-            log("LEV", f"Setting leverage x{sig.lev}")
-            set_leverage(symbol, sig.lev)
-
-            log("ORDER", f"Opening {sig.side.upper()} {symbol} qty={qty}")
-            resp = open_market(symbol, sig.side, qty)
-            log("SUCCESS", f"Order placed id={resp.get('id')}")
-
-            sl_order, tp_order = place_sl_tp_market_oneway(symbol, sig.side, qty, sig.sl, tp_final)
-            log("PROTECT", f"SL id={sl_order.get('id')} | TP id={tp_order.get('id')}")
-        except Exception as e:
-            log("ERROR", f"Trade failed: {e}")
-
-        return  # IMPORTANT: якщо NEW — не йдемо далі
-
-    # 2) CLOSE SIGNAL (тільки якщо не NEW)
-    base_to_close = parse_close_signal(text)
-    log("CLOSE_DBG", f"base_to_close={base_to_close}")
-
-    if base_to_close:
-        log("PARSE", f"CLOSE detected: {base_to_close}")
-        if DRY_RUN:
-            log("DRY_RUN", "Close NOT sent")
-            return
-        close_position_full_oneway(base_to_close)
-        return
-
-    # 3) нічого не розпізнали
-    log("SKIP", "Not a NEW or CLOSE signal format")
+            log("CHAN_ERR", f"{e}")
+            log("CHAN_TRACE", traceback.format_exc())
+else:
+    log("CHAN", "Channel handler DISABLED because TARGET_CHANNEL_ID is None")
 
 
 # ===================== MAIN =====================
-import time
-
 if __name__ == "__main__":
     log("BOOT", "Bot starting...")
 
+    # Безпечний прев’ю ENV (без секретів)
+    log("ENV", f"TG_API_ID={env_preview('TG_API_ID')} TG_API_HASH={env_flag('TG_API_HASH')} TG_SESSION_STRING={env_flag('TG_SESSION_STRING')}")
+    log("ENV", f"BINGX_API_KEY={env_flag('BINGX_API_KEY')} BINGX_API_SECRET={env_flag('BINGX_API_SECRET')}")
+    log("ENV", f"TARGET_CHANNEL_ID={os.getenv('TARGET_CHANNEL_ID')!r} DRY_RUN={DRY_RUN}")
+
+    if TARGET_CHANNEL_ID is None:
+        log("RUN", "Channel listener DISABLED (TARGET_CHANNEL_ID is None). Saved listener ENABLED.")
+    else:
+        log("RUN", f"Channel listener ENABLED. Listening TARGET_CHANNEL_ID={TARGET_CHANNEL_ID}. Saved listener ENABLED.")
+
     try:
-        if TARGET_CHANNEL_ID is None:
-            log("RUN", "Listening Saved Messages only (TARGET_CHANNEL_ID not set)")
-        else:
-            log("RUN", f"Listening TARGET_CHANNEL_ID={TARGET_CHANNEL_ID} ...")
-
         app.run()
-
     except Exception as e:
         log("FATAL", f"app.run() crashed: {e}")
+        log("TRACE", traceback.format_exc())
         raise

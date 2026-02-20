@@ -332,6 +332,15 @@ def place_sl_tp_market_oneway(symbol: str, entry_side: str, qty: float, sl: floa
 
 
 # ===================== HANDLER: CHANNEL =====================
+@app.on_message(filters.all)
+def debug_all(client, message):
+    try:
+        chat = message.chat
+        text = (message.text or message.caption or "").strip()
+        log("DBG_ALL", f"type={chat.type} id={chat.id} title={getattr(chat,'title',None)} text={text[:80]}")
+    except Exception as e:
+        log("DBG_ERR", str(e))
+        
 @app.on_message(filters.channel)  # ловим все посты из каналов
 def on_channel(client, message):
     # фильтруем нужный канал тут (самый надежный способ)

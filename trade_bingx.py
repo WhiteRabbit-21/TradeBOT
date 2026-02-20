@@ -334,7 +334,7 @@ def place_sl_tp_market_oneway(symbol: str, entry_side: str, qty: float, sl: floa
 # ===================== HANDLER: CHANNEL =====================
 # ===================== TEST HANDLER =====================
 # 1) Додай ENV: TEST_CHAT_ID (ID "Збережені" або твого тест-чату/групи)
-TEST_CHAT_ID = int(must_env("TEST_CHAT_ID"))
+#TEST_CHAT_ID = int(must_env("TEST_CHAT_ID"))
 
 # ---------- SAVED MESSAGES FILTER ----------
 MY_ID = None  # визначимо один раз
@@ -460,47 +460,8 @@ def on_saved(client, message):
 
     # 4) нічого не розпізнали
     log("SKIP", "Not a NEW or CLOSE signal format")
-    
-    try:
-        text = message.text or message.caption or ""
-        text = text.strip()
 
-        # 1) Лог: що саме прийшло
-        log(
-            "TEST",
-            f"chat_type={message.chat.type} chat_id={message.chat.id} "
-            f"msg_id={message.id} from={getattr(message.from_user, 'id', None)} "
-            f"text={text[:500]}"
-        )
 
-        if not text:
-            log("TEST_SKIP", "Empty message")
-            return
-
-        # 2) Перевіряємо CLOSE-сигнал
-        base_to_close = parse_close_signal(text)
-        log("TEST_CLOSE_DBG", f"base_to_close={base_to_close}")
-        if base_to_close:
-            log("TEST_PARSE", f"CLOSE detected: {base_to_close}")
-            # В тесті НЕ закриваємо позиції
-            return
-
-        # 3) Перевіряємо NEW-сигнал
-        sig = parse_new_signal(text)
-        if not sig:
-            log("TEST_SKIP", "Not a NEW signal format")
-            return
-
-        log(
-            "TEST_PARSE",
-            f"NEW SIGNAL: {sig.side.upper()} {sig.base} SL={sig.sl} Lev={sig.lev} Risk={sig.risk_pct}% "
-            f"TP(price={sig.tp_price}, rr={sig.tp_rr}, pct={sig.tp_pct})"
-        )
-
-        # В тесті НЕ відкриваємо угоди
-
-    except Exception as e:
-        log("TEST_ERR", f"Handler crashed: {e}")
 
 # ===================== MAIN =====================
 import time
@@ -512,7 +473,7 @@ if __name__ == "__main__":
         app.start()
         me = app.get_me()
         log("ME", f"LOGGED AS: {me.id} {me.first_name} @{me.username}")
-        log("RUN", f"Listening channel_id={TARGET_CHANNEL_ID} ...")
+        log("RUN", "Listening Saved Messages only...")
 
         # heartbeat чтобы точно видеть что живой
         while True:

@@ -76,6 +76,16 @@ def build_client() -> Client:
         api_hash=TG_API_HASH,
     )
 
+import signal
+import time
+
+def _on_stop(signum, frame):
+    log("SIG", f"Got signal {signum}. Platform is stopping the container.")
+    time.sleep(1)
+    raise SystemExit(0)
+
+signal.signal(signal.SIGTERM, _on_stop)
+signal.signal(signal.SIGINT, _on_stop)
 
 app = build_client()
 

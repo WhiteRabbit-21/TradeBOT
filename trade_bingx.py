@@ -29,9 +29,7 @@ api_id = int(must_env("TG_API_ID"))
 api_hash = must_env("TG_API_HASH")
 tg_session = must_env("TG_SESSION_STRING")
 
-# Канал (ВАЖНО: для каналов это обычно отрицательный id вида -100xxxxxxxxxx)
-TARGET_CHANNEL_ID_RAW = os.getenv("TARGET_CHANNEL_ID")
-TARGET_CHANNEL_ID = int(TARGET_CHANNEL_ID_RAW) if TARGET_CHANNEL_ID_RAW else None
+TARGET_CHANNEL_ID = int(must_env("TARGET_CHANNEL_ID"))
 
 # BingX
 BINGX_API_KEY = must_env("BINGX_API_KEY")
@@ -333,36 +331,18 @@ def place_sl_tp_market_oneway(symbol: str, entry_side: str, qty: float, sl: floa
 
 
 # ===================== HANDLER: CHANNEL =====================
-# ===================== TEST HANDLER =====================
-# 1) Додай ENV: TEST_CHAT_ID (ID "Збережені" або твого тест-чату/групи)
-#TEST_CHAT_ID = int(must_env("TEST_CHAT_ID"))
-
-# ---------- SAVED MESSAGES FILTER ----------
-MY_ID = None  # визначимо один раз
-
-@app.on_message(filters.private & filters.me)
-def on_saved(client, message):
-    global MY_ID
-
-    # 0) визначаємо свій user_id один раз
-    if MY_ID is None:
-        me = client.get_me()
-        MY_ID = me.id
-        log("ME", f"Logged as {me.first_name} (@{me.username}), my_id={MY_ID}")
-        log("START", "Listening ONLY Saved Messages...")
-
-    # 1) фільтруємо тільки Saved Messages (chat.id == твій user_id)
-    if message.chat.id != MY_ID:
-        return
+# TARGET CHAT listener (channel / supergroup / group)
+@app.on_message(filters.chat(TARGET_CHANNEL_ID) & (filters.text | filters.caption))
+def on_target(client, message):
 
     text = (message.text or message.caption or "").strip()
-    log("MSG", f"Saved message: {text[:200]}")
+    log("MSG", f"Target({message.chat.type}) message: {text[:200]}")
 
     if not text:
         log("SKIP", "Empty message")
         return
 
-    # 2) NEW SIGNAL
+    # 1) NEW SIGNAL
     sig = parse_new_signal(text)
     if sig:
         log("PARSE", f"NEW: {sig.side.upper()} {sig.base} SL={sig.sl} Lev={sig.lev} Risk={sig.risk_pct}%")
@@ -447,7 +427,7 @@ def on_saved(client, message):
 
         return  # IMPORTANT: якщо NEW — не йдемо далі
 
-    # 3) CLOSE SIGNAL (тільки якщо не NEW)
+    # 2) CLOSE SIGNAL (тільки якщо не NEW)
     base_to_close = parse_close_signal(text)
     log("CLOSE_DBG", f"base_to_close={base_to_close}")
 
@@ -459,9 +439,8 @@ def on_saved(client, message):
         close_position_full_oneway(base_to_close)
         return
 
-    # 4) нічого не розпізнали
+    # 3) нічого не розпізнали
     log("SKIP", "Not a NEW or CLOSE signal format")
-
 
 
 # ===================== MAIN =====================
@@ -469,4 +448,12 @@ import time
 
 if __name__ == "__main__":
     log("BOOT", "Bot starting...")
+
+    # 1) перевіряємо, що заданий ID чату/каналу
+    if TARGET_CHANNEL_ID is None:
+        raise ValueError("TARGET_CHANNEL_ID is not set. Add it to .env / Railway Variables")
+
+    log("RUN", f"Listening TARGET_CHANNEL_ID={TARGET_CHANNEL_ID} ...")
+
+    # 2) запускаємо pyrogram (тримає процес живим)
     app.run()

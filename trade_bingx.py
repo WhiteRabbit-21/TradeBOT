@@ -5,7 +5,7 @@ import os
 
 import ccxt
 from dotenv import load_dotenv
-from pyrogram import Client, filters, idle
+from pyrogram import Client, filters
 
 
 # ===================== ENV =====================
@@ -30,7 +30,8 @@ api_hash = must_env("TG_API_HASH")
 tg_session = must_env("TG_SESSION_STRING")
 
 # Канал (ВАЖНО: для каналов это обычно отрицательный id вида -100xxxxxxxxxx)
-TARGET_CHANNEL_ID = int(must_env("TARGET_CHANNEL_ID"))
+TARGET_CHANNEL_ID_RAW = os.getenv("TARGET_CHANNEL_ID")
+TARGET_CHANNEL_ID = int(TARGET_CHANNEL_ID_RAW) if TARGET_CHANNEL_ID_RAW else None
 
 # BingX
 BINGX_API_KEY = must_env("BINGX_API_KEY")
@@ -468,26 +469,4 @@ import time
 
 if __name__ == "__main__":
     log("BOOT", "Bot starting...")
-
-    try:
-        app.start()
-        me = app.get_me()
-        log("ME", f"LOGGED AS: {me.id} {me.first_name} @{me.username}")
-        log("RUN", "Listening Saved Messages only...")
-
-        # heartbeat чтобы точно видеть что живой
-        while True:
-            time.sleep(60)
-            log("HB", "alive")
-
-    except Exception as e:
-        log("FATAL", f"Startup crashed: {e}")
-        raise
-
-    finally:
-        try:
-            app.stop()
-            log("STOP", "Client stopped")
-        except Exception:
-            pass
-
+    app.run()

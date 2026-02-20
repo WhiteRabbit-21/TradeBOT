@@ -332,119 +332,52 @@ def place_sl_tp_market_oneway(symbol: str, entry_side: str, qty: float, sl: floa
 
 
 # ===================== HANDLER: CHANNEL =====================
-@app.on_message(filters.all)
-def debug_all(client, message):
+# ===================== TEST HANDLER =====================
+# 1) Додай ENV: TEST_CHAT_ID (ID "Збережені" або твого тест-чату/групи)
+TEST_CHAT_ID = int(must_env("TEST_CHAT_ID"))
+
+@app.on_message(filters.chat(TEST_CHAT_ID))
+def on_test_chat(client, message):
     try:
-        chat = message.chat
-        text = (message.text or message.caption or "").strip()
-        log("DBG_ALL", f"type={chat.type} id={chat.id} title={getattr(chat,'title',None)} text={text[:80]}")
-    except Exception as e:
-        log("DBG_ERR", str(e))
-        
-@app.on_message(filters.channel)  # ловим все посты из каналов
-def on_channel(client, message):
-    # фильтруем нужный канал тут (самый надежный способ)
-    if message.chat.id != TARGET_CHANNEL_ID:
-        return
+        text = message.text or message.caption or ""
+        text = text.strip()
 
-    text = message.text or message.caption or ""
-    log("MSG", f"Channel({message.chat.id}) msg: {text[:120]}")
+        # 1) Лог: що саме прийшло
+        log(
+            "TEST",
+            f"chat_type={message.chat.type} chat_id={message.chat.id} "
+            f"msg_id={message.id} from={getattr(message.from_user, 'id', None)} "
+            f"text={text[:500]}"
+        )
 
-    if not text.strip():
-        log("SKIP", "Empty message")
-        return
-
-    base_to_close = parse_close_signal(text)
-    log("CLOSE_DBG", f"base_to_close={base_to_close}")
-    if base_to_close:
-        log("PARSE", f"CLOSE detected: {base_to_close}")
-        if DRY_RUN:
-            log("DRY_RUN", "Close NOT sent")
+        if not text:
+            log("TEST_SKIP", "Empty message")
             return
-        close_position_full_oneway(base_to_close)
-        return
 
-    sig = parse_new_signal(text)
-    if not sig:
-        log("SKIP", "Not a NEW signal format")
-        return
+        # 2) Перевіряємо CLOSE-сигнал
+        base_to_close = parse_close_signal(text)
+        log("TEST_CLOSE_DBG", f"base_to_close={base_to_close}")
+        if base_to_close:
+            log("TEST_PARSE", f"CLOSE detected: {base_to_close}")
+            # В тесті НЕ закриваємо позиції
+            return
 
-    log("PARSE", f"{sig.side.upper()} {sig.base} SL={sig.sl} Lev={sig.lev} Risk={sig.risk_pct}%")
+        # 3) Перевіряємо NEW-сигнал
+        sig = parse_new_signal(text)
+        if not sig:
+            log("TEST_SKIP", "Not a NEW signal format")
+            return
 
-    symbol = resolve_symbol(sig.base)
-    if not symbol:
-        log("ERROR", f"Symbol not found on BingX swap: {sig.base}/USDT")
-        return
-    log("SYMBOL", symbol)
+        log(
+            "TEST_PARSE",
+            f"NEW SIGNAL: {sig.side.upper()} {sig.base} SL={sig.sl} Lev={sig.lev} Risk={sig.risk_pct}% "
+            f"TP(price={sig.tp_price}, rr={sig.tp_rr}, pct={sig.tp_pct})"
+        )
 
-    try:
-        ticker = exchange.fetch_ticker(symbol)
-        price = float(ticker["last"])
-        log("PRICE", str(price))
+        # В тесті НЕ відкриваємо угоди
+
     except Exception as e:
-        log("ERROR", f"fetch_ticker failed: {e}")
-        return
-
-    entry = price
-    tp_final = None
-
-    if sig.tp_price is not None:
-        tp_final = sig.tp_price
-        log("TP_MODE", f"price TP={tp_final}")
-    elif sig.tp_rr is not None:
-        tp_final = calc_tp_from_rr(sig.side, entry, sig.sl, sig.tp_rr)
-        log("TP_MODE", f"RR {sig.tp_rr} -> TP {tp_final}")
-    elif sig.tp_pct is not None:
-        tp_final = calc_tp_from_pct(sig.side, entry, sig.tp_pct)
-        log("TP_MODE", f"{sig.tp_pct}% -> TP {tp_final}")
-
-    if tp_final is None:
-        log("SKIP", "TP is missing (no price/rr/%)")
-        return
-
-    try:
-        tp_final = float(exchange.price_to_precision(symbol, tp_final))
-        log("TP", f"tp_prec={tp_final}")
-    except Exception as e:
-        log("ERROR", f"price_to_precision failed: {e}")
-        return
-
-    if not validate_sl_tp(sig.side, entry, sig.sl, tp_final):
-        log("SKIP", f"Bad SL/TP vs price. price={entry} SL={sig.sl} TP={tp_final}")
-        return
-
-    try:
-        usdt_free = get_usdt_free()
-        qty = calc_qty(usdt_free, sig.risk_pct, sig.lev, entry)
-        log("BAL", f"USDT free={usdt_free}")
-        log("QTY", f"qty_raw≈{qty}")
-        qty = float(exchange.amount_to_precision(symbol, qty))
-        log("QTY", f"qty_prec={qty}")
-    except Exception as e:
-        log("ERROR", f"balance/qty failed: {e}")
-        return
-
-    if qty <= 0:
-        log("SKIP", "qty became 0 after precision")
-        return
-
-    if DRY_RUN:
-        log("DRY_RUN", "Order NOT sent (test mode)")
-        return
-
-    try:
-        log("LEV", f"Setting leverage x{sig.lev}")
-        set_leverage(symbol, sig.lev)
-
-        log("ORDER", f"Opening {sig.side.upper()} {symbol} qty={qty}")
-        resp = open_market(symbol, sig.side, qty)
-        log("SUCCESS", f"Order placed id={resp.get('id')}")
-
-        sl_order, tp_order = place_sl_tp_market_oneway(symbol, sig.side, qty, sig.sl, tp_final)
-        log("PROTECT", f"SL id={sl_order.get('id')} | TP id={tp_order.get('id')}")
-    except Exception as e:
-        log("ERROR", f"Trade failed: {e}")
-
+        log("TEST_ERR", f"Handler crashed: {e}")
 
 # ===================== MAIN =====================
 import time

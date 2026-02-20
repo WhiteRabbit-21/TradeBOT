@@ -336,8 +336,131 @@ def place_sl_tp_market_oneway(symbol: str, entry_side: str, qty: float, sl: floa
 # 1) Додай ENV: TEST_CHAT_ID (ID "Збережені" або твого тест-чату/групи)
 TEST_CHAT_ID = int(must_env("TEST_CHAT_ID"))
 
-@app.on_message(filters.chat(TEST_CHAT_ID))
-def on_test_chat(client, message):
+# ---------- SAVED MESSAGES FILTER ----------
+MY_ID = None  # визначимо один раз
+
+@app.on_message(filters.private & filters.me)
+def on_saved(client, message):
+    global MY_ID
+
+    # 0) визначаємо свій user_id один раз
+    if MY_ID is None:
+        me = client.get_me()
+        MY_ID = me.id
+        log("ME", f"Logged as {me.first_name} (@{me.username}), my_id={MY_ID}")
+        log("START", "Listening ONLY Saved Messages...")
+
+    # 1) фільтруємо тільки Saved Messages (chat.id == твій user_id)
+    if message.chat.id != MY_ID:
+        return
+
+    text = (message.text or message.caption or "").strip()
+    log("MSG", f"Saved message: {text[:200]}")
+
+    if not text:
+        log("SKIP", "Empty message")
+        return
+
+    # 2) NEW SIGNAL
+    sig = parse_new_signal(text)
+    if sig:
+        log("PARSE", f"NEW: {sig.side.upper()} {sig.base} SL={sig.sl} Lev={sig.lev} Risk={sig.risk_pct}%")
+
+        symbol = resolve_symbol(sig.base)
+        if not symbol:
+            log("ERROR", f"Symbol not found on BingX swap: {sig.base}/USDT")
+            return
+        log("SYMBOL", symbol)
+
+        # price
+        try:
+            ticker = exchange.fetch_ticker(symbol)
+            price = float(ticker["last"])
+            log("PRICE", str(price))
+        except Exception as e:
+            log("ERROR", f"fetch_ticker failed: {e}")
+            return
+
+        # TP calc
+        entry = price
+        tp_final = None
+
+        if sig.tp_price is not None:
+            tp_final = sig.tp_price
+            log("TP_MODE", f"price TP={tp_final}")
+        elif sig.tp_rr is not None:
+            tp_final = calc_tp_from_rr(sig.side, entry, sig.sl, sig.tp_rr)
+            log("TP_MODE", f"RR {sig.tp_rr} -> TP {tp_final}")
+        elif sig.tp_pct is not None:
+            tp_final = calc_tp_from_pct(sig.side, entry, sig.tp_pct)
+            log("TP_MODE", f"{sig.tp_pct}% -> TP {tp_final}")
+
+        if tp_final is None:
+            log("SKIP", "TP is missing (no price/rr/%)")
+            return
+
+        try:
+            tp_final = float(exchange.price_to_precision(symbol, tp_final))
+            log("TP", f"tp_prec={tp_final}")
+        except Exception as e:
+            log("ERROR", f"price_to_precision failed: {e}")
+            return
+
+        if not validate_sl_tp(sig.side, entry, sig.sl, tp_final):
+            log("SKIP", f"Bad SL/TP vs price. price={entry} SL={sig.sl} TP={tp_final}")
+            return
+
+        # qty
+        try:
+            usdt_free = get_usdt_free()
+            qty = calc_qty(usdt_free, sig.risk_pct, sig.lev, entry)
+            log("BAL", f"USDT free={usdt_free}")
+            log("QTY", f"qty_raw≈{qty}")
+            qty = float(exchange.amount_to_precision(symbol, qty))
+            log("QTY", f"qty_prec={qty}")
+        except Exception as e:
+            log("ERROR", f"balance/qty failed: {e}")
+            return
+
+        if qty <= 0:
+            log("SKIP", "qty became 0 after precision")
+            return
+
+        if DRY_RUN:
+            log("DRY_RUN", "Order NOT sent (test mode)")
+            return
+
+        # place orders
+        try:
+            log("LEV", f"Setting leverage x{sig.lev}")
+            set_leverage(symbol, sig.lev)
+
+            log("ORDER", f"Opening {sig.side.upper()} {symbol} qty={qty}")
+            resp = open_market(symbol, sig.side, qty)
+            log("SUCCESS", f"Order placed id={resp.get('id')}")
+
+            sl_order, tp_order = place_sl_tp_market_oneway(symbol, sig.side, qty, sig.sl, tp_final)
+            log("PROTECT", f"SL id={sl_order.get('id')} | TP id={tp_order.get('id')}")
+        except Exception as e:
+            log("ERROR", f"Trade failed: {e}")
+
+        return  # IMPORTANT: якщо NEW — не йдемо далі
+
+    # 3) CLOSE SIGNAL (тільки якщо не NEW)
+    base_to_close = parse_close_signal(text)
+    log("CLOSE_DBG", f"base_to_close={base_to_close}")
+
+    if base_to_close:
+        log("PARSE", f"CLOSE detected: {base_to_close}")
+        if DRY_RUN:
+            log("DRY_RUN", "Close NOT sent")
+            return
+        close_position_full_oneway(base_to_close)
+        return
+
+    # 4) нічого не розпізнали
+    log("SKIP", "Not a NEW or CLOSE signal format")
+    
     try:
         text = message.text or message.caption or ""
         text = text.strip()

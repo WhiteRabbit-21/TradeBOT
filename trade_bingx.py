@@ -2,6 +2,7 @@ import os
 import asyncio
 from datetime import datetime
 from pyrogram import Client, filters
+from pyrogram import idle
 
 def req(key: str) -> str:
     v = os.getenv(key)
@@ -39,7 +40,7 @@ async def main():
     await app.start()
     print("✅ started")
     asyncio.create_task(heartbeat())
-    await app.idle()
+    await idle()
 
 if __name__ == "__main__":
     asyncio.run(main())

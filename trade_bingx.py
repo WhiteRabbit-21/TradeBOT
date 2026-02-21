@@ -1,9 +1,13 @@
 import os
 import sys
+import signal
+import time
+import threading
 from datetime import datetime
+from http.server import BaseHTTPRequestHandler, HTTPServer
+
 from dotenv import load_dotenv
-from pyrogram import idle
-from pyrogram import Client, filters
+from pyrogram import Client, filters, idle
 
 load_dotenv()
 
@@ -11,40 +15,83 @@ load_dotenv()
 TG_API_ID = int(os.getenv("TG_API_ID", "0"))
 TG_API_HASH = os.getenv("TG_API_HASH", "")
 
-# ВАРІАНТ 1 (кращий для деплою): Session String (не створює session-файл)
-TG_SESSION_STRING = os.getenv("TG_SESSION_STRING", "")
+# Варіант 1: Session String (рекомендовано для Railway)
+TG_SESSION_STRING = os.getenv("TG_SESSION_STRING", "").strip()
 
-# ВАРІАНТ 2: Bot token (якщо читаєш як бот; бот має бути в каналі/адміном)
-TG_BOT_TOKEN = os.getenv("TG_BOT_TOKEN", "")
+# Варіант 2: Bot token (якщо читаєш як бот; бот має бути в каналі/адміном)
+TG_BOT_TOKEN = os.getenv("TG_BOT_TOKEN", "").strip()
 
-# ВАРІАНТ 3: session file name (не рекомендую для Railway, але лишив як fallback)
-SESSION_NAME = os.getenv("TG_SESSION", "tradebot_session")
+# Варіант 3: session file name (fallback)
+SESSION_NAME = os.getenv("TG_SESSION", "tradebot_session").strip()
 
-TARGET_CHANNEL_ID = os.getenv("TARGET_CHANNEL_ID", "").strip()  # наприклад: -1002598403649 або @username
-
-if not TG_API_ID or not TG_API_HASH:
-    print("❌ TG_API_ID / TG_API_HASH not set")
-    sys.exit(1)
-
-if not TARGET_CHANNEL_ID:
-    print("❌ TARGET_CHANNEL_ID not set (example: -1001234567890 or @channelusername)")
-    sys.exit(1)
-
-# Приводимо ID до int якщо це число
-try:
-    if TARGET_CHANNEL_ID.lstrip("-").isdigit():
-        TARGET_CHANNEL_ID = int(TARGET_CHANNEL_ID)
-except Exception:
-    pass
+TARGET_CHANNEL_ID_RAW = os.getenv("TARGET_CHANNEL_ID", "").strip()  # -100... або @username
+ENABLE_SAVED = os.getenv("ENABLE_SAVED", "false").lower() in ("1", "true", "yes")
 
 
-# -------------------- LOG --------------------
 def log(status: str, msg: str = ""):
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     print(f"[{now}] [{status}] {msg}", flush=True)
 
 
-# -------------------- CLIENT --------------------
+def die(msg: str, code: int = 1):
+    print(msg, flush=True)
+    raise SystemExit(code)
+
+
+# -------------------- VALIDATION --------------------
+if not TG_API_ID or not TG_API_HASH:
+    die("❌ TG_API_ID / TG_API_HASH not set")
+
+if not TARGET_CHANNEL_ID_RAW:
+    die("❌ TARGET_CHANNEL_ID not set (example: -1001234567890 or @channelusername)")
+
+# Приводимо TARGET_CHANNEL_ID до int якщо це число
+TARGET_CHANNEL_ID = TARGET_CHANNEL_ID_RAW
+if TARGET_CHANNEL_ID_RAW.lstrip("-").isdigit():
+    TARGET_CHANNEL_ID = int(TARGET_CHANNEL_ID_RAW)
+
+
+# -------------------- HEALTH SERVER (for Railway/Web expectations) --------------------
+def start_health_server():
+    """
+    Railway інколи очікує, що процес слухає PORT (як web).
+    Цей сервер НЕ заважає Pyrogram-боту, але прибирає "Stopping Container".
+    """
+    port = int(os.getenv("PORT", "8080"))
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            if self.path in ("/", "/health"):
+                self.send_response(200)
+                self.send_header("Content-Type", "text/plain; charset=utf-8")
+                self.end_headers()
+                self.wfile.write(b"ok")
+            else:
+                self.send_response(404)
+                self.end_headers()
+
+        def log_message(self, format, *args):
+            return  # не спамимо в лог
+
+    server = HTTPServer(("0.0.0.0", port), Handler)
+    log("HTTP", f"Listening on 0.0.0.0:{port} (GET /health -> 200)")
+    server.serve_forever()
+
+
+# -------------------- SIGNALS --------------------
+def _on_stop(signum, frame):
+    # Не завжди встигає спрацювати (інколи Railway робить жорсткий stop),
+    # але нехай буде.
+    log("SIG", f"Got signal {signum}. Platform is stopping the container.")
+    time.sleep(0.5)
+    raise SystemExit(0)
+
+
+signal.signal(signal.SIGTERM, _on_stop)
+signal.signal(signal.SIGINT, _on_stop)
+
+
+# -------------------- PYROGRAM CLIENT --------------------
 def build_client() -> Client:
     # 1) BOT
     if TG_BOT_TOKEN:
@@ -57,7 +104,7 @@ def build_client() -> Client:
             in_memory=True,
         )
 
-    # 2) SESSION STRING (рекомендовано)
+    # 2) SESSION STRING (recommended)
     if TG_SESSION_STRING:
         log("ENV", "Using TG_SESSION_STRING")
         return Client(
@@ -76,16 +123,6 @@ def build_client() -> Client:
         api_hash=TG_API_HASH,
     )
 
-import signal
-import time
-
-def _on_stop(signum, frame):
-    log("SIG", f"Got signal {signum}. Platform is stopping the container.")
-    time.sleep(1)
-    raise SystemExit(0)
-
-signal.signal(signal.SIGTERM, _on_stop)
-signal.signal(signal.SIGINT, _on_stop)
 
 app = build_client()
 
@@ -111,10 +148,6 @@ def on_channel_message(client: Client, message):
     # handle_signal(text)
 
 
-# OPTIONAL: якщо ще хочеш ловити Saved Messages
-ENABLE_SAVED = os.getenv("ENABLE_SAVED", "false").lower() in ("1", "true", "yes")
-
-
 if ENABLE_SAVED:
     @app.on_message(filters.me & (filters.text | filters.caption))
     def on_saved_message(client: Client, message):
@@ -126,21 +159,32 @@ if ENABLE_SAVED:
 
 
 # -------------------- RUN --------------------
-from pyrogram import idle
-
 if __name__ == "__main__":
     log("BOOT", "Bot starting...")
+    log(
+        "ENV",
+        f"TG_API_ID={TG_API_ID} TG_API_HASH={'YES' if TG_API_HASH else 'NO'} "
+        f"TG_SESSION_STRING={'YES' if TG_SESSION_STRING else 'NO'} TG_BOT_TOKEN={'YES' if TG_BOT_TOKEN else 'NO'}",
+    )
+    log("ENV", f"TARGET_CHANNEL_ID={TARGET_CHANNEL_ID} ENABLE_SAVED={ENABLE_SAVED}")
+
+    # Підняти health-сервер у бекграунді
+    threading.Thread(target=start_health_server, daemon=True).start()
 
     try:
-        print("Before start()")
+        log("BOOT", "Starting Pyrogram...")
         app.start()
-        print("After start()")
+        log("BOOT", "Pyrogram started. Idling...")
 
-        idle()  # <-- ОСЬ ГОЛОВНЕ
-
-        print("After idle()")
-        app.stop()
+        idle()  # тримає процес живим
 
     except Exception as e:
-        log("FATAL", f"app crashed: {e}")
+        log("FATAL", f"Runtime error: {e}")
         raise
+    finally:
+        try:
+            log("BOOT", "Stopping Pyrogram...")
+            app.stop()
+            log("BOOT", "Pyrogram stopped.")
+        except Exception as e:
+            log("WARN", f"Error on stop(): {e}")

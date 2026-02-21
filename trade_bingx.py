@@ -3,6 +3,12 @@ import asyncio
 from datetime import datetime
 from pyrogram import Client, filters
 
+def env_required(key: str) -> str:
+    v = os.getenv(key)
+    if v is None or not v.strip():
+        raise RuntimeError(f"Missing/empty ENV: {key}")
+    return v.strip()
+
 API_ID = int(os.getenv("TG_API_ID", "0"))
 API_HASH = os.getenv("TG_API_HASH", "")
 TARGET_CHAT = os.getenv("TARGET_CHAT", "")  # @channel або -100...

@@ -6,6 +6,11 @@ from datetime import datetime
 from dotenv import load_dotenv
 from pyrogram import Client, filters
 
+def worker():
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    # далі твій async/pyrogram код
+
 load_dotenv()
 
 # -------------------- LOG --------------------

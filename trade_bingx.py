@@ -36,11 +36,19 @@ async def heartbeat():
         print(f"[{datetime.now().isoformat(timespec='seconds')}] BOT IS ALIVE")
         await asyncio.sleep(HEARTBEAT_SEC)
 
+from pyrogram import idle
+
 async def main():
     await app.start()
     print("✅ started")
     asyncio.create_task(heartbeat())
+
+    print("➡️ waiting in idle() ...")
     await idle()
 
+    print("🛑 idle() returned, stopping app ...")
+    await app.stop()
+    print("✅ app stopped cleanly")
+    
 if __name__ == "__main__":
     asyncio.run(main())

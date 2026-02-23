@@ -8,7 +8,7 @@ API_ID = int(os.environ["TG_API_ID"])
 API_HASH = os.environ["TG_API_HASH"]
 SESSION_STRING = os.environ["TG_SESSION_STRING"]
 
-TARGET_CHAT_ID = -1002483915667
+TARGET_CHAT_ID = -1002598403649
 
 app = Client(
     name="user",

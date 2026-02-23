@@ -1,6 +1,8 @@
 import os
 import asyncio
 import threading
+import signal
+import contextlib
 from datetime import datetime
 from pyrogram import Client, filters
 
@@ -24,24 +26,36 @@ print("TARGET_CHAT =", TARGET_CHAT)
 
 # ================= HEALTH SERVER =================
 def start_health_server():
-    async def handle(reader, writer):
+    async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
         try:
-            data = await reader.read(1024)
-            if b"GET /health" in data:
+            data = await reader.read(2048)
+            first_line = data.split(b"\r\n", 1)[0] if data else b""
+
+            if first_line.startswith(b"GET /health "):
                 body = b"ok"
                 resp = (
                     b"HTTP/1.1 200 OK\r\n"
                     b"Content-Type: text/plain\r\n"
                     b"Content-Length: 2\r\n"
+                    b"Connection: close\r\n"
                     b"\r\n" + body
                 )
             else:
-                resp = b"HTTP/1.1 404 Not Found\r\n\r\n"
+                body = b"not found"
+                resp = (
+                    b"HTTP/1.1 404 Not Found\r\n"
+                    b"Content-Type: text/plain\r\n"
+                    b"Content-Length: 9\r\n"
+                    b"Connection: close\r\n"
+                    b"\r\n" + body
+                )
 
             writer.write(resp)
             await writer.drain()
         finally:
             writer.close()
+            with contextlib.suppress(Exception):
+                await writer.wait_closed()
 
     async def server():
         port = int(os.getenv("PORT", "8080"))
@@ -69,7 +83,10 @@ app = Client(
 async def on_msg(_, message):
     text = message.text or message.caption
     ts = datetime.now().isoformat(timespec="seconds")
-    print(f"[{ts}] {text}")
+    if text:
+        print(f"[{ts}] {text}")
+    else:
+        print(f"[{ts}] (non-text message)")
 
 async def heartbeat():
     while True:
@@ -77,9 +94,30 @@ async def heartbeat():
         await asyncio.sleep(HEARTBEAT_SEC)
 
 async def main():
-    asyncio.create_task(heartbeat())
+    loop = asyncio.get_running_loop()
+    stop_event = asyncio.Event()
+
+    def _stop():
+        if not stop_event.is_set():
+            stop_event.set()
+
+    # Railway шле SIGTERM при зупинці/деплої
+    with contextlib.suppress(NotImplementedError):
+        loop.add_signal_handler(signal.SIGTERM, _stop)
+        loop.add_signal_handler(signal.SIGINT, _stop)
+
+    hb_task = asyncio.create_task(heartbeat())
     print("✅ BOT STARTED")
-    await asyncio.Event().wait()  # тримає процес живим
+
+    try:
+        # чекаємо поки Railway не попросить завершитись
+        await stop_event.wait()
+    finally:
+        print("🛑 stop signal received, shutting down...")
+
+        hb_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await hb_task
 
 if __name__ == "__main__":
     app.run(main())

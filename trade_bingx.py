@@ -1,7 +1,7 @@
 import os
 import asyncio
 from datetime import datetime
-from pyrogram import Client, filters
+from pyrogram import Client, filters, idle
 
 def req(key: str) -> str:
     v = os.getenv(key)
@@ -17,11 +17,8 @@ TARGET_CHAT_RAW = req("TARGET_CHAT")
 HEARTBEAT_SEC = int(os.getenv("HEARTBEAT_SEC", "300"))
 DEBUG_ALL = os.getenv("DEBUG_ALL", "0").strip() == "1"
 
-# chat id як int
-if TARGET_CHAT_RAW.lstrip("-").isdigit():
-    TARGET_CHAT = int(TARGET_CHAT_RAW)
-else:
-    TARGET_CHAT = TARGET_CHAT_RAW
+# chat id як int (якщо число), інакше username/link
+TARGET_CHAT = int(TARGET_CHAT_RAW) if TARGET_CHAT_RAW.lstrip("-").isdigit() else TARGET_CHAT_RAW
 
 print("SESSION_STRING length:", len(SESSION_STRING))
 print("TARGET_CHAT =", TARGET_CHAT, "(raw:", TARGET_CHAT_RAW, ")")
@@ -42,20 +39,20 @@ async def debug_all(_, message):
 @app.on_message(filters.chat(TARGET_CHAT))
 async def on_msg(_, message):
     text = message.text or message.caption
+    ts = datetime.now().isoformat(timespec="seconds")
     if text:
-        print(f"[{datetime.now().isoformat(timespec='seconds')}] MSG: {text}")
+        print(f"[{ts}] MSG: {text}")
     else:
-        print(f"[{datetime.now().isoformat(timespec='seconds')}] NON-TEXT message")
+        print(f"[{ts}] NON-TEXT message")
 
 async def heartbeat():
     while True:
         print(f"[{datetime.now().isoformat(timespec='seconds')}] BOT IS ALIVE")
         await asyncio.sleep(HEARTBEAT_SEC)
 
-# ---- Async health server (без потоків) ----
+# ---- Async health server (для Railway healthcheck) ----
 async def handle_http(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
     try:
-        # прочитаємо хоч щось з запиту
         await reader.read(1024)
         body = b"ok"
         resp = (
@@ -81,41 +78,32 @@ async def start_health_server():
     return server
 
 async def main():
-    stop_event = asyncio.Event()
-    loop = asyncio.get_running_loop()
-
-    # SIGTERM/SIGINT (Railway) → завершуємося акуратно
-    for sig in ("SIGTERM", "SIGINT"):
-        if hasattr(asyncio, "signals") and False:
-            pass
-    try:
-        import signal
-        loop.add_signal_handler(signal.SIGTERM, stop_event.set)
-        loop.add_signal_handler(signal.SIGINT, stop_event.set)
-    except Exception:
-        # якщо сигнал-хендлери недоступні — нічого страшного
-        pass
-
     health_server = await start_health_server()
 
     await app.start()
     print("✅ started")
-    asyncio.create_task(heartbeat())
 
-    print("➡️ running (waiting stop signal) ...")
-    await stop_event.wait()
+    hb_task = asyncio.create_task(heartbeat())
 
-    print("🛑 stop signal received, shutting down...")
-
-    # закриваємо health server
-    health_server.close()
-    await health_server.wait_closed()
-
-    # Pyrogram stop інколи дає "different loop" на платформах/рестартах
     try:
+        # idle() сам чекає SIGINT/SIGTERM і повертається при стопі
+        print("➡️ running (idle)...")
+        await idle()
+    finally:
+        print("🛑 shutting down...")
+
+        hb_task.cancel()
+        try:
+            await hb_task
+        except Exception:
+            pass
+
+        health_server.close()
+        await health_server.wait_closed()
+
         await app.stop()
-    except RuntimeError as e:
-        print("⚠️ app.stop RuntimeError (ignored):", e)
+        print("✅ stopped")
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    # важливо: НЕ asyncio.run
+    app.run(main)

@@ -1,7 +1,8 @@
 import os
 import asyncio
+import signal
 from datetime import datetime
-from pyrogram import Client, filters, idle
+from pyrogram import Client, filters
 
 def req(key: str) -> str:
     v = os.getenv(key)
@@ -17,7 +18,6 @@ TARGET_CHAT_RAW = req("TARGET_CHAT")
 HEARTBEAT_SEC = int(os.getenv("HEARTBEAT_SEC", "300"))
 DEBUG_ALL = os.getenv("DEBUG_ALL", "0").strip() == "1"
 
-# chat id як int (якщо число), інакше username/link
 TARGET_CHAT = int(TARGET_CHAT_RAW) if TARGET_CHAT_RAW.lstrip("-").isdigit() else TARGET_CHAT_RAW
 
 print("SESSION_STRING length:", len(SESSION_STRING))
@@ -34,7 +34,10 @@ app = Client(
 async def debug_all(_, message):
     if not DEBUG_ALL:
         return
-    print(f"DEBUG CHAT => id={message.chat.id} title={getattr(message.chat,'title',None)} type={message.chat.type}")
+    print(
+        f"DEBUG CHAT => id={message.chat.id} "
+        f"title={getattr(message.chat,'title',None)} type={message.chat.type}"
+    )
 
 @app.on_message(filters.chat(TARGET_CHAT))
 async def on_msg(_, message):
@@ -50,18 +53,34 @@ async def heartbeat():
         print(f"[{datetime.now().isoformat(timespec='seconds')}] BOT IS ALIVE")
         await asyncio.sleep(HEARTBEAT_SEC)
 
-# ---- Async health server (для Railway healthcheck) ----
+# -------------------------
+# Health server for Railway
+# -------------------------
 async def handle_http(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
     try:
-        await reader.read(1024)
-        body = b"ok"
-        resp = (
-            b"HTTP/1.1 200 OK\r\n"
-            b"Content-Type: text/plain\r\n"
-            b"Content-Length: 2\r\n"
-            b"Connection: close\r\n"
-            b"\r\n" + body
-        )
+        req_bytes = await reader.read(2048)
+        first_line = req_bytes.split(b"\r\n", 1)[0] if req_bytes else b""
+
+        # Expecting something like: b"GET /health HTTP/1.1"
+        if first_line.startswith(b"GET /health "):
+            body = b"ok"
+            resp = (
+                b"HTTP/1.1 200 OK\r\n"
+                b"Content-Type: text/plain\r\n"
+                b"Content-Length: 2\r\n"
+                b"Connection: close\r\n"
+                b"\r\n" + body
+            )
+        else:
+            body = b"not found"
+            resp = (
+                b"HTTP/1.1 404 Not Found\r\n"
+                b"Content-Type: text/plain\r\n"
+                b"Content-Length: 9\r\n"
+                b"Connection: close\r\n"
+                b"\r\n" + body
+            )
+
         writer.write(resp)
         await writer.drain()
     finally:
@@ -72,25 +91,42 @@ async def handle_http(reader: asyncio.StreamReader, writer: asyncio.StreamWriter
             pass
 
 async def start_health_server():
-    port = int(os.getenv("PORT", "8080"))
+    port = int(os.getenv("PORT", "8080"))  # Railway дає PORT
     server = await asyncio.start_server(handle_http, "0.0.0.0", port)
     print(f"✅ health server started on 0.0.0.0:{port}")
     return server
 
-async def main():
-    health_server = await start_health_server()
+# -------------------------
+# Async "idle" (SIGTERM/SIGINT)
+# -------------------------
+async def wait_for_stop_signal():
+    stop_event = asyncio.Event()
+    loop = asyncio.get_running_loop()
 
-    await app.start()
-    print("✅ started")
-
-    hb_task = asyncio.create_task(heartbeat())
+    def _stop():
+        if not stop_event.is_set():
+            stop_event.set()
 
     try:
-        # idle() сам чекає SIGINT/SIGTERM і повертається при стопі
-        print("➡️ running (idle)...")
-        await idle()
+        loop.add_signal_handler(signal.SIGTERM, _stop)
+        loop.add_signal_handler(signal.SIGINT, _stop)
+    except NotImplementedError:
+        # на всяк випадок (наприклад, якщо десь Windows)
+        pass
+
+    await stop_event.wait()
+
+async def main():
+    health_server = await start_health_server()
+    hb_task = asyncio.create_task(heartbeat())
+
+    print("✅ started")
+    print("➡️ running (waiting stop signal) ...")
+
+    try:
+        await wait_for_stop_signal()
     finally:
-        print("🛑 shutting down...")
+        print("🛑 stop signal received, shutting down...")
 
         hb_task.cancel()
         try:
@@ -101,9 +137,6 @@ async def main():
         health_server.close()
         await health_server.wait_closed()
 
-        await app.stop()
-        print("✅ stopped")
-
 if __name__ == "__main__":
-    # важливо: НЕ asyncio.run
-    app.run(main)
+    # ВАЖЛИВО: саме main() (корутина), не main
+    app.run(main())

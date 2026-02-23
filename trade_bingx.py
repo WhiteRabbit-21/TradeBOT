@@ -104,5 +104,27 @@ async def main():
     print("✅ app stopped cleanly")
 
 
+import threading
+from http.server import BaseHTTPRequestHandler, HTTPServer
+
+
+def start_http_server():
+    port = int(os.getenv("PORT", "8080"))
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(b"ok")
+
+        def log_message(self, *args):
+            return
+
+    server = HTTPServer(("0.0.0.0", port), Handler)
+    server.serve_forever()
+
+
 if __name__ == "__main__":
+    threading.Thread(target=start_http_server, daemon=True).start()
+    print("✅ health server started")
     asyncio.run(main())

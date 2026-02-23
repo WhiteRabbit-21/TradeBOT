@@ -10,8 +10,6 @@ API_HASH = os.environ["TG_API_HASH"]
 SESSION_STRING = os.environ["TG_SESSION_STRING"]
 
 TARGET_CHAT_ID = int(os.getenv("TARGET_CHAT_ID", "-1002598403649"))
-
-# твій приватний канал для логів:
 LOG_CHAT_ID = int(os.getenv("TG_LOG_CHAT_ID", "-1003828203122"))
 
 # --- Logging config (hardcoded) ---
@@ -60,7 +58,7 @@ def log(level: str, msg: str):
     """
     INFO/DEBUG -> в буфер
     ERROR -> одразу
-    WARNING -> одразу тільки якщо "важливий" (можеш поміняти правило)
+    WARNING -> одразу тільки якщо "важливий"
     """
     lvl_name = level.upper()
     lvl = _LEVELS.get(lvl_name, 20)
@@ -71,7 +69,6 @@ def log(level: str, msg: str):
 
     # ERROR -> immediately
     if lvl_name == "ERROR":
-        # одразу в TG (через task, бо ми в sync контексті інколи)
         try:
             loop = asyncio.get_event_loop()
             loop.create_task(_send_to_tg(line))
@@ -79,7 +76,7 @@ def log(level: str, msg: str):
             pass
         return
 
-    # IMPORTANT WARNING -> immediately (правило: якщо є ключові слова)
+    # IMPORTANT WARNING -> immediately
     if lvl_name == "WARNING" and any(k in msg.lower() for k in ["peer", "invalid", "failed", "error", "denied"]):
         try:
             loop = asyncio.get_event_loop()
@@ -88,7 +85,6 @@ def log(level: str, msg: str):
             pass
         return
 
-    # everything else -> queue
     try:
         _log_queue.put_nowait((lvl_name, line))
     except Exception:
@@ -96,14 +92,10 @@ def log(level: str, msg: str):
 
 
 async def log_pump():
-    """
-    Зливає INFO/DEBUG (і не-термінові WARNING) пачкою кожні LOG_FLUSH_SEC.
-    """
+    """Зливає INFO/DEBUG пачкою кожні LOG_FLUSH_SEC."""
     buf: list[str] = []
-
     while True:
         try:
-            # чекаємо хоча б один лог
             _, line = await _log_queue.get()
             buf.append(line)
 
@@ -121,7 +113,6 @@ async def log_pump():
             if not buf:
                 continue
 
-            # Ріжемо на шматки до ~3500 символів
             chunk = ""
             for ln in buf:
                 if len(chunk) + len(ln) + 1 > 3500:
@@ -133,7 +124,6 @@ async def log_pump():
                 await _send_to_tg(chunk.strip())
 
             buf.clear()
-
         except Exception:
             await asyncio.sleep(1)
 
@@ -164,7 +154,6 @@ async def ensure_peer_known(chat_id: int) -> bool:
 
         log("ERROR", f"❌ Не знайшов chat_id={chat_id} у dialogs.")
         return False
-
     except Exception as e:
         log("ERROR", f"❌ dialogs scan error: {e}")
         return False
@@ -180,30 +169,36 @@ async def on_message(_, message):
 
 
 async def main():
-    # запускаємо лог-памп
+    # ✅ ВАЖЛИВО: коли run() з coroutine — клієнт треба стартувати вручну
+    await app.start()
+
+    # ✅ log_pump запускаємо ПІСЛЯ start(), інакше send_message впаде
     asyncio.create_task(log_pump())
 
-    me = await app.get_me()
-    log("INFO", f"✅ Logged in as: @{me.username or ''} {me.first_name or ''}".strip())
+    try:
+        me = await app.get_me()
+        log("INFO", f"✅ Logged in as: @{me.username or ''} {me.first_name or ''}".strip())
 
-    # прогріваємо target
-    ok = await ensure_peer_known(TARGET_CHAT_ID)
-    while not ok:
-        log("WARNING", "⏳ TARGET retry in 60s…")
-        await asyncio.sleep(60)
         ok = await ensure_peer_known(TARGET_CHAT_ID)
+        while not ok:
+            log("WARNING", "⏳ TARGET retry in 60s…")
+            await asyncio.sleep(60)
+            ok = await ensure_peer_known(TARGET_CHAT_ID)
 
-    # прогріваємо лог-канал
-    if LOG_CHAT_ID != 0:
-        ok2 = await ensure_peer_known(LOG_CHAT_ID)
-        if ok2:
-            await _send_to_tg(f"[{_ts()}] [INFO] 🧾 Telegram logging ON. log_chat_id={LOG_CHAT_ID}")
-        else:
-            await _send_to_tg(f"[{_ts()}] [ERROR] 🧾 Telegram logging FAILED. log_chat_id={LOG_CHAT_ID}")
+        if LOG_CHAT_ID != 0:
+            ok2 = await ensure_peer_known(LOG_CHAT_ID)
+            if ok2:
+                await _send_to_tg(f"[{_ts()}] [INFO] 🧾 Telegram logging ON. log_chat_id={LOG_CHAT_ID}")
+            else:
+                await _send_to_tg(f"[{_ts()}] [ERROR] 🧾 Telegram logging FAILED. log_chat_id={LOG_CHAT_ID}")
 
-    log("INFO", "👂 Listening…")
-    await idle()
+        log("INFO", "👂 Listening…")
+        await idle()
+
+    finally:
+        # ✅ гарантуємо коректну зупинку
+        await app.stop()
 
 
 if __name__ == "__main__":
-    app.run(main())   # ✅ ОБОВʼЯЗКОВО З ДУЖКАМИ
+    app.run(main())  # ✅ з дужками

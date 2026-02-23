@@ -1,8 +1,7 @@
 import os
 import asyncio
 from datetime import datetime
-from pyrogram import Client, filters, idle
-
+from pyrogram import Client, filters
 
 def req(key: str) -> str:
     v = os.getenv(key)
@@ -10,17 +9,15 @@ def req(key: str) -> str:
         raise RuntimeError(f"Missing/empty ENV: {key}")
     return v.strip()
 
-
 API_ID = int(req("TG_API_ID"))
 API_HASH = req("TG_API_HASH")
 SESSION_STRING = req("TG_SESSION_STRING")
 
-TARGET_CHAT_RAW = req("TARGET_CHAT")  # може бути @username або -100...
+TARGET_CHAT_RAW = req("TARGET_CHAT")
 HEARTBEAT_SEC = int(os.getenv("HEARTBEAT_SEC", "300"))
-DUMP_HISTORY = os.getenv("DUMP_HISTORY", "0").strip() == "1"  # опційно
-HISTORY_LIMIT = int(os.getenv("HISTORY_LIMIT", "5"))
+DEBUG_ALL = os.getenv("DEBUG_ALL", "0").strip() == "1"
 
-# ✅ ВАЖЛИВО: якщо chat id — конвертуємо в int
+# chat id як int
 if TARGET_CHAT_RAW.lstrip("-").isdigit():
     TARGET_CHAT = int(TARGET_CHAT_RAW)
 else:
@@ -36,95 +33,89 @@ app = Client(
     session_string=SESSION_STRING,
 )
 
-# ✅ DEBUG: показує, що реально прилітає (chat.id, title, type)
-# Якщо не хочеш спам — постав DEBUG_ALL=0 в Railway
-DEBUG_ALL = os.getenv("DEBUG_ALL", "1").strip() == "1"
-
-
 @app.on_message()
 async def debug_all(_, message):
     if not DEBUG_ALL:
         return
-    # покажемо тільки мету, без всіх текстів, щоб не спамити
-    print(
-        f"DEBUG CHAT => id={message.chat.id} title={getattr(message.chat, 'title', None)} "
-        f"type={message.chat.type}"
-    )
-
+    print(f"DEBUG CHAT => id={message.chat.id} title={getattr(message.chat,'title',None)} type={message.chat.type}")
 
 @app.on_message(filters.chat(TARGET_CHAT))
 async def on_msg(_, message):
-    # ловимо текст/підпис або хоч якийсь тип контенту
     text = message.text or message.caption
     if text:
         print(f"[{datetime.now().isoformat(timespec='seconds')}] MSG: {text}")
     else:
-        # якщо нема тексту — покажемо тип контенту
-        print(
-            f"[{datetime.now().isoformat(timespec='seconds')}] NON-TEXT message: "
-            f"photo={bool(message.photo)} video={bool(message.video)} document={bool(message.document)} "
-            f"sticker={bool(message.sticker)}"
-        )
-
+        print(f"[{datetime.now().isoformat(timespec='seconds')}] NON-TEXT message")
 
 async def heartbeat():
     while True:
         print(f"[{datetime.now().isoformat(timespec='seconds')}] BOT IS ALIVE")
         await asyncio.sleep(HEARTBEAT_SEC)
 
-
-async def dump_last_messages():
-    print(f"📥 Dump last {HISTORY_LIMIT} messages from {TARGET_CHAT} ...")
+# ---- Async health server (без потоків) ----
+async def handle_http(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
     try:
-        async for m in app.get_chat_history(TARGET_CHAT, limit=HISTORY_LIMIT):
-            t = m.text or m.caption or ""
-            if t:
-                print("-", t[:200])
-            else:
-                print("-", "[no text]")
-    except Exception as e:
-        print("❌ dump_last_messages error:", repr(e))
+        # прочитаємо хоч щось з запиту
+        await reader.read(1024)
+        body = b"ok"
+        resp = (
+            b"HTTP/1.1 200 OK\r\n"
+            b"Content-Type: text/plain\r\n"
+            b"Content-Length: 2\r\n"
+            b"Connection: close\r\n"
+            b"\r\n" + body
+        )
+        writer.write(resp)
+        await writer.drain()
+    finally:
+        writer.close()
+        try:
+            await writer.wait_closed()
+        except Exception:
+            pass
 
+async def start_health_server():
+    port = int(os.getenv("PORT", "8080"))
+    server = await asyncio.start_server(handle_http, "0.0.0.0", port)
+    print(f"✅ health server started on 0.0.0.0:{port}")
+    return server
 
 async def main():
+    stop_event = asyncio.Event()
+    loop = asyncio.get_running_loop()
+
+    # SIGTERM/SIGINT (Railway) → завершуємося акуратно
+    for sig in ("SIGTERM", "SIGINT"):
+        if hasattr(asyncio, "signals") and False:
+            pass
+    try:
+        import signal
+        loop.add_signal_handler(signal.SIGTERM, stop_event.set)
+        loop.add_signal_handler(signal.SIGINT, stop_event.set)
+    except Exception:
+        # якщо сигнал-хендлери недоступні — нічого страшного
+        pass
+
+    health_server = await start_health_server()
+
     await app.start()
     print("✅ started")
-
     asyncio.create_task(heartbeat())
 
-    # опційно: зчитати останні повідомлення одразу після старту
-    if DUMP_HISTORY:
-        await dump_last_messages()
+    print("➡️ running (waiting stop signal) ...")
+    await stop_event.wait()
 
-    print("➡️ waiting in idle() ...")
-    await idle()
+    print("🛑 stop signal received, shutting down...")
 
-    print("🛑 idle() returned, stopping app ...")
-    await app.stop()
-    print("✅ app stopped cleanly")
+    # закриваємо health server
+    health_server.close()
+    await health_server.wait_closed()
 
-
-import threading
-from http.server import BaseHTTPRequestHandler, HTTPServer
-
-
-def start_http_server():
-    port = int(os.getenv("PORT", "8080"))
-
-    class Handler(BaseHTTPRequestHandler):
-        def do_GET(self):
-            self.send_response(200)
-            self.end_headers()
-            self.wfile.write(b"ok")
-
-        def log_message(self, *args):
-            return
-
-    server = HTTPServer(("0.0.0.0", port), Handler)
-    server.serve_forever()
-
+    # Pyrogram stop інколи дає "different loop" на платформах/рестартах
+    try:
+        await app.stop()
+    except RuntimeError as e:
+        print("⚠️ app.stop RuntimeError (ignored):", e)
 
 if __name__ == "__main__":
-    threading.Thread(target=start_http_server, daemon=True).start()
-    print("✅ health server started")
     asyncio.run(main())

@@ -180,9 +180,7 @@ async def on_message(_, message):
 
 
 async def main():
-    await app.start()
-
-    # запускаємо лог-памп (для INFO пачок)
+    # запускаємо лог-памп
     asyncio.create_task(log_pump())
 
     me = await app.get_me()
@@ -199,15 +197,13 @@ async def main():
     if LOG_CHAT_ID != 0:
         ok2 = await ensure_peer_known(LOG_CHAT_ID)
         if ok2:
-            # ці 2 — важливо бачити одразу
             await _send_to_tg(f"[{_ts()}] [INFO] 🧾 Telegram logging ON. log_chat_id={LOG_CHAT_ID}")
         else:
             await _send_to_tg(f"[{_ts()}] [ERROR] 🧾 Telegram logging FAILED. log_chat_id={LOG_CHAT_ID}")
 
     log("INFO", "👂 Listening…")
     await idle()
-    await app.stop()
 
 
 if __name__ == "__main__":
-    app.run(main)
+    app.run(main())   # ✅ ОБОВʼЯЗКОВО З ДУЖКАМИ

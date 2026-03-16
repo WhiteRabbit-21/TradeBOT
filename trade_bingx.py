@@ -689,7 +689,11 @@ def parse_set_sl_local(text: str) -> Optional[dict]:
 
     if any(re.search(p, low, re.I) for p in SET_SL_BLOCK_WORDS):
         return None
-
+    
+    # ignore if it looks like an OPEN signal
+    if re.search(r"\b(open|entry|long|short|target|lev|leverage|balance)\b", low):
+        return None
+    
     if not re.search(r"\b(stop\s*loss|stoploss|sl)\b", low, re.I):
         return None
 
@@ -723,6 +727,70 @@ def parse_set_sl_local(text: str) -> Optional[dict]:
         "raw_text": t[:500],
     }
 
+def parse_signal_block(text: str) -> Optional[dict]:
+
+    if not text:
+        return None
+
+    t = text.upper()
+
+    if not re.search(r"(market\s*entry|open\s+(long|short))", t):
+        return None
+
+    # BASE
+    m = re.search(r"#([A-Z0-9]+)USDT", t)
+    if not m:
+        return None
+    base = m.group(1)
+
+    # SIDE
+    if "SHORT" in t:
+        side = "short"
+    elif "LONG" in t:
+        side = "long"
+    else:
+        return None
+
+    # RISK %
+    risk = None
+    m = re.search(r"([0-9.]+)%\s*BALANCE", t)
+    if m:
+        risk = float(m.group(1))
+
+    # SL
+    sl = None
+    m = re.search(r"SL[: ]+([0-9.]+)", t)
+    if m:
+        sl = float(m.group(1))
+
+    # TARGETS
+    targets = re.findall(r"[0-9]+[: ]+([0-9.]+)", t)
+    tp = float(targets[0]) if targets else None
+
+    # LEVERAGE
+    lev = None
+    m = re.search(r"X([0-9]+)", t)
+    if m:
+        lev = int(m.group(1))
+
+    # DCA
+    dca = None
+    m = re.search(r"DCA ORDER[:\n ]+([0-9.]+)", t)
+    if m:
+        dca = float(m.group(1))
+
+    return {
+        "action": "OPEN",
+        "base": base,
+        "side": side,
+        "risk_pct": risk,
+        "leverage": lev,
+        "sl": sl,
+        "tp": tp,
+        "dca": dca,
+        "confidence": 1.0,
+        "raw_text": text[:500],
+    }
 
 # =========================
 # AI PARSER (text + images)
@@ -990,58 +1058,83 @@ async def handle_ai_command(cmd: dict):
         except Exception as e:
             log("ERROR", f"OPEN failed: {e}")
         return
+    # -------------------------
+    # ADD (from balance)
+    # -------------------------
 
-    # -------------------------
-    # ADD (+ optional SL update)
-    # -------------------------
     if action == "ADD":
-        if not base:
-            log("INFO", "AI SKIP ADD: base missing")
+
+        pct = risk_pct or add_pct
+
+        if not base or pct is None:
+            log("INFO", "ADD skip: base or pct missing")
             return
 
         base_clean = _clean_base(base)
         symbol = await resolve_symbol(base_clean)
+
         if not symbol:
-            log("ERROR", f"ADD skip: symbol not listed on BingX: {base_clean}/USDT")
-            return
-
-        new_sl = float(sl) if sl is not None else None
-
-        if DRY_RUN:
-            log("INFO", f"DRY_RUN ADD {base_clean} skipped (test mode)")
-            if new_sl is not None:
-                log("INFO", f"DRY_RUN After ADD would update SL for {base_clean} -> {new_sl}")
+            log("ERROR", f"symbol not listed: {base_clean}")
             return
 
         try:
-            res = await add_position_oneway(base_clean, add_pct)
-            log("INFO", f"SUCCESS ADD {base_clean}: {res}")
+            entry = float((await asyncio.to_thread(exchange.fetch_ticker, symbol))["last"])
         except Exception as e:
-            log("ERROR", f"ADD failed: {e}")
-            return
-
-        # оновлюємо SL тільки якщо він явно був у повідомленні
-        if new_sl is None:
-            log("INFO", f"ADD done, SL not provided -> keep existing SL ({base_clean})")
+            log("ERROR", f"ticker failed: {e}")
             return
 
         pos = await fetch_position_oneway(symbol)
-        pos_side = (pos.get("side") or "").lower() if pos else None
-        if pos_side in {"long", "short"}:
-            try:
-                last = float((await asyncio.to_thread(exchange.fetch_ticker, symbol))["last"])
-                new_sl = normalize_price_from_tail(float(new_sl), last, pos_side, "sl")
-                log("INFO", f"FIX ADD->SET_SL {base_clean}: normalized SL -> {new_sl}")
-            except Exception:
-                pass
+
+        if not pos:
+            log("ERROR", "ADD: no existing position")
+            return
+
+        side = (pos.get("side") or "").lower()
+
+        if side not in {"long", "short"}:
+            log("ERROR", "ADD: no existing position")
+            return
+
+        lev = int(float(pos.get("leverage") or 1))
 
         try:
-            res2 = await set_sl_oneway(base_clean, float(new_sl))  # cancel old SL inside
-            log("INFO", f"SUCCESS ADD->SET_SL {base_clean}: {res2}")
-        except Exception as e:
-            log("ERROR", f"ADD->SET_SL failed: {e}")
-        return
+            usdt_free = await get_usdt_free()
 
+            margin = usdt_free * (pct / 100)
+            notional = margin * lev
+            qty_raw = notional / entry
+
+            qty = float(await asyncio.to_thread(exchange.amount_to_precision, symbol, qty_raw))
+
+        except Exception as e:
+            log("ERROR", f"balance calc failed: {e}")
+            return
+
+        if qty <= 0:
+            log("INFO", "ADD qty=0")
+            return
+
+        if DRY_RUN:
+            log("INFO", f"DRY_RUN ADD {base_clean}")
+            return
+
+        try:
+            resp = await open_market(symbol, side, qty)
+            log("INFO", f"SUCCESS ADD {base_clean} qty={qty}")
+
+        except Exception as e:
+            log("ERROR", f"ADD failed {e}")
+            return
+
+        if sl:
+            try:
+                r = await set_sl_oneway(base_clean, float(sl))
+                log("INFO", f"UPDATED SL {r}")
+            except Exception as e:
+                log("ERROR", f"SL update failed {e}")
+
+        return
+    
     # -------------------------
     # SET_SL (always cancel old -> set new)
     # -------------------------
@@ -1317,6 +1410,14 @@ async def on_signal(_, message):
             log("INFO", f"LOCAL SET_SL detected base={local['base']} sl={local['sl']}")
             await handle_ai_command(local)
             return
+        
+    # PRIORITY: structured signal block
+    sig = parse_signal_block(text) if text else None
+    if sig and sig.get("leverage") and sig.get("risk_pct"):
+        sig["_tg_text"] = text
+        log("INFO", f"LOCAL SIGNAL detected base={sig['base']} side={sig['side']}")
+        await handle_ai_command(sig)
+        return
 
     # close intent -> bundle
     if text and has_close_intent(text):

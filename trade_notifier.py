@@ -1,48 +1,56 @@
 import asyncio
-import time
 import os
 
 LOG_CHAT_ID = int(os.getenv("TG_LOG_CHAT_ID", "-5184386267"))
 
-last_checked = 0
+last_positions = {}
 
-async def pnl_watcher(app, exchange, log, interval=10):
-    global last_checked
+
+async def pnl_watcher(app, exchange, log, interval=5):
+
+    global last_positions
 
     while True:
         try:
-            trades = await asyncio.to_thread(exchange.fetch_my_trades)
+            positions = await asyncio.to_thread(exchange.fetch_positions)
 
-            for t in trades:
-                ts = t.get("timestamp", 0)
+            current = {}
 
-                if ts <= last_checked:
-                    continue
+            for p in positions:
+                symbol = p.get("symbol")
+                size = float(p.get("contracts") or p.get("positionAmt") or 0)
 
-                info = t.get("info", {})
-                pnl_raw = info.get("realizedPnl") or info.get("profit")
+                if size > 0:
+                    current[symbol] = p
 
-                if pnl_raw is None:
-                    continue
+            # 🔥 перевіряємо що закрилось
+            for symbol, old_pos in last_positions.items():
 
-                pnl = float(pnl_raw)
-                symbol = t.get("symbol", "")
-                side = t.get("side", "")
-                amount = t.get("amount", 0)
+                if symbol not in current:
+                    # позиція ЗАКРИЛАСЬ
+                    pnl = float(
+                        old_pos.get("unrealizedPnl")
+                        or old_pos.get("info", {}).get("unrealizedProfit")
+                        or 0
+                    )
 
-                status = "🟢 PROFIT" if pnl > 0 else "🔴 LOSS"
+                    side = old_pos.get("side")
+                    qty = old_pos.get("contracts")
 
-                msg = (
-                    f"{status}\n"
-                    f"Symbol: {symbol}\n"
-                    f"Side: {side}\n"
-                    f"PnL: {pnl}\n"
-                    f"Qty: {amount}"
-                )
+                    status = "🟢 PROFIT" if pnl > 0 else "🔴 LOSS"
 
-                await app.send_message(chat_id=LOG_CHAT_ID, text=msg)
+                    msg = (
+                        f"{status}\n"
+                        f"Symbol: {symbol}\n"
+                        f"Side: {side}\n"
+                        f"PnL: {round(pnl, 4)}\n"
+                        f"Qty: {qty}"
+                    )
 
-                last_checked = ts
+                    await app.send_message(LOG_CHAT_ID, msg)
+
+            # оновлюємо стан
+            last_positions = current
 
         except Exception as e:
             log("ERROR", f"PNL watcher error: {e}")

@@ -7,7 +7,7 @@ import base64
 import asyncio
 from datetime import datetime
 from typing import Optional, Any
-
+from trade_notifier import pnl_watcher
 import ccxt
 from pyrogram import Client, filters, idle
 from pyrogram.errors import PeerIdInvalid, FloodWait, RPCError
@@ -1438,6 +1438,7 @@ async def on_signal(_, message):
 # =========================
 async def main():
     await app.start()
+    asyncio.create_task(pnl_watcher(app, exchange, log, LOG_CHAT_ID))
     asyncio.create_task(log_pump())
 
     try:

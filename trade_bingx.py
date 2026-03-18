@@ -344,7 +344,7 @@ def close_position_full_hedge_sync(base: str):
             contracts,
             None,
             {
-                "reduceOnly": True,
+                
                 "positionSide": "LONG" if side == "long" else "SHORT"
             }
         )
@@ -449,10 +449,10 @@ def set_sl_oneway_sync(base: str, sl_price: float) -> str:
     old = find_and_cancel_existing_stop_sync(symbol, stop_side)
 
     candidates = [
-        ("stopMarket", {"stopPrice": sl_prec, "reduceOnly": True}),
-        ("stop_market", {"stopPrice": sl_prec, "reduceOnly": True}),
-        ("stop", {"stopPrice": sl_prec, "reduceOnly": True}),
-        ("market", {"triggerPrice": sl_prec, "reduceOnly": True}),
+    ("stopMarket", {"stopPrice": sl_prec}),
+    ("stop_market", {"stopPrice": sl_prec}),
+    ("stop", {"stopPrice": sl_prec}),
+    ("market", {"triggerPrice": sl_prec}),
     ]
 
     last_err = None
@@ -512,7 +512,6 @@ def set_tp_oneway_sync(base: str, tp_price: float) -> str:
     contracts,
     tp_prec,
     {
-        "reduceOnly": True,
         "positionSide": "LONG" if pos_side == "long" else "SHORT"
     }
 )
@@ -1049,7 +1048,9 @@ async def handle_ai_command(cmd: dict):
         except Exception as e:
             log("ERROR", f"OPEN FAILED: {e}")
             return
-        # -------------------------
+        return    
+    
+    # -------------------------
     # ADD (from balance)
     # -------------------------
 

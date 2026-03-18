@@ -1493,6 +1493,25 @@ async def on_signal(_, message):
         sig["_tg_text"] = text
         log("INFO", f"LOCAL SIGNAL detected base={sig['base']} side={sig['side']}")
         log("INFO", f"LOCAL PARSED: {sig}")
+
+        # 🔥 якщо чогось не вистачає → відправляємо в AI
+        if not sig.get("leverage") or not sig.get("risk_pct"):
+            log("INFO", "LOCAL incomplete → fallback to AI")
+
+            cmd = await asyncio.to_thread(
+                ai_parse_trade_multi,
+                text,
+                [img_path] if img_path else []
+            )
+
+            cmd["_tg_text"] = text
+
+            # 🔥 merge local + AI
+            sig["leverage"] = sig.get("leverage") or cmd.get("leverage")
+            sig["risk_pct"] = sig.get("risk_pct") or cmd.get("risk_pct")
+            sig["tp"] = sig.get("tp") or cmd.get("tp")
+            sig["sl"] = sig.get("sl") or cmd.get("sl")
+
         await handle_ai_command(sig)
         return
 

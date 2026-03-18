@@ -734,7 +734,7 @@ def parse_signal_block(text: str) -> Optional[dict]:
 
     t = text.upper()
 
-    if not re.search(r"(market|order)", t):
+    if not re.search(r"(long|short)", t):
         return None
 
     # BASE
@@ -971,6 +971,7 @@ def _clean_base(x: str) -> str:
     b = b.replace(":", "")
     b = TOKEN_ALIASES.get(b, b)
     return b
+
 
 async def handle_ai_command(cmd: dict):
     action = (cmd.get("action") or "NONE").upper()
@@ -1488,9 +1489,10 @@ async def on_signal(_, message):
         
     # PRIORITY: structured signal block
     sig = parse_signal_block(text) if text else None
-    if sig and sig.get("leverage") and sig.get("risk_pct"):
+    if sig:
         sig["_tg_text"] = text
         log("INFO", f"LOCAL SIGNAL detected base={sig['base']} side={sig['side']}")
+        log("INFO", f"LOCAL PARSED: {sig}")
         await handle_ai_command(sig)
         return
 

@@ -681,200 +681,80 @@ def _normalize_base_word(w: str) -> Optional[str]:
         b = b[:-4]
     return b
 
-def parse_set_sl_local(text: str) -> Optional[dict]:
-    if not text:
-        return None
-    t = text.strip()
-    low = t.lower()
-
-    if any(re.search(p, low, re.I) for p in SET_SL_BLOCK_WORDS):
-        return None
-    
-    # ignore if it looks like an OPEN signal
-    if re.search(r"\b(open|entry|long|short|target|lev|leverage|balance)\b", low):
-        return None
-    
-    if not re.search(r"\b(stop\s*loss|stoploss|sl)\b", low, re.I):
-        return None
-
-    m_price = re.search(r"\bto\s*([0-9]+(?:\.[0-9]+)?)\b", t, re.I)
-    if not m_price:
-        m_price = re.search(r"\b(?:stop\s*loss|stoploss|sl)\b[^0-9]*([0-9]+(?:\.[0-9]+)?)\b", t, re.I)
-    if not m_price:
-        return None
-
-    sl = float(m_price.group(1))
-
-    candidates = re.findall(r"\b[A-Z0-9]{2,15}\b", t.upper())
-    bad = {"MOVE", "STOP", "LOSS", "STOPLOSS", "SL", "TO", "FOR", "TIME", "BEING", "THE", "A", "AN", "MY"}
-    base = None
-    for c in candidates:
-        if c in bad:
-            continue
-        if re.fullmatch(r"[0-9]+(?:\.[0-9]+)?", c):
-            continue
-        base = _normalize_base_word(c)
-        break
-
-    if not base:
-        return None
-
-    return {
-        "action": "SET_SL",
-        "base": base,
-        "sl": sl,
-        "confidence": 1.0,
-        "raw_text": t[:500],
-    }
-
-def parse_signal_block(text: str) -> Optional[dict]:
-
-    if not text:
-        return None
-
-    t = text.upper()
-
-    if not re.search(r"(long|short)", t):
-        return None
-
-    # BASE
-    m = re.search(r"#?([A-Z0-9]+)USDT", t)
-    if not m:
-        return None
-    base = m.group(1)
-
-    # SIDE
-    if "SHORT" in t:
-        side = "short"
-    elif "LONG" in t:
-        side = "long"
-    else:
-        return None
-
-    # RISK %
-    risk = None
-    m = re.search(r"([0-9.]+)%\s*BALANCE", t)
-    if m:
-        risk = float(m.group(1))
-
-    # SL
-    sl = None
-    m = re.search(r"SL[: ]+([0-9.]+)", t)
-    if m:
-        sl = float(m.group(1))
-
-    # TARGETS
-    m = re.search(r"TARGETS?:\s*([0-9.]+)", t)
-    tp = float(m.group(1)) if m else None
-
-    # LEVERAGE
-    lev = None
-    m = re.search(r"X([0-9]+)", t)
-    if m:
-        lev = int(m.group(1))
-
-    # DCA
-    dca = None
-    m = re.search(r"DCA ORDER[:\n ]+([0-9.]+)", t)
-    if m:
-        dca = float(m.group(1))
-
-    return {
-        "action": "OPEN",
-        "base": base,
-        "side": side,
-        "risk_pct": risk,
-        "leverage": lev,
-        "sl": sl,
-        "tp": tp,
-        "dca": dca,
-        "confidence": 1.0,
-        "raw_text": text[:500],
-    }
-
 # =========================
 # AI PARSER (text + images)
 # =========================
 AI_SYSTEM = """
 You are a crypto futures trading signal parser.
 
-Your task:
-Convert Telegram trading signals into structured JSON.
+Your ONLY task:
+Convert ANY trading signal into VALID JSON.
 
-STRICT RULES:
-- Always return JSON only
-- Never return NONE if it looks like a valid trade
-- Extract base WITHOUT USDT
-- Detect LONG or SHORT
-- Detect leverage (X10, 10x etc)
-- Detect risk (e.g. 1.5% balance)
-- Detect SL
-- Detect TARGET → take FIRST number as TP
-If ENTRY is not provided:
-- assume ENTRY ≈ current price
-- still return OPEN
-- do NOT return NONE just because entry is missing
+CRITICAL RULES:
+- ALWAYS return JSON
+- NEVER return NONE if there is ANY of:
+  base, SL, TP, LONG, SHORT
+
+- If signal looks like a trade → ALWAYS return OPEN
+
+- ENTRY can be missing → assume it's valid
 
 ---
 
-RISK REWARD (RR):
-- For LONG:
-  RR = (TP - ENTRY) / (ENTRY - SL)
+EXTRACTION:
 
-- For SHORT:
-  RR = (ENTRY - TP) / (SL - ENTRY)
+BASE:
+- Extract from #ETHUSDT → ETH
+- Remove USDT
 
-- If RR < 1 → low quality trade → set confidence lower (<0.7)
-- If RR >= 2 → high quality → confidence > 0.85
+SIDE:
+- LONG or SHORT
+
+LEVERAGE:
+- X10, 10x → 10
+
+RISK:
+- "1.5% balance" → 1.5
+
+SL:
+- number after SL
+
+TP:
+- first number from TARGET
 
 ---
 
-SUPPORTED ACTIONS:
-OPEN, ADD, CLOSE, SET_SL, SET_TP, BE
+RR CALCULATION:
+
+LONG:
+RR = (TP - ENTRY) / (ENTRY - SL)
+
+SHORT:
+RR = (ENTRY - TP) / (SL - ENTRY)
 
 ---
 
-EXAMPLES:
+CONFIDENCE:
 
-INPUT:
-#ETHUSDT
-LONG MARKET PRICE ORDER
-SL: 2260
-TARGET: 2420-2460
-LEVERAGE CROSS X30
-WITH 1.5% BALANCE
+- RR < 1 → 0.5
+- RR 1-2 → 0.75
+- RR > 2 → 0.9+
 
-OUTPUT:
+---
+
+OUTPUT FORMAT:
+
 {
   "action": "OPEN",
-  "base": "ETH",
-  "side": "long",
-  "leverage": 30,
-  "risk_pct": 1.5,
-  "sl": 2260,
-  "tp": 2420,
+  "base": "...",
+  "side": "...",
+  "leverage": ...,
+  "risk_pct": ...,
+  "sl": ...,
+  "tp": ...,
   "add_pct": null,
-  "rr": 2.1,
-  "confidence": 0.92
-}
-
----
-
-INPUT:
-Add 0.65% to ETH
-
-OUTPUT:
-{
-  "action": "ADD",
-  "base": "ETH",
-  "side": null,
-  "leverage": null,
-  "risk_pct": null,
-  "sl": null,
-  "tp": null,
-  "add_pct": 0.65,
-  "rr": null,
-  "confidence": 0.9
+  "rr": ...,
+  "confidence": ...
 }
 """
 
@@ -938,17 +818,28 @@ def ai_parse_trade_multi(text: Optional[str], image_paths: Optional[list[str]]) 
 
     try:
         data = json.loads(out)
+
         log("INFO", f"AI_PARSED: {data}")
         log("INFO", f"AI_JSON:\n{json.dumps(data, indent=2, ensure_ascii=False)}")
+
         if not isinstance(data, dict):
             raise ValueError("not dict")
+
         data.setdefault("action", "NONE")
         data.setdefault("confidence", 0.0)
         data.setdefault("raw_text", (text or "")[:500])
-        return data
-    except Exception:
-        return {"action": "NONE", "confidence": 0.0, "raw_text": out[:800]}
 
+        return data
+
+    except Exception as e:
+        log("ERROR", f"AI JSON PARSE FAILED: {e}")
+        log("ERROR", f"RAW WAS:\n{out}")
+
+        return {
+            "action": "NONE",
+            "confidence": 0.0,
+            "raw_text": out[:800]
+        }
 
 # =========================
 # ACTION MIN CONF
@@ -1478,44 +1369,7 @@ async def on_signal(_, message):
         cmd["_tg_text"] = ""
         await handle_ai_command(cmd)
         return
-
-    # ✅ PRIORITY: local SET_SL without AI (and without BE/ADD)
-    if text:
-        local = parse_set_sl_local(text)
-        if local:
-            local["_tg_text"] = text
-            log("INFO", f"LOCAL SET_SL detected base={local['base']} sl={local['sl']}")
-            await handle_ai_command(local)
-            return
         
-    # PRIORITY: structured signal block
-    sig = parse_signal_block(text) if text else None
-    if sig:
-        sig["_tg_text"] = text
-        log("INFO", f"LOCAL SIGNAL detected base={sig['base']} side={sig['side']}")
-        log("INFO", f"LOCAL PARSED: {sig}")
-
-        # 🔥 якщо чогось не вистачає → відправляємо в AI
-        if not sig.get("leverage") or not sig.get("risk_pct"):
-            log("INFO", "LOCAL incomplete → fallback to AI")
-
-            cmd = await asyncio.to_thread(
-                ai_parse_trade_multi,
-                text,
-                [img_path] if img_path else []
-            )
-
-            cmd["_tg_text"] = text
-
-            # 🔥 merge local + AI
-            sig["leverage"] = sig.get("leverage") or cmd.get("leverage")
-            sig["risk_pct"] = sig.get("risk_pct") or cmd.get("risk_pct")
-            sig["tp"] = sig.get("tp") or cmd.get("tp")
-            sig["sl"] = sig.get("sl") or cmd.get("sl")
-
-        await handle_ai_command(sig)
-        return
-
     # close intent -> bundle
     if text and has_close_intent(text):
         await close_bundle_start_or_update(text=text, images=[img_path] if img_path else [])

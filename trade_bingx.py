@@ -781,6 +781,9 @@ def _img_to_data_url(path: str) -> str:
     return f"data:image/jpeg;base64,{b64}"
 
 def ai_parse_trade_multi(text: Optional[str], image_paths: Optional[list[str]]) -> dict:
+    
+    log("INFO", f"AI CHECK: OpenAI={OpenAI} KEY={bool(OPENAI_API_KEY)}")
+    
     if not OpenAI or not OPENAI_API_KEY:
         return {"action": "NONE", "confidence": 0.0, "raw_text": "OpenAI not configured"}
 

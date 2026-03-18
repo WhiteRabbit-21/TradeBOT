@@ -1,7 +1,7 @@
 import asyncio
 import os
 
-LOG_CHAT_ID = int(os.getenv("TG_LOG_CHAT_ID", "-1003828203122"))
+LOG_CHAT_ID = int(os.getenv("TG_LOG_CHAT_ID", "-1003332013833"))
 
 last_positions = {}
 

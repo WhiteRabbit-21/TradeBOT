@@ -604,7 +604,7 @@ def normalize_price_from_tail(raw: float, entry: float, side: str, kind: str) ->
     entry = float(entry)
 
     # якщо це вже адекватна “маленька” ціна — не чіпаємо
-    if 0 < raw < 100 and raw < entry * 50:
+    if 0.5 * entry <= raw <= 1.5 * entry:
         return raw
 
     best = None

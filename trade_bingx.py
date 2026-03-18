@@ -1001,29 +1001,36 @@ async def handle_ai_command(cmd: dict):
             log("INFO", "DRY_RUN OPEN skipped (test mode)")
             return
 
+        log("INFO", f"TRY SET LEVERAGE {symbol} lev={lev}")
+
         try:
-            try:
-                await set_leverage(symbol, int(lev))
-            except Exception as e:
-                log("WARNING", f"set_leverage warning: {e}")
-
-            resp = await open_market(symbol, side, qty)
-            log("INFO", f"SUCCESS OPEN placed id={resp.get('id')} {base_clean} side={side} qty={qty}")
-
-            try:
-                r1 = await set_sl_oneway(base_clean, sl_prec)  # cancel old SL inside
-                log("INFO", f"SL {r1}")
-            except Exception as e:
-                log("WARNING", f"SL not set: {e}")
-
-            try:
-                r2 = await set_tp_oneway(base_clean, tp_prec)
-                log("INFO", f"TP {r2}")
-            except Exception as e:
-                log("WARNING", f"TP not set: {e}")
-
+            await set_leverage(symbol, int(lev))
+            log("INFO", "LEVERAGE SET OK")
         except Exception as e:
-            log("ERROR", f"OPEN failed: {e}")
+            log("ERROR", f"LEVERAGE FAILED: {e}")
+
+        log("INFO", f"TRY OPEN {symbol} side={side} qty={qty}")
+
+    try:
+        resp = await open_market(symbol, side, qty)
+        log("INFO", f"OPEN RESPONSE: {resp}")
+        log("INFO", f"SUCCESS OPEN placed id={resp.get('id')} {base_clean} side={side} qty={qty}")
+
+        # 🔥 ВСТАВИТИ ОТУТ
+        try:
+            r1 = await set_sl_oneway(base_clean, sl_prec)
+            log("INFO", f"SL {r1}")
+        except Exception as e:
+            log("WARNING", f"SL not set: {e}")
+
+        try:
+            r2 = await set_tp_oneway(base_clean, tp_prec)
+            log("INFO", f"TP {r2}")
+        except Exception as e:
+            log("WARNING", f"TP not set: {e}")
+
+    except Exception as e:
+        log("ERROR", f"OPEN FAILED: {e}")
         return
     # -------------------------
     # ADD (from balance)

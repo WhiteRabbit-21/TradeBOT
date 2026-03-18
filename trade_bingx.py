@@ -919,7 +919,8 @@ async def handle_ai_command(cmd: dict):
         return
 
     min_conf = ACTION_MIN_CONF.get(action, 0.70)
-    if conf < min_conf:
+    
+    if action != "ADD" and conf < min_conf:
         log("INFO", f"AI SKIP: low confidence {conf} < {min_conf} for action={action}")
         return
 

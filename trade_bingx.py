@@ -939,6 +939,7 @@ def ai_parse_trade_multi(text: Optional[str], image_paths: Optional[list[str]]) 
     try:
         data = json.loads(out)
         log("INFO", f"AI_PARSED: {data}")
+        log("INFO", f"AI_JSON:\n{json.dumps(data, indent=2, ensure_ascii=False)}")
         if not isinstance(data, dict):
             raise ValueError("not dict")
         data.setdefault("action", "NONE")

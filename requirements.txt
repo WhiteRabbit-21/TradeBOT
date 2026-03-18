@@ -2,3 +2,4 @@ pyrogram==2.0.106
 tgcrypto==1.2.5
 ccxt==4.5.38
 python-dotenv==1.0.1
+openai>=1.0.0

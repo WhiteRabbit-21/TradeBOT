@@ -734,11 +734,11 @@ def parse_signal_block(text: str) -> Optional[dict]:
 
     t = text.upper()
 
-    if not re.search(r"(market\s*entry|open\s+(long|short))", t):
+    if not re.search(r"(market|order)", t):
         return None
 
     # BASE
-    m = re.search(r"#([A-Z0-9]+)USDT", t)
+    m = re.search(r"#?([A-Z0-9]+)USDT", t)
     if not m:
         return None
     base = m.group(1)
@@ -764,8 +764,8 @@ def parse_signal_block(text: str) -> Optional[dict]:
         sl = float(m.group(1))
 
     # TARGETS
-    targets = re.findall(r"[0-9]+[: ]+([0-9.]+)", t)
-    tp = float(targets[0]) if targets else None
+    m = re.search(r"TARGETS?:\s*([0-9.]+)", t)
+    tp = float(m.group(1)) if m else None
 
     # LEVERAGE
     lev = None
@@ -810,7 +810,10 @@ STRICT RULES:
 - Detect risk (e.g. 1.5% balance)
 - Detect SL
 - Detect TARGET → take FIRST number as TP
-- Estimate ENTRY as current market price (approximate if not given)
+If ENTRY is not provided:
+- assume ENTRY ≈ current price
+- still return OPEN
+- do NOT return NONE just because entry is missing
 
 ---
 
@@ -929,11 +932,13 @@ def ai_parse_trade_multi(text: Optional[str], image_paths: Optional[list[str]]) 
     )
 
     out = (resp.choices[0].message.content or "").strip()
+    log("INFO", f"AI_RESPONSE_RAW:\n{out[:1000]}")
     out = re.sub(r"^```(?:json)?\s*", "", out, flags=re.I).strip()
     out = re.sub(r"\s*```$", "", out).strip()
 
     try:
         data = json.loads(out)
+        log("INFO", f"AI_PARSED: {data}")
         if not isinstance(data, dict):
             raise ValueError("not dict")
         data.setdefault("action", "NONE")
@@ -953,7 +958,7 @@ ACTION_MIN_CONF = {
     "SET_TP": 0.60,
     "BE": 0.60,
     "ADD": 0.65,
-    "OPEN": 0.80,
+    "OPEN": 0.60,
 }
 
 # =========================
@@ -1506,6 +1511,7 @@ async def on_signal(_, message):
 # =========================
 # MAIN (Railway safe)
 # =========================
+
 async def main():
     await app.start()
     asyncio.create_task(pnl_watcher(app, exchange, log, LOG_CHAT_ID))

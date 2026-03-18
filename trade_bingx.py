@@ -239,7 +239,7 @@ def set_leverage_sync(symbol: str, lev: int, side: str):
         int(lev),
         symbol,
         {
-            "side": "LONG" if side == "long" else "SHORT"
+            "positionSide": "LONG" if side == "long" else "SHORT"
         }
     )
 
@@ -264,6 +264,21 @@ def open_market_sync(symbol: str, side: str, qty: float):
 
 async def open_market(symbol: str, side: str, qty: float):
     return await asyncio.to_thread(open_market_sync, symbol, side, qty)
+
+def place_dca_order_sync(symbol: str, side: str, qty: float, price: float):
+    order_side = "sell" if side == "short" else "buy"
+    position_side = "SHORT" if side == "short" else "LONG"
+
+    return exchange.create_order(
+        symbol,
+        "limit",
+        order_side,
+        qty,
+        price,
+        {
+            "positionSide": position_side
+        }
+    )
 
 def fetch_position_oneway_sync(symbol: str):
 
@@ -785,6 +800,14 @@ OUTPUT FORMAT:
   "rr": ...,
   "confidence": ...
 }
+
+If signal contains DCA or additional entry price:
+- extract it as:
+  "dca_price": number
+  "dca_pct": percent
+
+If ADD has a price → it is DCA, not market add
+
 """
 
 AI_JSON_SHAPE = {
@@ -800,6 +823,9 @@ AI_JSON_SHAPE = {
     "confidence": "0..1",
     "raw_text": "string|null",
     "rr": "number|null",
+    "dca_price": "number|null",
+    "dca_pct": "number|null",
+    "price": "number|null", 
 }
 
 def _img_to_data_url(path: str) -> str:
@@ -852,7 +878,6 @@ def ai_parse_trade_multi(text: Optional[str], image_paths: Optional[list[str]]) 
         data = json.loads(out)
 
         log("INFO", f"AI_PARSED: {data}")
-        log("INFO", f"AI_JSON:\n{json.dumps(data, indent=2, ensure_ascii=False)}")
 
         if not isinstance(data, dict):
             raise ValueError("not dict")
@@ -919,7 +944,7 @@ async def handle_ai_command(cmd: dict):
         return
 
     min_conf = ACTION_MIN_CONF.get(action, 0.70)
-    
+
     if action != "ADD" and conf < min_conf:
         log("INFO", f"AI SKIP: low confidence {conf} < {min_conf} for action={action}")
         return
@@ -1061,6 +1086,14 @@ async def handle_ai_command(cmd: dict):
             log("INFO", f"OPEN RESPONSE: {resp}")
             log("INFO", f"SUCCESS OPEN placed id={resp.get('id')} {base_clean} side={side} qty={qty}")
 
+            # 🔥 DCA після OPEN
+                    
+            dca_price = cmd.get("dca_price")
+            dca_pct = cmd.get("dca_pct")
+
+            if dca_price and dca_pct:
+                await place_dca(symbol, side, float(dca_pct), float(dca_price), lev)
+    
             # 🔥 SET SL
             try:
                 r1 = await set_sl_oneway(base_clean, sl_prec)
@@ -1086,23 +1119,11 @@ async def handle_ai_command(cmd: dict):
 
     if action == "ADD":
 
-        pct = risk_pct or add_pct
-
-        if not base or pct is None:
-            log("INFO", "ADD skip: base or pct missing")
-            return
-
         base_clean = _clean_base(base)
         symbol = await resolve_symbol(base_clean)
 
         if not symbol:
             log("ERROR", f"symbol not listed: {base_clean}")
-            return
-
-        try:
-            entry = float((await asyncio.to_thread(exchange.fetch_ticker, symbol))["last"])
-        except Exception as e:
-            log("ERROR", f"ticker failed: {e}")
             return
 
         pos = await fetch_position_oneway(symbol)
@@ -1113,50 +1134,83 @@ async def handle_ai_command(cmd: dict):
 
         side = (pos.get("side") or "").lower()
 
-        if side not in {"long", "short"}:
-            log("ERROR", "ADD: no existing position")
+        lev = int(
+            float(
+                pos.get("leverage")
+                or (pos.get("info") or {}).get("leverage")
+                or 1
+            )
+        )
+
+        entry = float((await asyncio.to_thread(exchange.fetch_ticker, symbol))["last"])
+
+        pct = add_pct or risk_pct
+        if pct is None:
+            log("INFO", "ADD skip: no pct")
             return
 
-        lev = int(float(pos.get("leverage") or 1))
+        mode = detect_add_mode(cmd)
 
-        try:
-            usdt_free = await get_usdt_free()
+        log("INFO", f"ADD MODE = {mode}")
 
-            margin = usdt_free * (pct / 100)
-            notional = margin * lev
-            qty_raw = notional / entry
+        # =========================
+        # 🔥 DCA
+        # =========================
+        if mode == "DCA":
 
-            qty = float(await asyncio.to_thread(exchange.amount_to_precision, symbol, qty_raw))
+            dca_price = cmd.get("price") or cmd.get("dca_price")
 
-        except Exception as e:
-            log("ERROR", f"balance calc failed: {e}")
-            return
+            if not dca_price:
+                log("ERROR", "DCA but no price")
+                return
 
-        if qty <= 0:
-            log("INFO", "ADD qty=0")
-            return
+            dca_price = float(dca_price)
 
-        if DRY_RUN:
-            log("INFO", f"DRY_RUN ADD {base_clean}")
-            return
-
-        try:
-            resp = await open_market(symbol, side, qty)
-            log("INFO", f"SUCCESS ADD {base_clean} qty={qty}")
-
-        except Exception as e:
-            log("ERROR", f"ADD failed {e}")
-            return
-
-        if sl:
             try:
-                r = await set_sl_oneway(base_clean, float(sl))
-                log("INFO", f"UPDATED SL {r}")
+                usdt_free = await get_usdt_free()
+
+                margin = usdt_free * (pct / 100)
+                notional = margin * lev
+                qty_raw = notional / entry
+
+                qty = float(await asyncio.to_thread(exchange.amount_to_precision, symbol, qty_raw))
+
+                await place_dca(symbol, side, pct, dca_price, lev)
+
+                log("INFO", f"DCA placed {base_clean} at {dca_price} qty={qty}")
+
             except Exception as e:
-                log("ERROR", f"SL update failed {e}")
+                log("ERROR", f"DCA failed: {e}")
+
+            return
+
+        # =========================
+        # 🔥 MARKET ADD
+        # =========================
+        try:
+            contracts = float(
+                pos.get("contracts")
+                or pos.get("size")
+                or pos.get("positionAmt")
+                or 0
+            )
+
+            if contracts <= 0:
+                log("ERROR", "ADD: position size = 0")
+                return
+
+            add_qty = contracts * (pct / 100)
+
+            add_qty = float(await asyncio.to_thread(exchange.amount_to_precision, symbol, add_qty))
+
+            resp = await open_market(symbol, side, add_qty)
+
+            log("INFO", f"MARKET ADD {base_clean} qty={add_qty}")
+
+        except Exception as e:
+            log("ERROR", f"ADD failed: {e}")
 
         return
-    
     # -------------------------
     # SET_SL (always cancel old -> set new)
     # -------------------------
@@ -1259,6 +1313,65 @@ async def handle_ai_command(cmd: dict):
 
     log("INFO", f"Unknown/unsupported action: {action}")
 
+def detect_add_mode(cmd: dict) -> str:
+    """
+    return:
+    - "DCA"
+    - "MARKET"
+    """
+
+    # 🔥 якщо є явний dca_price → це DCA
+    if cmd.get("dca_price"):
+        return "DCA"
+
+    # 🔥 якщо є price → теж DCA
+    if cmd.get("price"):
+        return "DCA"
+
+    return "MARKET"
+
+async def place_dca(symbol, side, pct, price, lev):
+
+    try:
+        entry = float((await asyncio.to_thread(exchange.fetch_ticker, symbol))["last"])
+
+        if side == "long" and price >= entry:
+            log("WARNING", "DCA skipped: price above entry for LONG")
+            return
+
+        if side == "short" and price <= entry:
+            log("WARNING", "DCA skipped: price below entry for SHORT")
+            return
+
+        usdt_free = await get_usdt_free()
+        margin = usdt_free * (pct / 100)
+        notional = margin * lev
+        qty_raw = notional / entry
+
+        qty = float(await asyncio.to_thread(exchange.amount_to_precision, symbol, qty_raw))
+
+        # 🔥 защита от дубля
+        orders = await asyncio.to_thread(exchange.fetch_open_orders, symbol)
+
+        for o in orders:
+            o_price = float(o.get("price") or 0)
+
+            if abs(o_price - float(price)) / float(price) < 0.001:
+                log("INFO", "DCA already exists (approx match)")
+                return
+
+        await asyncio.to_thread(
+            place_dca_order_sync,
+            symbol,
+            side,
+            qty,
+            price
+        )
+
+        log("INFO", f"DCA placed {symbol} {side} price={price} qty={qty}")
+
+    except Exception as e:
+        log("ERROR", f"DCA failed: {e}")
 
 # =========================
 # MEDIA GROUP / CLOSE BUNDLE (async)

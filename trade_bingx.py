@@ -490,11 +490,23 @@ def set_tp_oneway_sync(base: str, tp_price: float) -> str:
     if not pos:
         return "NO_POSITION"
 
-    pos_side = (pos.get("side") or "").lower()
+    pos_side = (
+        pos.get("side")
+        or pos.get("positionSide")
+        or (pos.get("info") or {}).get("positionSide")
+        or ""
+    ).lower()
+
     if pos_side not in {"long", "short"}:
         return "NO_POSITION"
 
-    contracts = float(pos.get("contracts") or pos.get("size") or pos.get("positionAmt") or 0.0)
+    contracts = float(
+        pos.get("contracts")
+        or pos.get("size")
+        or pos.get("positionAmt")
+        or 0.0
+    )
+
     if contracts <= 0:
         return "NO_POSITION"
 
@@ -505,17 +517,35 @@ def set_tp_oneway_sync(base: str, tp_price: float) -> str:
     except Exception:
         tp_prec = float(tp_price)
 
-    resp = exchange.create_order(
-    symbol,
-    "limit",
-    close_side,
-    contracts,
-    tp_prec,
-    {
-        "positionSide": "LONG" if pos_side == "long" else "SHORT"
-    }
-)
-    return f"TP_SET id={resp.get('id')} tp={tp_prec}"
+    # 🔥 Спробуємо кілька типів (BingX любить різні назви)
+    candidates = [
+        ("takeProfitMarket", {"stopPrice": tp_prec}),
+        ("take_profit_market", {"stopPrice": tp_prec}),
+        ("market", {"triggerPrice": tp_prec}),
+    ]
+
+    last_err = None
+
+    for order_type, params in candidates:
+        try:
+            resp = exchange.create_order(
+                symbol,
+                order_type,
+                close_side,
+                contracts,
+                None,
+                {
+                    **params,
+                    "positionSide": "LONG" if pos_side == "long" else "SHORT"
+                }
+            )
+
+            return f"TP_SET id={resp.get('id')} tp={tp_prec}"
+
+        except Exception as e:
+            last_err = e
+
+    raise RuntimeError(f"Failed to set TP: {last_err}")
 
 async def set_tp_oneway(base: str, tp_price: float) -> str:
     return await asyncio.to_thread(set_tp_oneway_sync, base, tp_price)
@@ -577,7 +607,6 @@ def add_position_oneway_sync(base: str, add_pct: Optional[float]) -> str:
     None,
     {
         "positionSide": "LONG" if pos_side == "long" else "SHORT",
-        "reduceOnly": False
     }
 )
     return f"ADDED id={resp.get('id')} qty={add_qty} pct={pct}"

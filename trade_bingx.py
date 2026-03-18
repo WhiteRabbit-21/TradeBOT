@@ -795,20 +795,85 @@ def parse_signal_block(text: str) -> Optional[dict]:
 # =========================
 # AI PARSER (text + images)
 # =========================
-AI_SYSTEM = (
-    "You are a trade-signal parser for USDT-M perpetual futures.\n"
-    "Input may contain text and/or one or more screenshots.\n"
-    "Return ONLY valid JSON (no markdown).\n"
-    "If you are not sure, set action=NONE.\n"
-    "Return base WITHOUT 'USDT' (e.g., BTC, PEPE, 1000PEPE).\n"
-    "side must be only long/short.\n"
-    "Supported actions: OPEN, CLOSE, ADD, SET_SL, SET_TP, BE, NONE.\n"
-    "IMPORTANT: if the text contains 'tp these' / 'tp' / 'take profit' / 'roe' / 'roi' — DO NOT return OPEN; return only CLOSE or NONE.\n"
-    "IMPORTANT: if the text indicates CLOSE/TP/ROE/ROI but the tickers are only shown in the image(s), return them in 'bases' (array).\n"
-    "Ticker extraction from images: extract ONLY tickers matching XXXXUSDT (e.g., DOGEUSDT, 1000PEPEUSDT, SUIUSDT).\n"
-    "Ignore words like BYBIT/ROI/ROE/referral/Entry Price/Current Price/Profit.\n"
-    "For ADD: if the text includes an explicit stop loss price, return action=ADD and include sl.\n"
-)
+AI_SYSTEM = """
+You are a crypto futures trading signal parser.
+
+Your task:
+Convert Telegram trading signals into structured JSON.
+
+STRICT RULES:
+- Always return JSON only
+- Never return NONE if it looks like a valid trade
+- Extract base WITHOUT USDT
+- Detect LONG or SHORT
+- Detect leverage (X10, 10x etc)
+- Detect risk (e.g. 1.5% balance)
+- Detect SL
+- Detect TARGET → take FIRST number as TP
+- Estimate ENTRY as current market price (approximate if not given)
+
+---
+
+RISK REWARD (RR):
+- For LONG:
+  RR = (TP - ENTRY) / (ENTRY - SL)
+
+- For SHORT:
+  RR = (ENTRY - TP) / (SL - ENTRY)
+
+- If RR < 1 → low quality trade → set confidence lower (<0.7)
+- If RR >= 2 → high quality → confidence > 0.85
+
+---
+
+SUPPORTED ACTIONS:
+OPEN, ADD, CLOSE, SET_SL, SET_TP, BE
+
+---
+
+EXAMPLES:
+
+INPUT:
+#ETHUSDT
+LONG MARKET PRICE ORDER
+SL: 2260
+TARGET: 2420-2460
+LEVERAGE CROSS X30
+WITH 1.5% BALANCE
+
+OUTPUT:
+{
+  "action": "OPEN",
+  "base": "ETH",
+  "side": "long",
+  "leverage": 30,
+  "risk_pct": 1.5,
+  "sl": 2260,
+  "tp": 2420,
+  "add_pct": null,
+  "rr": 2.1,
+  "confidence": 0.92
+}
+
+---
+
+INPUT:
+Add 0.65% to ETH
+
+OUTPUT:
+{
+  "action": "ADD",
+  "base": "ETH",
+  "side": null,
+  "leverage": null,
+  "risk_pct": null,
+  "sl": null,
+  "tp": null,
+  "add_pct": 0.65,
+  "rr": null,
+  "confidence": 0.9
+}
+"""
 
 AI_JSON_SHAPE = {
     "action": "OPEN | CLOSE | ADD | SET_SL | SET_TP | BE | NONE",
@@ -821,7 +886,8 @@ AI_JSON_SHAPE = {
     "tp": "number|null",
     "add_pct": "number|null",
     "confidence": "0..1",
-    "raw_text": "string|null"
+    "raw_text": "string|null",
+    "rr": "number|null",
 }
 
 def _img_to_data_url(path: str) -> str:
@@ -1361,7 +1427,11 @@ async def close_bundle_flush():
 # =========================
 _last_hb = 0.0
 
-@app.on_message(filters.chat(TARGET_CHAT_ID) & (filters.text | filters.caption | filters.photo))
+@app.on_message(
+    filters.chat([TARGET_CHAT_ID, "me"])
+    & (filters.text | filters.caption | filters.photo)
+)
+
 async def on_signal(_, message):
     global _last_hb
 

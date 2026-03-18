@@ -234,15 +234,17 @@ def get_usdt_free_sync() -> float:
 async def get_usdt_free() -> float:
     return await asyncio.to_thread(get_usdt_free_sync)
 
-def set_leverage_sync(symbol: str, lev: int):
-    try:
-        exchange.set_leverage(int(lev), symbol)
-    except Exception as e:
-        # не критично
-        raise RuntimeError(f"set_leverage failed: {e}")
+def set_leverage_sync(symbol: str, lev: int, side: str):
+    exchange.set_leverage(
+        int(lev),
+        symbol,
+        {
+            "positionSide": "LONG" if side == "long" else "SHORT"
+        }
+    )
 
-async def set_leverage(symbol: str, lev: int):
-    await asyncio.to_thread(set_leverage_sync, symbol, lev)
+async def set_leverage(symbol: str, lev: int, side: str):
+    await asyncio.to_thread(set_leverage_sync, symbol, lev, side)
 
 def open_market_sync(symbol: str, side: str, qty: float):
 
@@ -257,7 +259,6 @@ def open_market_sync(symbol: str, side: str, qty: float):
         None,
         {
             "positionSide": position_side,
-            "reduceOnly": False
         }
     )
 
@@ -941,33 +942,41 @@ async def handle_ai_command(cmd: dict):
     # OPEN
     # -------------------------
     if action == "OPEN":
+
         if not base:
             log("INFO", "AI SKIP OPEN: base missing")
             return
+
         if side not in {"long", "short"}:
             log("INFO", "AI SKIP OPEN: side missing/invalid")
             return
+
         if not lev or not risk_pct:
             log("INFO", "AI SKIP OPEN: leverage or risk_pct missing")
             return
+
         if sl is None or tp is None:
             log("INFO", "AI SKIP OPEN: sl or tp missing")
             return
 
         base_clean = _clean_base(base)
         symbol = await resolve_symbol(base_clean)
+
         if not symbol:
             log("ERROR", f"Symbol not listed on BingX: {base_clean}/USDT")
             return
 
+        # 🔥 ENTRY PRICE
         try:
             entry = float((await asyncio.to_thread(exchange.fetch_ticker, symbol))["last"])
         except Exception as e:
             log("ERROR", f"fetch_ticker failed: {e}")
             return
 
+        # 🔥 FIX SL/TP
         sl_fixed = normalize_price_from_tail(float(sl), entry, side, "sl")
         tp_fixed = normalize_price_from_tail(float(tp), entry, side, "tp")
+
         log("INFO", f"FIX {base_clean} entry={entry} rawSL={sl} -> {sl_fixed} | rawTP={tp} -> {tp_fixed}")
 
         try:
@@ -980,15 +989,19 @@ async def handle_ai_command(cmd: dict):
         except Exception:
             tp_prec = float(tp_fixed)
 
+        # 🔥 VALIDATION
         if not validate_sl_tp(side, entry, sl_prec, tp_prec):
             log("INFO", f"SKIP Bad SL/TP vs entry. entry={entry} SL={sl_prec} TP={tp_prec}")
             return
 
+        # 🔥 CALC QTY
         try:
             usdt_free = await get_usdt_free()
             qty_raw = calc_qty(usdt_free, float(risk_pct), int(lev), entry)
             qty = float(await asyncio.to_thread(exchange.amount_to_precision, symbol, qty_raw))
+
             log("INFO", f"QTY USDT free={usdt_free} qty_raw≈{qty_raw} qty_prec={qty}")
+
         except Exception as e:
             log("ERROR", f"balance/qty failed: {e}")
             return
@@ -1001,38 +1014,42 @@ async def handle_ai_command(cmd: dict):
             log("INFO", "DRY_RUN OPEN skipped (test mode)")
             return
 
-        log("INFO", f"TRY SET LEVERAGE {symbol} lev={lev}")
+        # 🔥 SET LEVERAGE (HEDGE)
+        log("INFO", f"TRY SET LEVERAGE {symbol} lev={lev} side={side}")
 
         try:
-            await set_leverage(symbol, int(lev))
+            await set_leverage(symbol, int(lev), side)
             log("INFO", "LEVERAGE SET OK")
         except Exception as e:
             log("ERROR", f"LEVERAGE FAILED: {e}")
 
+        # 🔥 OPEN ORDER
         log("INFO", f"TRY OPEN {symbol} side={side} qty={qty}")
 
-    try:
-        resp = await open_market(symbol, side, qty)
-        log("INFO", f"OPEN RESPONSE: {resp}")
-        log("INFO", f"SUCCESS OPEN placed id={resp.get('id')} {base_clean} side={side} qty={qty}")
-
-        # 🔥 ВСТАВИТИ ОТУТ
         try:
-            r1 = await set_sl_oneway(base_clean, sl_prec)
-            log("INFO", f"SL {r1}")
-        except Exception as e:
-            log("WARNING", f"SL not set: {e}")
+            resp = await open_market(symbol, side, qty)
 
-        try:
-            r2 = await set_tp_oneway(base_clean, tp_prec)
-            log("INFO", f"TP {r2}")
-        except Exception as e:
-            log("WARNING", f"TP not set: {e}")
+            log("INFO", f"OPEN RESPONSE: {resp}")
+            log("INFO", f"SUCCESS OPEN placed id={resp.get('id')} {base_clean} side={side} qty={qty}")
 
-    except Exception as e:
-        log("ERROR", f"OPEN FAILED: {e}")
-        return
-    # -------------------------
+            # 🔥 SET SL
+            try:
+                r1 = await set_sl_oneway(base_clean, sl_prec)
+                log("INFO", f"SL {r1}")
+            except Exception as e:
+                log("WARNING", f"SL not set: {e}")
+
+            # 🔥 SET TP
+            try:
+                r2 = await set_tp_oneway(base_clean, tp_prec)
+                log("INFO", f"TP {r2}")
+            except Exception as e:
+                log("WARNING", f"TP not set: {e}")
+
+        except Exception as e:
+            log("ERROR", f"OPEN FAILED: {e}")
+            return
+        # -------------------------
     # ADD (from balance)
     # -------------------------
 

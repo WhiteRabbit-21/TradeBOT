@@ -239,7 +239,7 @@ def set_leverage_sync(symbol: str, lev: int, side: str):
         int(lev),
         symbol,
         {
-            "positionSide": "LONG" if side == "long" else "SHORT"
+            "side": "LONG" if side == "long" else "SHORT"
         }
     )
 

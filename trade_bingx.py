@@ -783,7 +783,7 @@ def _img_to_data_url(path: str) -> str:
 def ai_parse_trade_multi(text: Optional[str], image_paths: Optional[list[str]]) -> dict:
     
     log("INFO", f"AI CHECK: OpenAI={OpenAI} KEY={bool(OPENAI_API_KEY)}")
-    
+
     if not OpenAI or not OPENAI_API_KEY:
         return {"action": "NONE", "confidence": 0.0, "raw_text": "OpenAI not configured"}
 
@@ -1334,6 +1334,8 @@ _last_hb = 0.0
 )
 
 async def on_signal(_, message):
+    log("INFO", f"MSG RECEIVED chat={message.chat.id} text={bool(message.text)} photo={bool(message.photo)}")
+
     global _last_hb
 
     # не логимо власний лог-чат, якщо раптом він = target

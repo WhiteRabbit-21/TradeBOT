@@ -1200,29 +1200,32 @@ async def handle_ai_command(cmd: dict):
         # 🔥 MARKET ADD
         # =========================
         try:
-            contracts = float(
-                pos.get("contracts")
-                or pos.get("size")
-                or pos.get("positionAmt")
-                or 0
-            )
+            usdt_free = await get_usdt_free()
 
-            if contracts <= 0:
-                log("ERROR", "ADD: position size = 0")
-                return
+            pct = float(pct)
 
-            add_qty = contracts * (pct / 100)
+            margin = usdt_free * (pct / 100)
+            notional = margin * lev
 
-            add_qty = float(await asyncio.to_thread(exchange.amount_to_precision, symbol, add_qty))
+            entry = float((await asyncio.to_thread(exchange.fetch_ticker, symbol))["last"])
 
-            resp = await open_market(symbol, side, add_qty)
+            qty_raw = notional / entry
 
-            log("INFO", f"MARKET ADD {base_clean} qty={add_qty}")
+            qty = float(await asyncio.to_thread(exchange.amount_to_precision, symbol, qty_raw))
+
+            market = exchange.market(symbol)
+            min_qty = market.get("limits", {}).get("amount", {}).get("min")
+
+            if min_qty and qty < min_qty:
+                qty = float(min_qty)
+                log("INFO", f"ADD qty adjusted to min: {qty}")
+
+            resp = await open_market(symbol, side, qty)
+
+            log("INFO", f"MARKET ADD {base_clean} qty={qty} (~{pct}% balance)")
 
         except Exception as e:
-            log("ERROR", f"ADD failed: {e}")
-
-        return
+            log("ERROR", f"ADD failed: {e}") 
     # -------------------------
     # SET_SL (always cancel old -> set new)
     # -------------------------

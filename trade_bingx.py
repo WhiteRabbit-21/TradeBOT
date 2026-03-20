@@ -374,6 +374,15 @@ def close_position_full_hedge_sync(base: str):
 async def close_position_full_oneway(base: str):
     return await asyncio.to_thread(close_position_full_hedge_sync, base)
 
+def set_margin_mode_sync(symbol: str):
+    try:
+        exchange.set_margin_mode("cross", symbol)
+    except Exception:
+        pass
+
+async def set_margin_mode(symbol: str):
+    await asyncio.to_thread(set_margin_mode_sync, symbol)
+
 # =========================
 # STOP/TP helpers (best-effort)
 # =========================
@@ -870,14 +879,11 @@ def ai_parse_trade_multi(text: Optional[str], image_paths: Optional[list[str]]) 
     )
 
     out = (resp.choices[0].message.content or "").strip()
-    log("INFO", f"AI_RESPONSE_RAW:\n{out[:1000]}")
     out = re.sub(r"^```(?:json)?\s*", "", out, flags=re.I).strip()
     out = re.sub(r"\s*```$", "", out).strip()
 
     try:
         data = json.loads(out)
-
-        log("INFO", f"AI_PARSED: {data}")
 
         if not isinstance(data, dict):
             raise ValueError("not dict")
@@ -1072,8 +1078,13 @@ async def handle_ai_command(cmd: dict):
         log("INFO", f"TRY SET LEVERAGE {symbol} lev={lev} side={side}")
 
         try:
+            await set_margin_mode(symbol) 
             await set_leverage(symbol, int(lev), side)
+
+            await asyncio.sleep(1.0)       
+
             log("INFO", "LEVERAGE SET OK")
+
         except Exception as e:
             log("ERROR", f"LEVERAGE FAILED: {e}")
 
@@ -1312,6 +1323,7 @@ async def handle_ai_command(cmd: dict):
         return
 
     log("INFO", f"Unknown/unsupported action: {action}")
+    
 
 def detect_add_mode(cmd: dict) -> str:
     """

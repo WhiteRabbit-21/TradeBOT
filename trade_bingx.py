@@ -27,6 +27,7 @@ SESSION_STRING = os.environ["TG_SESSION_STRING"]
 
 TARGET_CHAT_ID = int(os.getenv("TARGET_CHAT_ID", "-1002598403649"))   # де читаємо сигнали
 LOG_CHAT_ID = int(os.getenv("TG_LOG_CHAT_ID", "-1003828203122"))      # куди шлемо логи
+PNL_CHAT_ID = int(os.getenv("PNL_CHAT_ID", "-1003332013833")) # куди шлемо профіт/лос
 
 BINGX_API_KEY = os.getenv("BINGX_API_KEY", "")
 BINGX_API_SECRET = os.getenv("BINGX_API_SECRET", "")
@@ -1575,7 +1576,9 @@ async def on_signal(_, message):
 
 async def main():
     await app.start()
-    asyncio.create_task(pnl_watcher(app, exchange, log, LOG_CHAT_ID))
+    asyncio.create_task(
+        pnl_watcher(app, exchange, log, PNL_CHAT_ID)
+    )
     asyncio.create_task(log_pump())
 
     try:

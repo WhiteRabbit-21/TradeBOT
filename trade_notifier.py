@@ -1,20 +1,25 @@
 import asyncio
-import os
 import time
-
-LOG_CHAT_ID = int(os.getenv("TG_LOG_CHAT_ID", "-1003332013833"))
 
 last_checked = 0
 weekly_pnl = 0.0
 week_start = time.time()
 
+seen_ids = set()
 
-async def pnl_watcher(app, exchange, log, interval=5):
-    global last_checked, weekly_pnl, week_start
+
+async def pnl_watcher(app, exchange, log, log_chat_id, interval=5):
+    global last_checked, weekly_pnl, week_start, seen_ids
 
     while True:
         try:
-            trades = await asyncio.to_thread(exchange.fetch_my_trades)
+            trades = await asyncio.to_thread(
+                exchange.fetch_my_trades,
+                None,
+                50
+            )
+
+            positions = {}
 
             for t in trades:
                 ts = t.get("timestamp", 0)
@@ -22,8 +27,19 @@ async def pnl_watcher(app, exchange, log, interval=5):
                 if ts <= last_checked:
                     continue
 
+                trade_id = t.get("id")
+                if trade_id in seen_ids:
+                    continue
+
+                seen_ids.add(trade_id)
+
+                info = t.get("info", {})
+
                 pnl = float(
-                    t.get("info", {}).get("realizedPnl") or 0
+                    info.get("realizedPnl")
+                    or info.get("profit")
+                    or info.get("closedPnl")
+                    or 0
                 )
 
                 if pnl == 0:
@@ -31,23 +47,55 @@ async def pnl_watcher(app, exchange, log, interval=5):
 
                 symbol = t.get("symbol", "")
                 side = t.get("side", "")
-                amount = t.get("amount", 0)
+                amount = float(t.get("amount", 0))
+
+                # 🔥 ключ позиції
+                key = f"{symbol}_{side}"
+
+                if key not in positions:
+                    positions[key] = {
+                        "pnl": 0.0,
+                        "qty": 0.0,
+                        "trades": 0,
+                        "ts": ts
+                    }
+
+                positions[key]["pnl"] += pnl
+                positions[key]["qty"] += amount
+                positions[key]["trades"] += 1
+
+                if ts > positions[key]["ts"]:
+                    positions[key]["ts"] = ts
+
+            # 📤 відправка 1 повідомлення на позицію
+            for key, data in positions.items():
+                symbol, side = key.split("_")
+
+                pnl = data["pnl"]
+                qty = data["qty"]
+                trades_count = data["trades"]
 
                 status = "🟢 PROFIT" if pnl > 0 else "🔴 LOSS"
 
                 msg = (
-                    f"{status}\n"
-                    f"Symbol: {symbol}\n"
+                    f"{status} #{symbol}\n"
                     f"Side: {side}\n"
-                    f"PnL: {round(pnl, 4)}\n"
-                    f"Qty: {amount}"
+                    f"Total PnL: {round(pnl, 4)} USDT\n"
+                    f"Total Qty: {round(qty, 4)}\n"
+                    f"Trades: {trades_count}"
                 )
 
                 weekly_pnl += pnl
 
-                await app.send_message(LOG_CHAT_ID, msg)
+                await app.send_message(log_chat_id, msg)
 
-                last_checked = ts
+            # 🧠 оновлюємо last_checked
+            if positions:
+                last_checked = max(p["ts"] for p in positions.values())
+
+            # 🧹 чистка памʼяті
+            if len(seen_ids) > 1000:
+                seen_ids.clear()
 
             # 📊 weekly report
             if time.time() - week_start >= 7 * 24 * 60 * 60:
@@ -59,7 +107,7 @@ async def pnl_watcher(app, exchange, log, interval=5):
                     f"Total PnL: {round(weekly_pnl, 4)} USDT"
                 )
 
-                await app.send_message(LOG_CHAT_ID, report)
+                await app.send_message(log_chat_id, report)
 
                 weekly_pnl = 0.0
                 week_start = time.time()

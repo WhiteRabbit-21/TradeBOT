@@ -1,56 +1,68 @@
 import asyncio
 import os
+import time
 
 LOG_CHAT_ID = int(os.getenv("TG_LOG_CHAT_ID", "-1003332013833"))
 
-last_positions = {}
+last_checked = 0
+weekly_pnl = 0.0
+week_start = time.time()
 
 
 async def pnl_watcher(app, exchange, log, interval=5):
-
-    global last_positions
+    global last_checked, weekly_pnl, week_start
 
     while True:
         try:
-            positions = await asyncio.to_thread(exchange.fetch_positions)
+            trades = await asyncio.to_thread(exchange.fetch_my_trades)
 
-            current = {}
+            for t in trades:
+                ts = t.get("timestamp", 0)
 
-            for p in positions:
-                symbol = p.get("symbol")
-                size = float(p.get("contracts") or p.get("positionAmt") or 0)
+                if ts <= last_checked:
+                    continue
 
-                if size > 0:
-                    current[symbol] = p
+                pnl = float(
+                    t.get("info", {}).get("realizedPnl") or 0
+                )
 
-            # 🔥 перевіряємо що закрилось
-            for symbol, old_pos in last_positions.items():
+                if pnl == 0:
+                    continue
 
-                if symbol not in current:
-                    # позиція ЗАКРИЛАСЬ
-                    pnl = float(
-                        old_pos.get("unrealizedPnl")
-                        or old_pos.get("info", {}).get("unrealizedProfit")
-                        or 0
-                    )
+                symbol = t.get("symbol", "")
+                side = t.get("side", "")
+                amount = t.get("amount", 0)
 
-                    side = old_pos.get("side")
-                    qty = old_pos.get("contracts")
+                status = "🟢 PROFIT" if pnl > 0 else "🔴 LOSS"
 
-                    status = "🟢 PROFIT" if pnl > 0 else "🔴 LOSS"
+                msg = (
+                    f"{status}\n"
+                    f"Symbol: {symbol}\n"
+                    f"Side: {side}\n"
+                    f"PnL: {round(pnl, 4)}\n"
+                    f"Qty: {amount}"
+                )
 
-                    msg = (
-                        f"{status}\n"
-                        f"Symbol: {symbol}\n"
-                        f"Side: {side}\n"
-                        f"PnL: {round(pnl, 4)}\n"
-                        f"Qty: {qty}"
-                    )
+                weekly_pnl += pnl
 
-                    await app.send_message(LOG_CHAT_ID, msg)
+                await app.send_message(LOG_CHAT_ID, msg)
 
-            # оновлюємо стан
-            last_positions = current
+                last_checked = ts
+
+            # 📊 weekly report
+            if time.time() - week_start >= 7 * 24 * 60 * 60:
+                status = "🟢 PROFIT" if weekly_pnl > 0 else "🔴 LOSS"
+
+                report = (
+                    f"📊 WEEKLY REPORT\n\n"
+                    f"{status}\n"
+                    f"Total PnL: {round(weekly_pnl, 4)} USDT"
+                )
+
+                await app.send_message(LOG_CHAT_ID, report)
+
+                weekly_pnl = 0.0
+                week_start = time.time()
 
         except Exception as e:
             log("ERROR", f"PNL watcher error: {e}")

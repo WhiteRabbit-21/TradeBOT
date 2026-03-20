@@ -13,12 +13,55 @@ async def pnl_watcher(app, exchange, log, log_chat_id, interval=5):
 
     while True:
         try:
-            trades = await asyncio.to_thread(
-                exchange.fetch_my_trades,
-                None,
-                50
-            )
+            # =========================
+            # 🔥 1. беремо відкриті позиції
+            # =========================
+            positions_data = await asyncio.to_thread(exchange.fetch_positions)
 
+            symbols = []
+
+            for p in positions_data:
+                contracts = float(
+                    p.get("contracts")
+                    or p.get("size")
+                    or p.get("positionAmt")
+                    or 0
+                )
+
+                if contracts > 0:
+                    sym = p.get("symbol")
+                    if sym:
+                        symbols.append(sym)
+
+            symbols = list(set(symbols))
+
+            # якщо нема позицій — нічого не робимо
+            if not symbols:
+                await asyncio.sleep(interval)
+                continue
+
+            # =========================
+            # 🔥 2. тягнемо трейди
+            # =========================
+            all_trades = []
+
+            for symbol in symbols:
+                try:
+                    trades = await asyncio.to_thread(
+                        exchange.fetch_my_trades,
+                        symbol,
+                        50
+                    )
+                    all_trades.extend(trades)
+
+                except Exception as e:
+                    log("WARNING", f"fetch trades failed for {symbol}: {e}")
+
+            trades = all_trades
+
+            # =========================
+            # 🔥 3. групування позицій
+            # =========================
             positions = {}
 
             for t in trades:
@@ -49,7 +92,6 @@ async def pnl_watcher(app, exchange, log, log_chat_id, interval=5):
                 side = t.get("side", "")
                 amount = float(t.get("amount", 0))
 
-                # 🔥 ключ позиції
                 key = f"{symbol}_{side}"
 
                 if key not in positions:
@@ -67,7 +109,9 @@ async def pnl_watcher(app, exchange, log, log_chat_id, interval=5):
                 if ts > positions[key]["ts"]:
                     positions[key]["ts"] = ts
 
-            # 📤 відправка 1 повідомлення на позицію
+            # =========================
+            # 🔥 4. відправка (1 позиція = 1 повідомлення)
+            # =========================
             for key, data in positions.items():
                 symbol, side = key.split("_")
 
@@ -89,15 +133,21 @@ async def pnl_watcher(app, exchange, log, log_chat_id, interval=5):
 
                 await app.send_message(log_chat_id, msg)
 
-            # 🧠 оновлюємо last_checked
+            # =========================
+            # 🧠 5. оновлення last_checked
+            # =========================
             if positions:
                 last_checked = max(p["ts"] for p in positions.values())
 
-            # 🧹 чистка памʼяті
+            # =========================
+            # 🧹 6. чистка памʼяті
+            # =========================
             if len(seen_ids) > 1000:
                 seen_ids.clear()
 
-            # 📊 weekly report
+            # =========================
+            # 📊 7. weekly report
+            # =========================
             if time.time() - week_start >= 7 * 24 * 60 * 60:
                 status = "🟢 PROFIT" if weekly_pnl > 0 else "🔴 LOSS"
 

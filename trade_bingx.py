@@ -771,7 +771,11 @@ CRITICAL RULES:
 - NEVER return NONE if there is ANY of:
   base, SL, TP, LONG, SHORT
 
-- If signal looks like a trade → ALWAYS return OPEN
+- If signal contains "ADD" or "add" → return action = ADD
+- If signal contains "SL" → return SET_SL
+- If signal contains "TP" → return SET_TP
+Otherwise:
+- If full signal → OPEN
 
 - ENTRY can be missing → assume it's valid
 
@@ -839,6 +843,10 @@ If signal contains DCA or additional entry price:
   "dca_pct": percent
 
 If ADD has a price → it is DCA, not market add
+
++ ADD:
++ - "add", "add more", "increase position" → action = ADD
++ - Extract percent → add_pct
 
 """
 
@@ -971,6 +979,11 @@ async def handle_ai_command(cmd: dict):
     if action == "NONE":
         log("DEBUG", "AI SKIP: action=NONE")
         return
+    
+    # 🔥 FIX: force ADD if text contains "add"
+    if action == "OPEN" and "add" in (tg_text or "").lower():
+        log("WARNING", "FORCE FIX: OPEN -> ADD by text rule")
+        action = "ADD"
 
     min_conf = ACTION_MIN_CONF.get(action, 0.70)
 
@@ -1165,6 +1178,9 @@ async def handle_ai_command(cmd: dict):
     # -------------------------
     # ADD (from balance)
     # -------------------------
+    if action == "ADD" and not base:
+        log("INFO", "AI SKIP ADD: base missing")
+        return
 
     if action == "ADD":
 

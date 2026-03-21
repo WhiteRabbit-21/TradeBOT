@@ -44,6 +44,8 @@ CLOSE_BUNDLE_WINDOW_SEC = float(os.getenv("CLOSE_BUNDLE_WINDOW_SEC", "15"))  # a
 # --- TG logging config (hardcoded) ---
 LOG_LEVEL = "INFO"   # DEBUG / INFO / WARNING / ERROR
 LOG_FLUSH_SEC = 20   # INFO пачкою раз на N секунд
+SLTP_FILE = "/data/sltp.json"
+LAST_SLTP = {}
 
 # =========================
 # PYROGRAM CLIENT (USER)
@@ -54,6 +56,23 @@ app = Client(
     api_hash=API_HASH,
     session_string=SESSION_STRING,
 )
+
+def save_sltp():
+    try:
+        with open(SLTP_FILE, "w") as f:
+            json.dump(LAST_SLTP, f)
+    except Exception as e:
+        print("SLTP save error:", e)
+
+
+def load_sltp():
+    global LAST_SLTP
+    try:
+        if os.path.exists(SLTP_FILE):
+            with open(SLTP_FILE, "r") as f:
+                LAST_SLTP = json.load(f)
+    except Exception as e:
+        print("SLTP load error:", e)
 
 # =========================
 # TG LOGGER (batched)
@@ -542,6 +561,9 @@ def set_tp_oneway_sync(base: str, tp_price: float) -> str:
     except Exception:
         tp_prec = float(tp_price)
 
+    # 🔥 cancel старий TP
+    find_and_cancel_existing_stop_sync(symbol, close_side)
+
     # 🔥 Спробуємо кілька типів (BingX любить різні назви)
     candidates = [
         ("takeProfitMarket", {"stopPrice": tp_prec}),
@@ -994,6 +1016,10 @@ async def handle_ai_command(cmd: dict):
 
             try:
                 res = await close_position_full_oneway(b)
+                if b in LAST_SLTP:
+                    del LAST_SLTP[b]
+                    save_sltp()
+                log("INFO", f"SLTP cleared for {b}")
                 log("INFO", f"SUCCESS CLOSE {b}: {res}")
             except Exception as e:
                 log("ERROR", f"CLOSE {b} failed: {e}")
@@ -1098,6 +1124,31 @@ async def handle_ai_command(cmd: dict):
             log("INFO", f"OPEN RESPONSE: {resp}")
             log("INFO", f"SUCCESS OPEN placed id={resp.get('id')} {base_clean} side={side} qty={qty}")
 
+            # 🔥 ЗБЕРЕГТИ SL/TP
+            LAST_SLTP[base_clean] = {
+                "sl": sl_prec,
+                "tp": tp_prec
+            }
+
+            save_sltp()
+
+            sltp = LAST_SLTP.get(base_clean)
+
+            if sltp:
+                log("INFO", f"Reapplying SL/TP for {base_clean}")
+
+                try:
+                    await set_sl_oneway(base_clean, sltp["sl"])
+                except Exception as e:
+                    log("WARNING", f"SL reset failed: {e}")
+
+                try:
+                    await set_tp_oneway(base_clean, sltp["tp"])
+                except Exception as e:
+                    log("WARNING", f"TP reset failed: {e}")
+            else:
+                log("WARNING", f"No SL/TP stored for {base_clean}")
+
             # 🔥 DCA після OPEN
                     
             dca_price = cmd.get("dca_price")
@@ -1105,20 +1156,6 @@ async def handle_ai_command(cmd: dict):
 
             if dca_price and dca_pct:
                 await place_dca(symbol, side, float(dca_pct), float(dca_price), lev)
-    
-            # 🔥 SET SL
-            try:
-                r1 = await set_sl_oneway(base_clean, sl_prec)
-                log("INFO", f"SL {r1}")
-            except Exception as e:
-                log("WARNING", f"SL not set: {e}")
-
-            # 🔥 SET TP
-            try:
-                r2 = await set_tp_oneway(base_clean, tp_prec)
-                log("INFO", f"TP {r2}")
-            except Exception as e:
-                log("WARNING", f"TP not set: {e}")
 
         except Exception as e:
             log("ERROR", f"OPEN FAILED: {e}")
@@ -1224,8 +1261,26 @@ async def handle_ai_command(cmd: dict):
 
             log("INFO", f"MARKET ADD {base_clean} qty={qty} (~{pct}% balance)")
 
+            # 🔥 RESET SL/TP після ADD
+            sltp = LAST_SLTP.get(base_clean)
+
+            if sltp:
+                log("INFO", f"Reapplying SL/TP for {base_clean}")
+
+                try:
+                    await set_sl_oneway(base_clean, sltp["sl"])
+                except Exception as e:
+                    log("WARNING", f"SL reset failed: {e}")
+
+                try:
+                    await set_tp_oneway(base_clean, sltp["tp"])
+                except Exception as e:
+                    log("WARNING", f"TP reset failed: {e}")
+
+            return
         except Exception as e:
-            log("ERROR", f"ADD failed: {e}") 
+            log("ERROR", f"ADD failed: {e}")
+            return
     # -------------------------
     # SET_SL (always cancel old -> set new)
     # -------------------------
@@ -1258,6 +1313,16 @@ async def handle_ai_command(cmd: dict):
 
         try:
             res = await set_sl_oneway(base_clean, new_sl)  # cancels old SL inside
+            # 🔥 SAVE SL
+            if base_clean in LAST_SLTP:
+                LAST_SLTP[base_clean]["sl"] = new_sl
+            else:
+                LAST_SLTP[base_clean] = {
+                    "sl": new_sl,
+                    "tp": None
+                }
+
+            save_sltp()
             log("INFO", f"SUCCESS SET_SL {base_clean}: {res}")
         except Exception as e:
             log("ERROR", f"SET_SL failed: {e}")
@@ -1295,6 +1360,17 @@ async def handle_ai_command(cmd: dict):
 
         try:
             res = await set_tp_oneway(base_clean, new_tp)
+
+            # 🔥 SAVE TP
+            if base_clean in LAST_SLTP:
+                LAST_SLTP[base_clean]["tp"] = new_tp
+            else:
+                LAST_SLTP[base_clean] = {
+                    "sl": None,
+                    "tp": new_tp
+                }
+
+            save_sltp()
             log("INFO", f"SUCCESS SET_TP {base_clean}: {res}")
         except Exception as e:
             log("ERROR", f"SET_TP failed: {e}")
@@ -1578,6 +1654,7 @@ async def on_signal(_, message):
 # =========================
 
 async def main():
+    load_sltp()
     await app.start()
     asyncio.create_task(
         pnl_watcher(app, exchange, log, PNL_CHAT_ID)

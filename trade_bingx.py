@@ -64,6 +64,39 @@ def save_sltp():
     except Exception as e:
         print("SLTP save error:", e)
 
+def cancel_all_stops_sync(symbol: str, side: str, pos_side: str, kind: str):
+    try:
+        orders = exchange.fetch_open_orders(symbol)
+
+        for o in orders:
+            try:
+                o_side = (o.get("side") or "").lower()
+                o_info = o.get("info") or {}
+
+                o_pos_side = str(o_info.get("positionSide") or "").lower()
+
+                # 🔥 фільтр
+                if o_side != side:
+                    continue
+
+                
+                if o_pos_side != pos_side.lower():
+                    continue
+
+                # 🔥 розділяємо SL / TP
+                if kind == "sl" and not is_sl_order(o):
+                    continue
+
+                if kind == "tp" and not is_tp_order(o):
+                    continue
+                exchange.cancel_order(o["id"], symbol)
+                print(f"CANCEL {symbol} {o_side} {o_pos_side} id={o['id']}")
+
+            except Exception:
+                continue
+
+    except Exception as e:
+        print("cancel_all_stops error:", e)
 
 def load_sltp():
     global LAST_SLTP
@@ -490,7 +523,7 @@ def set_sl_oneway_sync(base: str, sl_price: float) -> str:
     except Exception:
         sl_prec = float(sl_price)
 
-    old = find_and_cancel_existing_stop_sync(symbol, stop_side)
+    cancel_all_stops_sync(symbol, stop_side, pos_side, "sl")
 
     candidates = [
     ("stopMarket", {"stopPrice": sl_prec}),
@@ -514,8 +547,6 @@ def set_sl_oneway_sync(base: str, sl_price: float) -> str:
     }
 )
             new_id = resp.get("id")
-            if old:
-                return f"SL_UPDATED old={old} new={new_id} sl={sl_prec}"
             return f"SL_SET id={new_id} sl={sl_prec}"
         except Exception as e:
             last_err = e
@@ -562,7 +593,7 @@ def set_tp_oneway_sync(base: str, tp_price: float) -> str:
         tp_prec = float(tp_price)
 
     # 🔥 cancel старий TP
-    find_and_cancel_existing_stop_sync(symbol, close_side)
+    cancel_all_stops_sync(symbol, close_side, pos_side, "tp")
 
     # 🔥 Спробуємо кілька типів (BingX любить різні назви)
     candidates = [
@@ -757,6 +788,7 @@ def _normalize_base_word(w: str) -> Optional[str]:
         b = b[:-4]
     return b
 
+
 # =========================
 # AI PARSER (text + images)
 # =========================
@@ -868,6 +900,26 @@ AI_JSON_SHAPE = {
     "price": "number|null", 
 }
 
+def is_sl_order(o):
+    t = (o.get("type") or "").lower()
+    info = o.get("info") or {}
+
+    return (
+        "stop" in t
+        or info.get("stopPrice") is not None
+    )
+
+
+def is_tp_order(o):
+    t = (o.get("type") or "").lower()
+    info = o.get("info") or {}
+
+    return (
+        "profit" in t
+        or "take" in t
+        or info.get("triggerPrice") is not None
+    )
+
 def _img_to_data_url(path: str) -> str:
     with open(path, "rb") as f:
         b = f.read()
@@ -958,7 +1010,6 @@ def _clean_base(x: str) -> str:
     b = TOKEN_ALIASES.get(b, b)
     return b
 
-
 async def handle_ai_command(cmd: dict):
     action = (cmd.get("action") or "NONE").upper()
     conf = float(cmd.get("confidence") or 0.0)
@@ -981,7 +1032,7 @@ async def handle_ai_command(cmd: dict):
         return
     
     # 🔥 FIX: force ADD if text contains "add"
-    if action == "OPEN" and "add" in (tg_text or "").lower():
+    if action == "OPEN" and re.search(r"\badd\b", (tg_text or ""), re.I):
         log("WARNING", "FORCE FIX: OPEN -> ADD by text rule")
         action = "ADD"
 
@@ -1137,6 +1188,8 @@ async def handle_ai_command(cmd: dict):
             log("INFO", f"OPEN RESPONSE: {resp}")
             log("INFO", f"SUCCESS OPEN placed id={resp.get('id')} {base_clean} side={side} qty={qty}")
 
+            await asyncio.sleep(0.7)
+
             # 🔥 ЗБЕРЕГТИ SL/TP
             LAST_SLTP[base_clean] = {
                 "sl": sl_prec,
@@ -1276,6 +1329,7 @@ async def handle_ai_command(cmd: dict):
             resp = await open_market(symbol, side, qty)
 
             log("INFO", f"MARKET ADD {base_clean} qty={qty} (~{pct}% balance)")
+            await asyncio.sleep(0.7)
 
             # 🔥 RESET SL/TP після ADD
             sltp = LAST_SLTP.get(base_clean)

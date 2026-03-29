@@ -13,64 +13,26 @@ async def pnl_watcher(app, exchange, log, log_chat_id, interval=5):
 
     while True:
         try:
-            # =========================
-            # 🔥 1. беремо відкриті позиції
-            # =========================
-            positions_data = await asyncio.to_thread(exchange.fetch_positions)
+            # 🔥 беремо останні трейди (ВСІ символи)
+            trades = await asyncio.to_thread(
+                exchange.fetch_my_trades,
+                None,
+                200
+            )
 
-            symbols = []
-
-            for p in positions_data:
-                contracts = float(
-                    p.get("contracts")
-                    or p.get("size")
-                    or p.get("positionAmt")
-                    or 0
-                )
-
-                if contracts > 0:
-                    sym = p.get("symbol")
-                    if sym:
-                        symbols.append(sym)
-
-            symbols = list(set(symbols))
-
-            # якщо нема позицій — нічого не робимо
-            if not symbols:
-                await asyncio.sleep(interval)
-                continue
-
-            # =========================
-            # 🔥 2. тягнемо трейди
-            # =========================
-            all_trades = []
-
-            for symbol in symbols:
-                try:
-                    trades = await asyncio.to_thread(
-                        exchange.fetch_my_trades,
-                        symbol,
-                        50
-                    )
-                    all_trades.extend(trades)
-
-                except Exception as e:
-                    log("WARNING", f"fetch trades failed for {symbol}: {e}")
-
-            trades = all_trades
-
-            # =========================
-            # 🔥 3. групування позицій
-            # =========================
             positions = {}
 
             for t in trades:
                 ts = t.get("timestamp", 0)
 
+                # 🔥 тільки нові
                 if ts <= last_checked:
                     continue
 
                 trade_id = t.get("id")
+                if not trade_id:
+                    continue
+
                 if trade_id in seen_ids:
                     continue
 
@@ -85,6 +47,7 @@ async def pnl_watcher(app, exchange, log, log_chat_id, interval=5):
                     or 0
                 )
 
+                # 🔥 пропускаємо не закриті
                 if pnl == 0:
                     continue
 
@@ -110,7 +73,7 @@ async def pnl_watcher(app, exchange, log, log_chat_id, interval=5):
                     positions[key]["ts"] = ts
 
             # =========================
-            # 🔥 4. відправка (1 позиція = 1 повідомлення)
+            # 🔥 ВІДПРАВКА
             # =========================
             for key, data in positions.items():
                 symbol, side = key.split("_")
@@ -124,8 +87,8 @@ async def pnl_watcher(app, exchange, log, log_chat_id, interval=5):
                 msg = (
                     f"{status} #{symbol}\n"
                     f"Side: {side}\n"
-                    f"Total PnL: {round(pnl, 4)} USDT\n"
-                    f"Total Qty: {round(qty, 4)}\n"
+                    f"PnL: {round(pnl, 4)} USDT\n"
+                    f"Qty: {round(qty, 4)}\n"
                     f"Trades: {trades_count}"
                 )
 
@@ -134,19 +97,19 @@ async def pnl_watcher(app, exchange, log, log_chat_id, interval=5):
                 await app.send_message(log_chat_id, msg)
 
             # =========================
-            # 🧠 5. оновлення last_checked
+            # 🔥 оновлення часу
             # =========================
-            if positions:
-                last_checked = max(p["ts"] for p in positions.values())
+            if trades:
+                last_checked = max(t.get("timestamp", 0) for t in trades)
 
             # =========================
-            # 🧹 6. чистка памʼяті
+            # 🔥 чистка seen_ids
             # =========================
-            if len(seen_ids) > 1000:
-                seen_ids.clear()
+            if len(seen_ids) > 5000:
+                seen_ids = set(list(seen_ids)[-2000:])
 
             # =========================
-            # 📊 7. weekly report
+            # 🔥 weekly report
             # =========================
             if time.time() - week_start >= 7 * 24 * 60 * 60:
                 status = "🟢 PROFIT" if weekly_pnl > 0 else "🔴 LOSS"

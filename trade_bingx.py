@@ -288,13 +288,30 @@ async def get_usdt_free() -> float:
     return await asyncio.to_thread(get_usdt_free_sync)
 
 def set_leverage_sync(symbol: str, lev: int, side: str):
-    exchange.set_leverage(
-        int(lev),
-        symbol,
-        {
-            "positionSide": "LONG" if side == "long" else "SHORT"
-        }
-    )
+
+    pos_side = "LONG" if side == "long" else "SHORT"
+
+    # 🔥 важливо
+    exchange.set_margin_mode("cross", symbol)
+
+    # 🔥 пробуємо різні варіанти (бо BingX кривий)
+    variants = [
+        {"positionSide": pos_side},
+        {"side": pos_side},
+        {"positionSide": pos_side, "side": pos_side},
+    ]
+
+    last_err = None
+
+    for params in variants:
+        try:
+            exchange.set_leverage(int(lev), symbol, params)
+            log("INFO", f"LEVERAGE SET OK {symbol} {lev} {pos_side} params={params}")
+            return
+        except Exception as e:
+            last_err = e
+
+    raise RuntimeError(f"set_leverage failed: {last_err}")
 
 async def set_leverage(symbol: str, lev: int, side: str):
     await asyncio.to_thread(set_leverage_sync, symbol, lev, side)
@@ -394,11 +411,15 @@ def close_position_full_hedge_sync(base: str):
             continue
 
         contracts = float(
-            pos.get("contracts")
-            or pos.get("size")
-            or pos.get("positionAmt")
-            or 0
+            abs(
+                pos.get("contracts")
+                or pos.get("size")
+                or pos.get("positionAmt")
+                or 0
+            )
         )
+        
+        contracts = float(exchange.amount_to_precision(symbol, contracts))
 
         if contracts <= 0:
             continue
@@ -509,10 +530,21 @@ def set_sl_oneway_sync(base: str, sl_price: float) -> str:
         or ""
     ).lower()
     
+    
     if pos_side not in {"long", "short"}:
         return "NO_POSITION"
 
-    contracts = float(pos.get("contracts") or pos.get("size") or pos.get("positionAmt") or 0.0)
+    contracts = float(
+    abs(
+        pos.get("contracts")
+        or pos.get("size")
+        or pos.get("positionAmt")
+        or 0
+    )
+)
+
+    contracts = float(exchange.amount_to_precision(symbol, contracts))
+
     if contracts <= 0:
         return "NO_POSITION"
 
@@ -576,11 +608,14 @@ def set_tp_oneway_sync(base: str, tp_price: float) -> str:
         return "NO_POSITION"
 
     contracts = float(
-        pos.get("contracts")
-        or pos.get("size")
-        or pos.get("positionAmt")
-        or 0.0
+        abs(
+            pos.get("contracts")
+            or pos.get("size")
+            or pos.get("positionAmt")
+            or 0
+        )
     )
+    contracts = float(exchange.amount_to_precision(symbol, contracts))
 
     if contracts <= 0:
         return "NO_POSITION"
@@ -660,7 +695,17 @@ def add_position_oneway_sync(base: str, add_pct: Optional[float]) -> str:
     if pos_side not in {"long", "short"}:
         return "NO_POSITION"
 
-    contracts = float(pos.get("contracts") or pos.get("size") or pos.get("positionAmt") or 0.0)
+    contracts = float(
+    abs(
+        pos.get("contracts")
+        or pos.get("size")
+        or pos.get("positionAmt")
+        or 0
+    )
+)
+
+    contracts = float(exchange.amount_to_precision(symbol, contracts))
+
     if contracts <= 0:
         return "NO_POSITION"
 
@@ -717,13 +762,16 @@ def normalize_price_from_tail(raw: float, entry: float, side: str, kind: str) ->
     best = None
     best_score = float("inf")
 
+    if raw > entry * 1000:
+        raw = raw / 100
+
     for k in range(0, 13):
         cand = raw / (10 ** k)
         if cand <= 0:
             continue
 
         ratio = cand / entry if entry > 0 else 999.0
-        if ratio < 0.1 or ratio > 10:
+        if ratio < 0.00001 or ratio > 100:
             continue
 
         ok_dir = True
@@ -996,7 +1044,7 @@ ACTION_MIN_CONF = {
     "SET_TP": 0.60,
     "BE": 0.60,
     "ADD": 0.65,
-    "OPEN": 0.60,
+    "OPEN": 0.40,
 }
 
 # =========================
@@ -1038,7 +1086,7 @@ async def handle_ai_command(cmd: dict):
 
     min_conf = ACTION_MIN_CONF.get(action, 0.70)
 
-    if action != "ADD" and conf < min_conf:
+    if action not in {"SET_SL", "SET_TP", "BE"} and conf < min_conf:
         log("INFO", f"AI SKIP: low confidence {conf} < {min_conf} for action={action}")
         return
 

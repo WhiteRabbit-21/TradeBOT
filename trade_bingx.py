@@ -7,7 +7,7 @@ import base64
 import asyncio
 from datetime import datetime
 from typing import Optional, Any
-from trade_notifier import pnl_watcher
+from trade_notifier import pnl_watcher, register_symbol
 import ccxt
 from pyrogram import Client, filters, idle
 from pyrogram.errors import PeerIdInvalid, FloodWait, RPCError
@@ -1094,6 +1094,7 @@ async def handle_ai_command(cmd: dict):
     # CLOSE
     # -------------------------
     if action == "CLOSE":
+        
         if not has_close_intent(tg_text):
             log("INFO", "SAFE SKIP CLOSE: no close intent words in text")
             return
@@ -1118,6 +1119,8 @@ async def handle_ai_command(cmd: dict):
 
         for b in cleaned:
             symbol = await resolve_symbol(b)
+            register_symbol(symbol)
+
             if not symbol:
                 log("ERROR", f"CLOSE skip: symbol not listed on BingX: {b}/USDT")
                 continue
@@ -1232,7 +1235,7 @@ async def handle_ai_command(cmd: dict):
 
         try:
             resp = await open_market(symbol, side, qty)
-
+            register_symbol(symbol)
             log("INFO", f"OPEN RESPONSE: {resp}")
             log("INFO", f"SUCCESS OPEN placed id={resp.get('id')} {base_clean} side={side} qty={qty}")
 
@@ -1270,6 +1273,7 @@ async def handle_ai_command(cmd: dict):
 
             if dca_price and dca_pct:
                 await place_dca(symbol, side, float(dca_pct), float(dca_price), lev)
+                register_symbol(symbol)
 
         except Exception as e:
             log("ERROR", f"OPEN FAILED: {e}")
@@ -1342,7 +1346,7 @@ async def handle_ai_command(cmd: dict):
                 qty = float(await asyncio.to_thread(exchange.amount_to_precision, symbol, qty_raw))
 
                 await place_dca(symbol, side, pct, dca_price, lev)
-
+                register_symbol(symbol)
                 log("INFO", f"DCA placed {base_clean} at {dca_price} qty={qty}")
 
             except Exception as e:
@@ -1375,6 +1379,7 @@ async def handle_ai_command(cmd: dict):
                 log("INFO", f"ADD qty adjusted to min: {qty}")
 
             resp = await open_market(symbol, side, qty)
+            register_symbol(symbol)
 
             log("INFO", f"MARKET ADD {base_clean} qty={qty} (~{pct}% balance)")
             await asyncio.sleep(0.7)

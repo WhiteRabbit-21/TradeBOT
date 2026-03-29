@@ -7,25 +7,57 @@ week_start = time.time()
 
 seen_ids = set()
 
+# 🔥 список активних символів
+ACTIVE_SYMBOLS = set()
+
+
+def register_symbol(symbol: str):
+    if symbol:
+        ACTIVE_SYMBOLS.add(symbol)
+
 
 async def pnl_watcher(app, exchange, log, log_chat_id, interval=5):
     global last_checked, weekly_pnl, week_start, seen_ids
 
     while True:
         try:
-            # 🔥 беремо останні трейди (ВСІ символи)
-            trades = await asyncio.to_thread(
-                exchange.fetch_my_trades,
-                None,
-                200
-            )
+            # =========================
+            # 🔥 беремо тільки активні символи
+            # =========================
+            symbols = list(ACTIVE_SYMBOLS)
+
+            # fallback якщо ще нічого нема
+            if not symbols:
+                await asyncio.sleep(interval)
+                continue
+
+            all_trades = []
+
+            for symbol in symbols:
+                try:
+                    trades = await asyncio.to_thread(
+                        exchange.fetch_my_trades,
+                        symbol,
+                        None,
+                        50
+                    )
+                    all_trades.extend(trades)
+
+                except Exception as e:
+                    log("WARNING", f"fetch trades failed {symbol}: {e}")
+
+            if not all_trades:
+                await asyncio.sleep(interval)
+                continue
 
             positions = {}
 
-            for t in trades:
+            # =========================
+            # 🔥 обробка трейдів
+            # =========================
+            for t in all_trades:
                 ts = t.get("timestamp", 0)
 
-                # 🔥 тільки нові
                 if ts <= last_checked:
                     continue
 
@@ -44,10 +76,10 @@ async def pnl_watcher(app, exchange, log, log_chat_id, interval=5):
                     info.get("realizedPnl")
                     or info.get("profit")
                     or info.get("closedPnl")
+                    or t.get("cost")  # fallback
                     or 0
                 )
 
-                # 🔥 пропускаємо не закриті
                 if pnl == 0:
                     continue
 
@@ -73,7 +105,7 @@ async def pnl_watcher(app, exchange, log, log_chat_id, interval=5):
                     positions[key]["ts"] = ts
 
             # =========================
-            # 🔥 ВІДПРАВКА
+            # 🔥 відправка повідомлень
             # =========================
             for key, data in positions.items():
                 symbol, side = key.split("_")
@@ -99,8 +131,8 @@ async def pnl_watcher(app, exchange, log, log_chat_id, interval=5):
             # =========================
             # 🔥 оновлення часу
             # =========================
-            if trades:
-                last_checked = max(t.get("timestamp", 0) for t in trades)
+            if all_trades:
+                last_checked = max(t.get("timestamp", 0) for t in all_trades)
 
             # =========================
             # 🔥 чистка seen_ids

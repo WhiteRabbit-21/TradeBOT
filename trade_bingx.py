@@ -1086,7 +1086,7 @@ async def handle_ai_command(cmd: dict):
 
     min_conf = ACTION_MIN_CONF.get(action, 0.70)
 
-    if action not in {"SET_SL", "SET_TP", "BE"} and conf < min_conf:
+    if action not in {"SET_SL", "SET_TP", "BE", "CLOSE"} and conf < min_conf:
         log("INFO", f"AI SKIP: low confidence {conf} < {min_conf} for action={action}")
         return
 

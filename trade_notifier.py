@@ -1,22 +1,19 @@
 import asyncio
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Set
 
-# =========================
-# GLOBAL STATE
-# =========================
-last_checked = 0  # latest processed trade timestamp (ms)
+last_checked = 0
 weekly_pnl = 0.0
 week_start = time.time()
 
-# store already-sent close events so we don't resend them
 SENT_EVENT_KEYS = set()
 MAX_SENT_EVENT_KEYS = 5000
 
+# Пам'ятаємо символи, по яких недавно були позиції/ордери/закриття
+RECENT_SYMBOLS: Set[str] = set()
+MAX_RECENT_SYMBOLS = 30
 
-# =========================
-# HELPERS
-# =========================
+
 def _to_float(value: Any, default: float = 0.0) -> float:
     try:
         if value is None or value == "":
@@ -58,7 +55,6 @@ def _is_close_trade(trade: dict) -> bool:
     if reduce_only:
         return True
 
-    # fallback: many exchanges expose non-zero realized pnl only on closing fills
     return _extract_pnl(trade) != 0
 
 
@@ -87,7 +83,6 @@ def _event_key(trade: dict) -> str:
     if order_id:
         return f"{symbol}|{order_id}|{side}|{pos_side}"
 
-    # fallback if exchange doesn't provide order id
     ts_bucket = int(trade.get("timestamp") or 0) // 5000
     return f"{symbol}|{ts_bucket}|{side}|{pos_side}"
 
@@ -114,20 +109,16 @@ def _format_close_message(event: dict) -> str:
     return "\n".join(lines)
 
 
-async def _fetch_all_recent_trades(exchange, since_ms: int) -> List[dict]:
-    """
-    Quiet fetcher:
-    - tries global trade history first
-    - if not supported, falls back to symbols from positions/open orders
-    - no warnings in normal polling loop
-    """
-    try:
-        trades = await asyncio.to_thread(exchange.fetch_my_trades, None, since_ms or None, 100)
-        if trades:
-            return trades
-    except Exception:
-        pass
+def _remember_symbol(symbol: str):
+    global RECENT_SYMBOLS
+    if not symbol:
+        return
+    RECENT_SYMBOLS.add(symbol)
+    if len(RECENT_SYMBOLS) > MAX_RECENT_SYMBOLS:
+        RECENT_SYMBOLS = set(list(RECENT_SYMBOLS)[-MAX_RECENT_SYMBOLS:])
 
+
+async def _collect_symbols(exchange) -> List[str]:
     symbols: List[str] = []
 
     try:
@@ -136,6 +127,7 @@ async def _fetch_all_recent_trades(exchange, since_ms: int) -> List[dict]:
             symbol = pos.get("symbol")
             if symbol and symbol not in symbols:
                 symbols.append(symbol)
+                _remember_symbol(symbol)
     except Exception:
         pass
 
@@ -145,17 +137,40 @@ async def _fetch_all_recent_trades(exchange, since_ms: int) -> List[dict]:
             symbol = order.get("symbol")
             if symbol and symbol not in symbols:
                 symbols.append(symbol)
+                _remember_symbol(symbol)
     except Exception:
         pass
 
+    for sym in list(RECENT_SYMBOLS):
+        if sym and sym not in symbols:
+            symbols.append(sym)
+
+    return symbols[:20]
+
+
+async def _fetch_all_recent_trades(exchange, since_ms: int) -> List[dict]:
+    # 1) пробуем общую историю
+    try:
+        trades = await asyncio.to_thread(exchange.fetch_my_trades, None, since_ms or None, 100)
+        if trades:
+            for t in trades:
+                _remember_symbol(t.get("symbol"))
+            return trades
+    except Exception:
+        pass
+
+    # 2) fallback по текущим и недавним символам
+    symbols = await _collect_symbols(exchange)
     if not symbols:
         return []
 
     all_trades: List[dict] = []
-    for symbol in symbols[:15]:
+    for symbol in symbols:
         try:
             part = await asyncio.to_thread(exchange.fetch_my_trades, symbol, since_ms or None, 50)
             if part:
+                for t in part:
+                    _remember_symbol(t.get("symbol"))
                 all_trades.extend(part)
         except Exception:
             pass
@@ -163,20 +178,7 @@ async def _fetch_all_recent_trades(exchange, since_ms: int) -> List[dict]:
     return all_trades
 
 
-# =========================
-# PUBLIC WATCHER
-# =========================
 async def pnl_watcher(app, exchange, log, log_chat_id, interval: int = 5):
-    """
-    Sends ONE message for the latest closed trade event.
-
-    Rules:
-    - no warning spam during normal polling
-    - only new closing trades are processed
-    - multiple fills of the same close are merged into one event
-    - only the latest close event is sent per cycle
-    - already sent events are deduplicated
-    """
     global last_checked, weekly_pnl, week_start, SENT_EVENT_KEYS
 
     while True:
@@ -206,6 +208,9 @@ async def pnl_watcher(app, exchange, log, log_chat_id, interval: int = 5):
                 if pnl == 0:
                     continue
 
+                symbol = str(trade.get("symbol") or "")
+                _remember_symbol(symbol)
+
                 key = _event_key(trade)
                 if key in SENT_EVENT_KEYS:
                     continue
@@ -214,7 +219,7 @@ async def pnl_watcher(app, exchange, log, log_chat_id, interval: int = 5):
                 if not event:
                     close_events[key] = {
                         "key": key,
-                        "symbol": str(trade.get("symbol") or ""),
+                        "symbol": symbol,
                         "side": str(trade.get("side") or (trade.get("info") or {}).get("side") or ""),
                         "pnl": pnl,
                         "qty": abs(_to_float(trade.get("amount"), 0.0)),
@@ -238,10 +243,7 @@ async def pnl_watcher(app, exchange, log, log_chat_id, interval: int = 5):
                     SENT_EVENT_KEYS = set(list(SENT_EVENT_KEYS)[-2000:])
 
                 weekly_pnl += latest_event["pnl"]
-                log(
-                    "INFO",
-                    f"PNL notifier sent: {latest_event['symbol']} pnl={latest_event['pnl']} fills={latest_event['fills']}",
-                )
+                log("INFO", f"PNL notifier sent: {latest_event['symbol']} pnl={latest_event['pnl']} fills={latest_event['fills']}")
 
             last_checked = latest_seen_ts
 

@@ -1378,7 +1378,7 @@ async def handle_ai_command(cmd: dict):
                 log("INFO", f"ADD qty adjusted to min: {qty}")
 
             resp = await open_market(symbol, side, qty)
-            
+           
 
             log("INFO", f"MARKET ADD {base_clean} qty={qty} (~{pct}% balance)")
             await asyncio.sleep(0.7)
@@ -1796,6 +1796,13 @@ async def main():
                 await _send_to_tg(f"[{_ts()}] [INFO] 🧾 Telegram logging ON. log_chat_id={LOG_CHAT_ID}")
             else:
                 log("ERROR", f"Telegram logging FAILED. log_chat_id={LOG_CHAT_ID}")
+        if PNL_CHAT_ID:
+            ok3 = await ensure_peer_known(PNL_CHAT_ID)
+            if ok3:
+                log("INFO", f"PNL chat ready. pnl_chat_id={PNL_CHAT_ID}")
+            else:
+                log("ERROR", f"PNL chat FAILED. pnl_chat_id={PNL_CHAT_ID}")
+
 
         try:
             await ensure_markets_loaded()

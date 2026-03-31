@@ -1778,9 +1778,7 @@ async def on_signal(_, message):
 async def main():
     load_sltp()
     await app.start()
-    asyncio.create_task(
-        pnl_watcher(app, exchange, log, PNL_CHAT_ID)
-    )
+
     asyncio.create_task(log_pump())
 
     try:
@@ -1796,19 +1794,24 @@ async def main():
                 await _send_to_tg(f"[{_ts()}] [INFO] 🧾 Telegram logging ON. log_chat_id={LOG_CHAT_ID}")
             else:
                 log("ERROR", f"Telegram logging FAILED. log_chat_id={LOG_CHAT_ID}")
+
+        pnl_ready = False
         if PNL_CHAT_ID:
             ok3 = await ensure_peer_known(PNL_CHAT_ID)
             if ok3:
+                pnl_ready = True
                 log("INFO", f"PNL chat ready. pnl_chat_id={PNL_CHAT_ID}")
             else:
                 log("ERROR", f"PNL chat FAILED. pnl_chat_id={PNL_CHAT_ID}")
-
 
         try:
             await ensure_markets_loaded()
             log("INFO", "BINGX markets loaded")
         except Exception as e:
             log("ERROR", f"BINGX load_markets failed: {e}")
+
+        if pnl_ready:
+            asyncio.create_task(pnl_watcher(app, exchange, log, PNL_CHAT_ID))
 
         log("INFO", f"DRY_RUN={DRY_RUN} | Listening TARGET_CHAT_ID={TARGET_CHAT_ID}")
         await idle()

@@ -1,17 +1,16 @@
 import asyncio
 import time
-from typing import Any, Dict, List, Set
+from typing import Any, Dict, Optional
 
-last_checked = 0
+# =========================
+# GLOBAL STATE
+# =========================
+LAST_POSITIONS: Dict[str, dict] = {}
+SENT_CLOSE_CACHE: Dict[str, int] = {}   # symbol -> last sent ts
+CACHE_TTL_SEC = 30
+
 weekly_pnl = 0.0
 week_start = time.time()
-
-SENT_EVENT_KEYS = set()
-MAX_SENT_EVENT_KEYS = 5000
-
-# Пам'ятаємо символи, по яких недавно були позиції/ордери/закриття
-RECENT_SYMBOLS: Set[str] = set()
-MAX_RECENT_SYMBOLS = 30
 
 
 def _to_float(value: Any, default: float = 0.0) -> float:
@@ -23,9 +22,35 @@ def _to_float(value: Any, default: float = 0.0) -> float:
         return default
 
 
-def _extract_pnl(trade: dict) -> float:
-    info = trade.get("info") or {}
+def _extract_pos_side(pos: dict) -> str:
+    return str(
+        pos.get("side")
+        or pos.get("positionSide")
+        or (pos.get("info") or {}).get("positionSide")
+        or ""
+    ).lower()
 
+
+def _extract_pos_size(pos: dict) -> float:
+    return abs(_to_float(
+        pos.get("contracts")
+        or pos.get("size")
+        or pos.get("positionAmt")
+        or 0
+    ))
+
+
+def _extract_entry(pos: dict) -> float:
+    return _to_float(
+        pos.get("entryPrice")
+        or pos.get("average")
+        or pos.get("avgPrice")
+        or 0
+    )
+
+
+def _extract_trade_pnl(trade: dict) -> float:
+    info = trade.get("info") or {}
     for candidate in (
         trade.get("realizedPnl"),
         trade.get("closedPnl"),
@@ -38,214 +63,124 @@ def _extract_pnl(trade: dict) -> float:
         pnl = _to_float(candidate, 0.0)
         if pnl != 0:
             return pnl
-
     return 0.0
 
 
-def _is_close_trade(trade: dict) -> bool:
-    info = trade.get("info") or {}
-
-    reduce_only = trade.get("reduceOnly")
-    if reduce_only is None:
-        reduce_only = info.get("reduceOnly")
-
-    if isinstance(reduce_only, str):
-        reduce_only = reduce_only.lower() in {"true", "1", "yes"}
-
-    if reduce_only:
-        return True
-
-    return _extract_pnl(trade) != 0
+def _extract_trade_qty(trade: dict) -> float:
+    return abs(_to_float(trade.get("amount"), 0.0))
 
 
-def _normalize_symbol(symbol: str) -> str:
-    return str(symbol or "").replace(":", "_").replace("/", "_")
-
-
-def _event_key(trade: dict) -> str:
-    info = trade.get("info") or {}
-    symbol = _normalize_symbol(trade.get("symbol", ""))
-    side = str(trade.get("side") or info.get("side") or "").lower()
-    pos_side = str(
-        trade.get("positionSide")
-        or info.get("positionSide")
-        or info.get("posSide")
-        or ""
-    ).lower()
-
-    order_id = (
-        trade.get("order")
-        or trade.get("orderId")
-        or info.get("orderId")
-        or info.get("clientOrderId")
-        or info.get("clientOid")
-    )
-    if order_id:
-        return f"{symbol}|{order_id}|{side}|{pos_side}"
-
-    ts_bucket = int(trade.get("timestamp") or 0) // 5000
-    return f"{symbol}|{ts_bucket}|{side}|{pos_side}"
-
-
-def _format_close_message(event: dict) -> str:
-    pnl = event["pnl"]
-    qty = event["qty"]
-    symbol = event["symbol"]
-    side = (event.get("side") or "").upper()
+def _format_close_message(symbol: str, side: str, pnl: float, qty: float) -> str:
     status = "🟢 PROFIT" if pnl > 0 else "🔴 LOSS"
-
     lines = [
         f"{status} #{symbol}",
+        f"Close side: {side.upper()}",
         f"PnL: {round(pnl, 4)} USDT",
         f"Qty: {round(qty, 4)}",
     ]
-
-    if side:
-        lines.insert(1, f"Close side: {side}")
-
-    if event.get("fills", 1) > 1:
-        lines.append(f"Fills: {event['fills']}")
-
     return "\n".join(lines)
 
 
-def _remember_symbol(symbol: str):
-    global RECENT_SYMBOLS
-    if not symbol:
-        return
-    RECENT_SYMBOLS.add(symbol)
-    if len(RECENT_SYMBOLS) > MAX_RECENT_SYMBOLS:
-        RECENT_SYMBOLS = set(list(RECENT_SYMBOLS)[-MAX_RECENT_SYMBOLS:])
+def _should_send(symbol: str) -> bool:
+    now = int(time.time())
+    last = SENT_CLOSE_CACHE.get(symbol, 0)
+    if now - last < CACHE_TTL_SEC:
+        return False
+    SENT_CLOSE_CACHE[symbol] = now
+    return True
 
 
-async def _collect_symbols(exchange) -> List[str]:
-    symbols: List[str] = []
-
+async def _fetch_positions_map(exchange) -> Dict[str, dict]:
+    result: Dict[str, dict] = {}
     try:
         positions = await asyncio.to_thread(exchange.fetch_positions)
-        for pos in positions or []:
-            symbol = pos.get("symbol")
-            if symbol and symbol not in symbols:
-                symbols.append(symbol)
-                _remember_symbol(symbol)
     except Exception:
-        pass
+        return result
 
+    for pos in positions or []:
+        symbol = pos.get("symbol")
+        if not symbol:
+            continue
+
+        side = _extract_pos_side(pos)
+        size = _extract_pos_size(pos)
+
+        if side in {"long", "short"} and size > 0:
+            result[symbol] = {
+                "side": side,
+                "size": size,
+                "entry": _extract_entry(pos),
+                "raw": pos,
+            }
+
+    return result
+
+
+async def _get_last_closed_trade_info(exchange, symbol: str) -> Optional[dict]:
     try:
-        open_orders = await asyncio.to_thread(exchange.fetch_open_orders)
-        for order in open_orders or []:
-            symbol = order.get("symbol")
-            if symbol and symbol not in symbols:
-                symbols.append(symbol)
-                _remember_symbol(symbol)
+        trades = await asyncio.to_thread(exchange.fetch_my_trades, symbol, None, 20)
     except Exception:
-        pass
+        return None
 
-    for sym in list(RECENT_SYMBOLS):
-        if sym and sym not in symbols:
-            symbols.append(sym)
+    if not trades:
+        return None
 
-    return symbols[:20]
+    trades = sorted(trades, key=lambda t: int(t.get("timestamp") or 0), reverse=True)
 
+    best = None
+    for t in trades:
+        pnl = _extract_trade_pnl(t)
+        qty = _extract_trade_qty(t)
+        if pnl != 0 and qty > 0:
+            best = {
+                "pnl": pnl,
+                "qty": qty,
+                "ts": int(t.get("timestamp") or 0),
+                "side": str(t.get("side") or (t.get("info") or {}).get("side") or ""),
+            }
+            break
 
-async def _fetch_all_recent_trades(exchange, since_ms: int) -> List[dict]:
-    # 1) пробуем общую историю
-    try:
-        trades = await asyncio.to_thread(exchange.fetch_my_trades, None, since_ms or None, 100)
-        if trades:
-            for t in trades:
-                _remember_symbol(t.get("symbol"))
-            return trades
-    except Exception:
-        pass
-
-    # 2) fallback по текущим и недавним символам
-    symbols = await _collect_symbols(exchange)
-    if not symbols:
-        return []
-
-    all_trades: List[dict] = []
-    for symbol in symbols:
-        try:
-            part = await asyncio.to_thread(exchange.fetch_my_trades, symbol, since_ms or None, 50)
-            if part:
-                for t in part:
-                    _remember_symbol(t.get("symbol"))
-                all_trades.extend(part)
-        except Exception:
-            pass
-
-    return all_trades
+    return best
 
 
-async def pnl_watcher(app, exchange, log, log_chat_id, interval: int = 5):
-    global last_checked, weekly_pnl, week_start, SENT_EVENT_KEYS
+async def pnl_watcher(app, exchange, log, log_chat_id, interval: int = 3):
+    global LAST_POSITIONS, weekly_pnl, week_start
 
     while True:
         try:
-            trades = await _fetch_all_recent_trades(exchange, last_checked)
-            if not trades:
-                await asyncio.sleep(interval)
-                continue
+            current_positions = await _fetch_positions_map(exchange)
 
-            trades.sort(key=lambda t: int(t.get("timestamp") or 0), reverse=True)
+            # ищем символы, которые были открыты, а теперь исчезли
+            just_closed = []
+            for symbol, prev in LAST_POSITIONS.items():
+                if symbol not in current_positions and prev.get("size", 0) > 0:
+                    just_closed.append((symbol, prev))
 
-            latest_seen_ts = last_checked
-            close_events: Dict[str, dict] = {}
-
-            for trade in trades:
-                ts = int(trade.get("timestamp") or 0)
-                if ts > latest_seen_ts:
-                    latest_seen_ts = ts
-
-                if ts <= last_checked:
+            for symbol, prev in just_closed:
+                if not _should_send(symbol):
                     continue
 
-                if not _is_close_trade(trade):
-                    continue
+                info = await _get_last_closed_trade_info(exchange, symbol)
 
-                pnl = _extract_pnl(trade)
-                if pnl == 0:
-                    continue
+                # fallback если pnl не нашли
+                pnl = 0.0
+                qty = prev.get("size", 0.0)
+                side = prev.get("side", "")
 
-                symbol = str(trade.get("symbol") or "")
-                _remember_symbol(symbol)
+                if info:
+                    pnl = info["pnl"]
+                    qty = info["qty"] or qty
 
-                key = _event_key(trade)
-                if key in SENT_EVENT_KEYS:
-                    continue
+                msg = _format_close_message(symbol, side, pnl, qty)
 
-                event = close_events.get(key)
-                if not event:
-                    close_events[key] = {
-                        "key": key,
-                        "symbol": symbol,
-                        "side": str(trade.get("side") or (trade.get("info") or {}).get("side") or ""),
-                        "pnl": pnl,
-                        "qty": abs(_to_float(trade.get("amount"), 0.0)),
-                        "fills": 1,
-                        "ts": ts,
-                    }
-                else:
-                    event["pnl"] += pnl
-                    event["qty"] += abs(_to_float(trade.get("amount"), 0.0))
-                    event["fills"] += 1
-                    if ts > event["ts"]:
-                        event["ts"] = ts
+                try:
+                    await app.send_message(log_chat_id, msg)
+                    weekly_pnl += pnl
+                    log("INFO", f"PNL notifier sent: {symbol} pnl={pnl} qty={qty}")
+                except Exception as e:
+                    log("ERROR", f"PNL send failed for {symbol}: {e}")
 
-            if close_events:
-                latest_event = max(close_events.values(), key=lambda item: item["ts"])
-                msg = _format_close_message(latest_event)
-                await app.send_message(log_chat_id, msg)
-
-                SENT_EVENT_KEYS.add(latest_event["key"])
-                if len(SENT_EVENT_KEYS) > MAX_SENT_EVENT_KEYS:
-                    SENT_EVENT_KEYS = set(list(SENT_EVENT_KEYS)[-2000:])
-
-                weekly_pnl += latest_event["pnl"]
-                log("INFO", f"PNL notifier sent: {latest_event['symbol']} pnl={latest_event['pnl']} fills={latest_event['fills']}")
-
-            last_checked = latest_seen_ts
+            LAST_POSITIONS = current_positions
 
             if time.time() - week_start >= 7 * 24 * 60 * 60:
                 status = "🟢 PROFIT" if weekly_pnl > 0 else "🔴 LOSS"
@@ -254,7 +189,11 @@ async def pnl_watcher(app, exchange, log, log_chat_id, interval: int = 5):
                     f"{status}\n"
                     f"Total PnL: {round(weekly_pnl, 4)} USDT"
                 )
-                await app.send_message(log_chat_id, report)
+                try:
+                    await app.send_message(log_chat_id, report)
+                except Exception as e:
+                    log("ERROR", f"Weekly report send failed: {e}")
+
                 weekly_pnl = 0.0
                 week_start = time.time()
 

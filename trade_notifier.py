@@ -23,12 +23,33 @@ async def pnl_watcher(app, exchange, log, log_chat_id, interval=5):
             # =========================
             # 🔥 ВСІ трейди
             # =========================
-            trades = await asyncio.to_thread(
-                exchange.fetch_my_trades,
-                None,
-                None,
-                100
-            )
+            # 🔥 беремо всі позиції
+            positions = await asyncio.to_thread(exchange.fetch_positions)
+
+            symbols = []
+
+            for p in positions:
+                symbol = p.get("symbol")
+                if symbol:
+                    symbols.append(symbol)
+
+            # fallback (якщо нема позицій)
+            if not symbols:
+                symbols = ["BTC/USDT:USDT", "ETH/USDT:USDT"]
+
+            trades = []
+
+            for symbol in symbols:
+                try:
+                    t = await asyncio.to_thread(
+                        exchange.fetch_my_trades,
+                        symbol,
+                        None,
+                        50
+                    )
+                    trades.extend(t)
+                except Exception as e:
+                    log("WARNING", f"fetch trades failed {symbol}: {e}")
 
             if not trades:
                 await asyncio.sleep(interval)

@@ -5,36 +5,31 @@ from typing import Any, Dict, List, Optional
 # =========================
 # GLOBAL STATE
 # =========================
-last_checked = 0  # ms timestamp of latest processed trade
+last_checked = 0  # latest processed trade timestamp (ms)
 weekly_pnl = 0.0
 week_start = time.time()
 
-# dedupe already notified close events
-SENT_CLOSE_KEYS = set()
-MAX_SENT_KEYS = 5000
+# store already-sent close events so we don't resend them
+SENT_EVENT_KEYS = set()
+MAX_SENT_EVENT_KEYS = 5000
 
 
 # =========================
 # HELPERS
 # =========================
-
-def _to_float(x: Any, default: float = 0.0) -> float:
+def _to_float(value: Any, default: float = 0.0) -> float:
     try:
-        if x is None or x == "":
+        if value is None or value == "":
             return default
-        return float(x)
+        return float(value)
     except Exception:
         return default
 
 
-def _norm_symbol(symbol: str) -> str:
-    s = str(symbol or "")
-    return s.replace(":", "_").replace("/", "_")
-
-
 def _extract_pnl(trade: dict) -> float:
     info = trade.get("info") or {}
-    candidates = [
+
+    for candidate in (
         trade.get("realizedPnl"),
         trade.get("closedPnl"),
         trade.get("profit"),
@@ -42,42 +37,38 @@ def _extract_pnl(trade: dict) -> float:
         info.get("closedPnl"),
         info.get("profit"),
         info.get("profitValue"),
-    ]
-    for value in candidates:
-        pnl = _to_float(value, default=0.0)
+    ):
+        pnl = _to_float(candidate, 0.0)
         if pnl != 0:
             return pnl
+
     return 0.0
 
 
-def _is_reduce_only_close(trade: dict) -> bool:
+def _is_close_trade(trade: dict) -> bool:
     info = trade.get("info") or {}
 
-    ro = trade.get("reduceOnly")
-    if ro is None:
-        ro = info.get("reduceOnly")
-    if isinstance(ro, str):
-        ro = ro.lower() in {"true", "1", "yes"}
+    reduce_only = trade.get("reduceOnly")
+    if reduce_only is None:
+        reduce_only = info.get("reduceOnly")
 
-    if ro:
+    if isinstance(reduce_only, str):
+        reduce_only = reduce_only.lower() in {"true", "1", "yes"}
+
+    if reduce_only:
         return True
 
-    # fallback: if exchange does not expose reduceOnly reliably,
-    # realized pnl on a user trade is a strong signal of closing.
-    pnl = _extract_pnl(trade)
-    return pnl != 0
+    # fallback: many exchanges expose non-zero realized pnl only on closing fills
+    return _extract_pnl(trade) != 0
 
 
-def _close_group_key(trade: dict) -> str:
+def _normalize_symbol(symbol: str) -> str:
+    return str(symbol or "").replace(":", "_").replace("/", "_")
+
+
+def _event_key(trade: dict) -> str:
     info = trade.get("info") or {}
-    symbol = _norm_symbol(trade.get("symbol", ""))
-    order_id = (
-        trade.get("order")
-        or trade.get("orderId")
-        or info.get("orderId")
-        or info.get("clientOrderId")
-        or info.get("clientOid")
-    )
+    symbol = _normalize_symbol(trade.get("symbol", ""))
     side = str(trade.get("side") or info.get("side") or "").lower()
     pos_side = str(
         trade.get("positionSide")
@@ -85,17 +76,23 @@ def _close_group_key(trade: dict) -> str:
         or info.get("posSide")
         or ""
     ).lower()
-    ts = int(trade.get("timestamp") or 0)
 
+    order_id = (
+        trade.get("order")
+        or trade.get("orderId")
+        or info.get("orderId")
+        or info.get("clientOrderId")
+        or info.get("clientOid")
+    )
     if order_id:
         return f"{symbol}|{order_id}|{side}|{pos_side}"
 
-    # fallback when order id is absent: group nearby close fills together
-    bucket = ts // 5000  # 5 sec bucket
-    return f"{symbol}|{bucket}|{side}|{pos_side}"
+    # fallback if exchange doesn't provide order id
+    ts_bucket = int(trade.get("timestamp") or 0) // 5000
+    return f"{symbol}|{ts_bucket}|{side}|{pos_side}"
 
 
-def _format_msg(event: dict) -> str:
+def _format_close_message(event: dict) -> str:
     pnl = event["pnl"]
     qty = event["qty"]
     symbol = event["symbol"]
@@ -107,133 +104,147 @@ def _format_msg(event: dict) -> str:
         f"PnL: {round(pnl, 4)} USDT",
         f"Qty: {round(qty, 4)}",
     ]
+
     if side:
         lines.insert(1, f"Close side: {side}")
-    if event.get("fills", 0) > 1:
+
+    if event.get("fills", 1) > 1:
         lines.append(f"Fills: {event['fills']}")
+
     return "\n".join(lines)
 
 
-async def _fetch_recent_trades(exchange, log, since_ms: int) -> List[dict]:
-    """Try one global fetch first, fallback to a small recent symbol set."""
+async def _fetch_all_recent_trades(exchange, since_ms: int) -> List[dict]:
+    """
+    Quiet fetcher:
+    - tries global trade history first
+    - if not supported, falls back to symbols from positions/open orders
+    - no warnings in normal polling loop
+    """
     try:
         trades = await asyncio.to_thread(exchange.fetch_my_trades, None, since_ms or None, 100)
         if trades:
             return trades
-    except Exception as e:
-        log("WARNING", f"fetch_my_trades(all) failed: {e}")
+    except Exception:
+        pass
 
-    symbols = []
+    symbols: List[str] = []
 
-    # fallback to currently relevant symbols only
     try:
         positions = await asyncio.to_thread(exchange.fetch_positions)
-        for p in positions or []:
-            symbol = p.get("symbol")
-            if symbol and symbol not in symbols:
-                symbols.append(symbol)
-    except Exception as e:
-        log("WARNING", f"fetch_positions fallback failed: {e}")
-
-    try:
-        orders = await asyncio.to_thread(exchange.fetch_open_orders)
-        for o in orders or []:
-            symbol = o.get("symbol")
+        for pos in positions or []:
+            symbol = pos.get("symbol")
             if symbol and symbol not in symbols:
                 symbols.append(symbol)
     except Exception:
         pass
 
-    # tiny safety fallback
+    try:
+        open_orders = await asyncio.to_thread(exchange.fetch_open_orders)
+        for order in open_orders or []:
+            symbol = order.get("symbol")
+            if symbol and symbol not in symbols:
+                symbols.append(symbol)
+    except Exception:
+        pass
+
     if not symbols:
-        symbols = ["BTC/USDT:USDT", "ETH/USDT:USDT"]
+        return []
 
     all_trades: List[dict] = []
-    for symbol in symbols[:10]:
+    for symbol in symbols[:15]:
         try:
             part = await asyncio.to_thread(exchange.fetch_my_trades, symbol, since_ms or None, 50)
             if part:
                 all_trades.extend(part)
-        except Exception as e:
-            log("WARNING", f"fetch_my_trades({symbol}) failed: {e}")
+        except Exception:
+            pass
 
     return all_trades
 
 
-async def pnl_watcher(app, exchange, log, log_chat_id, interval=5):
-    global last_checked, weekly_pnl, week_start, SENT_CLOSE_KEYS
+# =========================
+# PUBLIC WATCHER
+# =========================
+async def pnl_watcher(app, exchange, log, log_chat_id, interval: int = 5):
+    """
+    Sends ONE message for the latest closed trade event.
+
+    Rules:
+    - no warning spam during normal polling
+    - only new closing trades are processed
+    - multiple fills of the same close are merged into one event
+    - only the latest close event is sent per cycle
+    - already sent events are deduplicated
+    """
+    global last_checked, weekly_pnl, week_start, SENT_EVENT_KEYS
 
     while True:
         try:
-            trades = await _fetch_recent_trades(exchange, log, last_checked)
+            trades = await _fetch_all_recent_trades(exchange, last_checked)
             if not trades:
                 await asyncio.sleep(interval)
                 continue
 
-            # newest first
-            trades = sorted(trades, key=lambda t: int(t.get("timestamp") or 0), reverse=True)
+            trades.sort(key=lambda t: int(t.get("timestamp") or 0), reverse=True)
 
+            latest_seen_ts = last_checked
             close_events: Dict[str, dict] = {}
-            max_ts = last_checked
 
-            for t in trades:
-                ts = int(t.get("timestamp") or 0)
-                if ts > max_ts:
-                    max_ts = ts
+            for trade in trades:
+                ts = int(trade.get("timestamp") or 0)
+                if ts > latest_seen_ts:
+                    latest_seen_ts = ts
 
                 if ts <= last_checked:
                     continue
 
-                if not _is_reduce_only_close(t):
+                if not _is_close_trade(trade):
                     continue
 
-                pnl = _extract_pnl(t)
+                pnl = _extract_pnl(trade)
                 if pnl == 0:
                     continue
 
-                key = _close_group_key(t)
-                if key in SENT_CLOSE_KEYS:
+                key = _event_key(trade)
+                if key in SENT_EVENT_KEYS:
                     continue
-
-                symbol = str(t.get("symbol") or "")
-                qty = abs(_to_float(t.get("amount"), 0.0))
-                side = str(t.get("side") or (t.get("info") or {}).get("side") or "")
 
                 event = close_events.get(key)
                 if not event:
                     close_events[key] = {
                         "key": key,
-                        "symbol": symbol,
+                        "symbol": str(trade.get("symbol") or ""),
+                        "side": str(trade.get("side") or (trade.get("info") or {}).get("side") or ""),
                         "pnl": pnl,
-                        "qty": qty,
-                        "side": side,
+                        "qty": abs(_to_float(trade.get("amount"), 0.0)),
                         "fills": 1,
                         "ts": ts,
                     }
                 else:
                     event["pnl"] += pnl
-                    event["qty"] += qty
+                    event["qty"] += abs(_to_float(trade.get("amount"), 0.0))
                     event["fills"] += 1
                     if ts > event["ts"]:
                         event["ts"] = ts
 
             if close_events:
-                # take only the latest fully grouped close event per cycle
-                latest_event = max(close_events.values(), key=lambda x: x["ts"])
-                msg = _format_msg(latest_event)
+                latest_event = max(close_events.values(), key=lambda item: item["ts"])
+                msg = _format_close_message(latest_event)
                 await app.send_message(log_chat_id, msg)
 
-                SENT_CLOSE_KEYS.add(latest_event["key"])
-                if len(SENT_CLOSE_KEYS) > MAX_SENT_KEYS:
-                    SENT_CLOSE_KEYS = set(list(SENT_CLOSE_KEYS)[-2000:])
+                SENT_EVENT_KEYS.add(latest_event["key"])
+                if len(SENT_EVENT_KEYS) > MAX_SENT_EVENT_KEYS:
+                    SENT_EVENT_KEYS = set(list(SENT_EVENT_KEYS)[-2000:])
 
                 weekly_pnl += latest_event["pnl"]
-                log("INFO", f"PNL notifier sent: {latest_event['symbol']} pnl={latest_event['pnl']} key={latest_event['key']}")
+                log(
+                    "INFO",
+                    f"PNL notifier sent: {latest_event['symbol']} pnl={latest_event['pnl']} fills={latest_event['fills']}",
+                )
 
-            # move watermark after processing
-            last_checked = max_ts
+            last_checked = latest_seen_ts
 
-            # weekly report
             if time.time() - week_start >= 7 * 24 * 60 * 60:
                 status = "🟢 PROFIT" if weekly_pnl > 0 else "🔴 LOSS"
                 report = (

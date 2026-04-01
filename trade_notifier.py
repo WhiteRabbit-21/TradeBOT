@@ -91,8 +91,7 @@ def _format_pnl_message(
     if entry_price > 0:
         lines.append(f"Entry: {round(entry_price, 6)}")
 
-    if income_count > 0:
-        lines.append(f"Income rows: {income_count}")
+    lines.append(f"Income rows: {income_count}")
 
     return "\n".join(lines)
 
@@ -252,8 +251,8 @@ async def _get_position_income_summary(
     close_ts_ms: int,
 ) -> Optional[dict]:
     try:
-        start_ms = max(0, opened_at_ms - 60_000)
-        end_ms = close_ts_ms + 120_000
+        start_ms = max(0, opened_at_ms - 120_000)
+        end_ms = close_ts_ms + 180_000
 
         resp = await asyncio.to_thread(
             get_swap_income,
@@ -277,6 +276,8 @@ async def _get_position_income_summary(
     matched_rows = []
     total_pnl = 0.0
 
+    rows = sorted(rows, key=_extract_income_time, reverse=True)
+
     for row in rows:
         row_symbol_raw = _extract_income_symbol(row)
         row_symbol = _normalize_symbol_for_compare(row_symbol_raw)
@@ -289,15 +290,17 @@ async def _get_position_income_summary(
             f"PNL DEBUG INCOME EXTRACT target={target_symbol} row_symbol={row_symbol} type={income_type} pnl={income_value} ts={ts}",
         )
 
-        if row_symbol and target_symbol not in row_symbol:
-            continue
-
         if ts and (ts < start_ms or ts > end_ms):
             continue
 
         if income_value == 0.0:
             continue
 
+        # якщо символ у рядку є і він явно інший — пропускаємо
+        if row_symbol and target_symbol not in row_symbol:
+            continue
+
+        # якщо символ пустий, але час підходить — беремо
         matched_rows.append(row)
         total_pnl += income_value
 
@@ -353,6 +356,8 @@ async def pnl_watcher(
                 close_ts_ms = int(time.time() * 1000)
 
                 income_info = None
+
+                # даємо BingX час записати всі income rows
                 for _ in range(4):
                     await asyncio.sleep(1.5)
                     income_info = await _get_position_income_summary(

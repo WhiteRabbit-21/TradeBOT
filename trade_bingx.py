@@ -513,16 +513,31 @@ def _bingx_raw_request_sync(method: str, path: str, params: dict) -> dict:
     resp = requests.request(method.upper(), url, headers=headers, timeout=5)
     log("INFO", f"RAW HTTP DONE status={resp.status_code} path={path}")
     body_text = resp.text
+    log("INFO", f"RAW HTTP RESPONSE TEXT: {body_text[:1000]}")
 
     try:
         data = resp.json()
     except Exception:
         raise RuntimeError(f"BingX RAW {method} {path} bad json: {body_text[:500]}")
 
+    log("INFO", f"RAW HTTP RESPONSE JSON: {data}")
+
     code = str(data.get("code", ""))
-    if resp.status_code >= 400 or code not in {"0", "", "None"}:
+    success = data.get("success")
+
+    if resp.status_code >= 400:
         raise RuntimeError(
-            f"BingX RAW {method} {path} failed status={resp.status_code} code={data.get('code')} msg={data.get('msg') or data.get('message')} body={body_text[:500]}"
+            f"BingX RAW {method} {path} HTTP_FAIL status={resp.status_code} code={data.get('code')} msg={data.get('msg') or data.get('message')} body={body_text[:500]}"
+        )
+
+    if success not in (None, True, "true", "True", 1, "1"):
+        raise RuntimeError(
+            f"BingX RAW {method} {path} REJECTED success={success} code={data.get('code')} msg={data.get('msg') or data.get('message')} body={body_text[:500]}"
+        )
+
+    if code not in {"0", "", "None"}:
+        raise RuntimeError(
+            f"BingX RAW {method} {path} REJECTED code={data.get('code')} msg={data.get('msg') or data.get('message')} body={body_text[:500]}"
         )
 
     return data
@@ -539,7 +554,7 @@ def _place_bingx_tpsl_raw_sync(symbol: str, pos_side: str, trigger_price: float,
         "quantity": _fmt_num(quantity),
         "stopPrice": _fmt_num(trigger_price),
         "workingType": "MARK_PRICE",
-        "reduceOnly": "true",
+        "reduceOnly": True,
     }
 
     return _bingx_raw_request_sync("POST", "/openApi/swap/v2/trade/order", payload)
@@ -627,6 +642,7 @@ def set_sl_oneway_sync(base: str, sl_price: float) -> str:
 
     data = resp.get("data") or {}
     new_id = data.get("orderId") or data.get("id") or data.get("clientOrderId")
+    log("INFO", f"SL_SET_RAW success symbol={symbol} pos_side={pos_side} sl={sl_prec} order_id={new_id} raw={resp}")
     return f"SL_SET_RAW id={new_id} sl={sl_prec}"
 
 async def set_sl_oneway(base: str, sl_price: float) -> str:
@@ -673,6 +689,7 @@ def set_tp_oneway_sync(base: str, tp_price: float) -> str:
 
     data = resp.get("data") or {}
     new_id = data.get("orderId") or data.get("id") or data.get("clientOrderId")
+    log("INFO", f"TP_SET_RAW success symbol={symbol} pos_side={pos_side} tp={tp_prec} order_id={new_id} raw={resp}")
     return f"TP_SET_RAW id={new_id} tp={tp_prec}"
 
 async def set_tp_oneway(base: str, tp_price: float) -> str:

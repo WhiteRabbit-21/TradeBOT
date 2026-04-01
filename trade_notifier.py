@@ -1,6 +1,5 @@
 import asyncio
 import time
-import json
 import hmac
 import hashlib
 import urllib.parse
@@ -14,7 +13,7 @@ import requests
 # =========================
 LAST_POSITIONS: Dict[str, dict] = {}
 SENT_CLOSE_CACHE: Dict[str, int] = {}
-CACHE_TTL_SEC = 90  # збільшив, щоб не було дубля повідомлень по тому ж символу
+CACHE_TTL_SEC = 90
 
 weekly_pnl = 0.0
 week_start = time.time()
@@ -76,7 +75,6 @@ def _format_pnl_message(
     pnl: float,
     qty: float,
     entry_price: float = 0.0,
-    income_count: int = 0,
 ) -> str:
     status = "🟢 PROFIT" if pnl > 0 else "🔴 LOSS"
     side_text = side.upper() if side else "UNKNOWN"
@@ -90,8 +88,6 @@ def _format_pnl_message(
 
     if entry_price > 0:
         lines.append(f"Entry: {round(entry_price, 6)}")
-
-    lines.append(f"Income rows: {income_count}")
 
     return "\n".join(lines)
 
@@ -247,13 +243,6 @@ def _extract_income_info_text(row: dict) -> str:
 
 
 def _is_relevant_income_type(income_type: str, info_text: str) -> bool:
-    """
-    Для net pnl беремо:
-    - realized pnl
-    - fees
-    - funding
-    - commissions
-    """
     t = (income_type or "").upper()
     info_text = (info_text or "").lower()
 
@@ -281,10 +270,6 @@ def _is_relevant_income_type(income_type: str, info_text: str) -> bool:
 
 
 def _has_real_pnl_signal(rows: list[dict]) -> bool:
-    """
-    Не використовуємо для раннього break.
-    Просто debug-ознака, що в rows вже є хоча б один PnL-рядок.
-    """
     for row in rows:
         income_type = _extract_income_type(row)
         info_text = _extract_income_info_text(row)
@@ -307,7 +292,6 @@ async def _get_position_income_summary(
     close_ts_ms: int,
 ) -> Optional[dict]:
     try:
-        # робимо вікно ширшим, щоб не втрачати пізні rows
         start_ms = max(0, opened_at_ms - 300_000)
         end_ms = close_ts_ms + 600_000
 
@@ -320,12 +304,11 @@ async def _get_position_income_summary(
             100,
         )
     except Exception as e:
-        log("ERROR", f"PNL DEBUG income request failed for {symbol}: {e}")
+        log("ERROR", f"PNL income request failed for {symbol}: {e}")
         return None
 
     rows = _extract_income_rows(resp)
     if not rows:
-        log("INFO", f"PNL DEBUG income empty for {symbol}: {resp}")
         return None
 
     target_symbol = _normalize_symbol_for_compare(symbol)
@@ -343,11 +326,6 @@ async def _get_position_income_summary(
         info_text = _extract_income_info_text(row)
         ts = _extract_income_time(row)
 
-        log(
-            "INFO",
-            f"PNL DEBUG INCOME EXTRACT target={target_symbol} row_symbol={row_symbol} raw_symbol={row_symbol_raw} type={income_type} pnl={income_value} ts={ts}",
-        )
-
         if ts and (ts < start_ms or ts > end_ms):
             continue
 
@@ -362,9 +340,6 @@ async def _get_position_income_summary(
 
         matched_rows.append(row)
         total_pnl += income_value
-
-    for row in matched_rows[:20]:
-        log("INFO", f"PNL DEBUG INCOME MATCHED {symbol}: {json.dumps(row, ensure_ascii=False)}")
 
     if not matched_rows:
         return None
@@ -393,20 +368,16 @@ def _is_better_income_snapshot(new_info: dict, best_info: Optional[dict]) -> boo
     new_has_real = bool(new_info.get("has_real_pnl_signal"))
     best_has_real = bool(best_info.get("has_real_pnl_signal"))
 
-    # спочатку віддаємо перевагу снапшоту, де є справжній pnl рядок
     if new_has_real and not best_has_real:
         return True
     if best_has_real and not new_has_real:
         return False
 
-    # потім більше рядків = повніший net pnl
     if new_count > best_count:
         return True
     if new_count < best_count:
         return False
 
-    # якщо count однаковий, беремо той, де більше абсолютний результат
-    # часто це означає, що вже підтягнулися fee/funding
     if abs(new_pnl) > abs(best_pnl):
         return True
 
@@ -421,16 +392,11 @@ async def _wait_final_income_summary(
     opened_at_ms: int,
     close_ts_ms: int,
 ) -> Optional[dict]:
-    """
-    Чекаємо, поки income snapshot стабілізується.
-    Не виходимо по першому close signal.
-    """
     best_income_info = None
     stable_rounds = 0
     last_signature = None
 
-    # ~24 сек загального очікування
-    for attempt in range(12):
+    for _ in range(12):
         await asyncio.sleep(2)
 
         income_info = await _get_position_income_summary(
@@ -443,7 +409,6 @@ async def _wait_final_income_summary(
         )
 
         if not income_info:
-            log("INFO", f"PNL DEBUG snapshot empty {symbol} attempt={attempt + 1}")
             continue
 
         if _is_better_income_snapshot(income_info, best_income_info):
@@ -454,11 +419,6 @@ async def _wait_final_income_summary(
         has_real = bool(income_info.get("has_real_pnl_signal"))
         signature = (count, pnl_now, has_real)
 
-        log(
-            "INFO",
-            f"PNL DEBUG snapshot {symbol} attempt={attempt + 1} count={count} pnl={pnl_now} has_real_pnl={has_real}",
-        )
-
         if signature == last_signature:
             stable_rounds += 1
         else:
@@ -466,9 +426,7 @@ async def _wait_final_income_summary(
 
         last_signature = signature
 
-        # 2 однакових стани підряд -> вважаємо що стабілізувалось
         if stable_rounds >= 2:
-            log("INFO", f"PNL DEBUG stabilized for {symbol} after attempt={attempt + 1}")
             break
 
     return best_income_info
@@ -503,10 +461,9 @@ async def pnl_watcher(
 
             for symbol, prev in just_closed:
                 close_ts_ms = int(time.time() * 1000)
-                close_key = f"{symbol}:{close_ts_ms // 60000}"  # ключ по символу і хвилині закриття
+                close_key = f"{symbol}:{close_ts_ms // 60000}"
 
                 if not _should_send(close_key):
-                    log("INFO", f"PNL notifier duplicate skipped: {close_key}")
                     continue
 
                 side = str(prev.get("side", ""))
@@ -516,7 +473,7 @@ async def pnl_watcher(
                     prev.get("opened_at", int(time.time() * 1000) - 10 * 60 * 1000)
                 )
 
-                log("INFO", f"PNL DEBUG close detected symbol={symbol} side={side} qty={qty} entry={entry_price}")
+                log("INFO", f"PNL close detected: {symbol}")
 
                 income_info = await _wait_final_income_summary(
                     symbol=symbol,
@@ -528,13 +485,11 @@ async def pnl_watcher(
                 )
 
                 pnl = float(income_info["pnl"]) if income_info else 0.0
-                income_count = int(income_info.get("count", 0)) if income_info else 0
 
                 if income_info is None:
                     log("WARNING", f"PNL notifier: no income rows found for {symbol}")
                     continue
 
-                # Якщо хочеш бачити навіть 0.0 — прибери цей if
                 if pnl == 0.0:
                     log("INFO", f"PNL notifier skip: {symbol} pnl=0.0")
                     continue
@@ -545,13 +500,12 @@ async def pnl_watcher(
                     pnl=pnl,
                     qty=qty,
                     entry_price=entry_price,
-                    income_count=income_count,
                 )
 
                 try:
                     await app.send_message(log_chat_id, msg)
                     weekly_pnl += pnl
-                    log("INFO", f"PNL notifier sent: {symbol} net_pnl={pnl} qty={qty} rows={income_count}")
+                    log("INFO", f"PNL notifier sent: {symbol} net_pnl={pnl} qty={qty}")
                 except Exception as e:
                     log("ERROR", f"PNL send failed for {symbol}: {e}")
 

@@ -509,7 +509,9 @@ def _bingx_raw_request_sync(method: str, path: str, params: dict) -> dict:
         "Content-Type": "application/x-www-form-urlencoded",
     }
 
-    resp = requests.request(method.upper(), url, headers=headers, timeout=15)
+    log("INFO", f"RAW HTTP {method.upper()} {path} payload={payload}")
+    resp = requests.request(method.upper(), url, headers=headers, timeout=5)
+    log("INFO", f"RAW HTTP DONE status={resp.status_code} path={path}")
     body_text = resp.text
 
     try:
@@ -585,6 +587,7 @@ async def find_and_cancel_existing_stop(symbol: str, want_side: str) -> Optional
     return await asyncio.to_thread(find_and_cancel_existing_stop_sync, symbol, want_side)
 
 def set_sl_oneway_sync(base: str, sl_price: float) -> str:
+    log("INFO", f"SET_SL start base={base} sl={sl_price}")
     symbol = resolve_symbol_sync(base)
     if not symbol:
         raise RuntimeError(f"Symbol not found: {base}")
@@ -615,8 +618,12 @@ def set_sl_oneway_sync(base: str, sl_price: float) -> str:
     except Exception:
         sl_prec = float(sl_price)
 
+    log("INFO", f"SET_SL prepared symbol={symbol} pos_side={pos_side} stop_side={stop_side} qty={contracts} sl_prec={sl_prec}")
+    log("INFO", "SET_SL cancel old stops start")
     cancel_all_stops_sync(symbol, stop_side, pos_side, "sl")
+    log("INFO", "SET_SL cancel old stops done")
     resp = _place_bingx_tpsl_raw_sync(symbol, pos_side, sl_prec, contracts, "sl")
+    log("INFO", f"SET_SL raw response={resp}")
 
     data = resp.get("data") or {}
     new_id = data.get("orderId") or data.get("id") or data.get("clientOrderId")
@@ -626,6 +633,7 @@ async def set_sl_oneway(base: str, sl_price: float) -> str:
     return await asyncio.to_thread(set_sl_oneway_sync, base, sl_price)
 
 def set_tp_oneway_sync(base: str, tp_price: float) -> str:
+    log("INFO", f"SET_TP start base={base} tp={tp_price}")
     symbol = resolve_symbol_sync(base)
     if not symbol:
         raise RuntimeError(f"Symbol not found: {base}")
@@ -656,8 +664,12 @@ def set_tp_oneway_sync(base: str, tp_price: float) -> str:
     except Exception:
         tp_prec = float(tp_price)
 
+    log("INFO", f"SET_TP prepared symbol={symbol} pos_side={pos_side} close_side={close_side} qty={contracts} tp_prec={tp_prec}")
+    log("INFO", "SET_TP cancel old tps start")
     cancel_all_stops_sync(symbol, close_side, pos_side, "tp")
+    log("INFO", "SET_TP cancel old tps done")
     resp = _place_bingx_tpsl_raw_sync(symbol, pos_side, tp_prec, contracts, "tp")
+    log("INFO", f"SET_TP raw response={resp}")
 
     data = resp.get("data") or {}
     new_id = data.get("orderId") or data.get("id") or data.get("clientOrderId")
@@ -1408,12 +1420,16 @@ async def handle_ai_command(cmd: dict):
             if sltp:
                 log("INFO", f"Reapplying SL/TP for {base_clean}")
                 try:
-                    await set_sl_oneway(base_clean, sltp["sl"])
+                    log("INFO", f"REAPPLY SL start {base_clean} sl={sltp.get('sl')}")
+                    sl_res = await set_sl_oneway(base_clean, sltp["sl"])
+                    log("INFO", f"REAPPLY SL done {base_clean}: {sl_res}")
                 except Exception as e:
                     log("WARNING", f"SL reset failed: {e}")
 
                 try:
-                    await set_tp_oneway(base_clean, sltp["tp"])
+                    log("INFO", f"REAPPLY TP start {base_clean} tp={sltp.get('tp')}")
+                    tp_res = await set_tp_oneway(base_clean, sltp["tp"])
+                    log("INFO", f"REAPPLY TP done {base_clean}: {tp_res}")
                 except Exception as e:
                     log("WARNING", f"TP reset failed: {e}")
             else:
@@ -1515,12 +1531,16 @@ async def handle_ai_command(cmd: dict):
             if sltp:
                 log("INFO", f"Reapplying SL/TP for {base_clean}")
                 try:
-                    await set_sl_oneway(base_clean, sltp["sl"])
+                    log("INFO", f"REAPPLY SL start {base_clean} sl={sltp.get('sl')}")
+                    sl_res = await set_sl_oneway(base_clean, sltp["sl"])
+                    log("INFO", f"REAPPLY SL done {base_clean}: {sl_res}")
                 except Exception as e:
                     log("WARNING", f"SL reset failed: {e}")
 
                 try:
-                    await set_tp_oneway(base_clean, sltp["tp"])
+                    log("INFO", f"REAPPLY TP start {base_clean} tp={sltp.get('tp')}")
+                    tp_res = await set_tp_oneway(base_clean, sltp["tp"])
+                    log("INFO", f"REAPPLY TP done {base_clean}: {tp_res}")
                 except Exception as e:
                     log("WARNING", f"TP reset failed: {e}")
             return

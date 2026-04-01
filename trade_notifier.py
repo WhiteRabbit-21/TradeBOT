@@ -1,6 +1,7 @@
 import asyncio
 import time
 from typing import Any, Dict, Optional
+import json
 
 # =========================
 # GLOBAL STATE
@@ -125,12 +126,36 @@ async def _get_last_closed_trade_info(exchange, symbol: str) -> Optional[dict]:
     if not trades:
         return None
 
+    
+
     trades = sorted(trades, key=lambda t: int(t.get("timestamp") or 0), reverse=True)
+
+    for t in trades[:10]:
+        info = t.get("info") or {}
+        print("INFO", f"PNL DEBUG {symbol} trade={json.dumps({
+            'id': t.get('id'),
+            'order': t.get('order'),
+            'timestamp': t.get('timestamp'),
+            'side': t.get('side'),
+            'amount': t.get('amount'),
+            'realizedPnl': t.get('realizedPnl'),
+            'closedPnl': t.get('closedPnl'),
+            'profit': t.get('profit'),
+            'info_realizedPnl': info.get('realizedPnl'),
+            'info_closedPnl': info.get('closedPnl'),
+            'info_profit': info.get('profit'),
+            'info_profitValue': info.get('profitValue'),
+            'info_reduceOnly': info.get('reduceOnly'),
+            'info_positionSide': info.get('positionSide'),
+        }, ensure_ascii=False)}")
 
     best = None
     for t in trades:
         pnl = _extract_trade_pnl(t)
         qty = _extract_trade_qty(t)
+
+        print(f"PNL DEBUG EXTRACT {symbol} id={t.get('id')} pnl={pnl} qty={qty}")
+
         if pnl != 0 and qty > 0:
             best = {
                 "pnl": pnl,
@@ -150,10 +175,15 @@ async def pnl_watcher(app, exchange, log, log_chat_id, interval: int = 3):
         try:
             current_positions = await _fetch_positions_map(exchange)
 
-            # ищем символы, которые были открыты, а теперь исчезли
+            # шукаємо ТІЛЬКИ повне закриття позиції
             just_closed = []
             for symbol, prev in LAST_POSITIONS.items():
-                if symbol not in current_positions and prev.get("size", 0) > 0:
+                prev_size = float(prev.get("size", 0.0))
+                current = current_positions.get(symbol)
+                curr_size = float(current.get("size", 0.0)) if current else 0.0
+
+                # тільки якщо було > 0 і стало 0
+                if prev_size > 0 and curr_size == 0:
                     just_closed.append((symbol, prev))
 
             for symbol, prev in just_closed:
@@ -178,12 +208,12 @@ async def pnl_watcher(app, exchange, log, log_chat_id, interval: int = 3):
                     weekly_pnl += pnl
                     log("INFO", f"PNL notifier sent: {symbol} pnl={pnl} qty={qty}")
                 except Exception as e:
-                    log("ERROR", f"PNL send failed for {symbol}: {e}")
+                    log("ERROR", f"PNL send failed for {symbol}: {e}")     
 
             LAST_POSITIONS = current_positions
 
             if time.time() - week_start >= 7 * 24 * 60 * 60:
-                status = "🟢 PROFIT" if weekly_pnl > 0 else "🔴 LOSS"
+                status = "🟢 PROFIT" if weekly_pnl >= 0 else "🔴 LOSS"
                 report = (
                     "📊 WEEKLY REPORT\n\n"
                     f"{status}\n"

@@ -387,19 +387,16 @@ async def fetch_position_oneway(symbol: str):
         symbol
     )    
 
-def close_position_full_hedge_sync(base: str):
-
+def close_position_full_sync(base: str):
     symbol = resolve_symbol_sync(base)
 
     if not symbol:
         raise RuntimeError(f"Symbol not found: {base}")
 
     positions = exchange.fetch_positions([symbol])
-
     closed = []
 
     for pos in positions:
-
         side = (
             pos.get("side")
             or pos.get("positionSide")
@@ -418,7 +415,7 @@ def close_position_full_hedge_sync(base: str):
                 or 0
             )
         )
-        
+
         contracts = float(exchange.amount_to_precision(symbol, contracts))
 
         if contracts <= 0:
@@ -433,7 +430,6 @@ def close_position_full_hedge_sync(base: str):
             contracts,
             None,
             {
-                
                 "positionSide": "LONG" if side == "long" else "SHORT"
             }
         )
@@ -445,8 +441,9 @@ def close_position_full_hedge_sync(base: str):
 
     return f"CLOSED {'/'.join(closed)}"
 
-async def close_position_full_oneway(base: str):
-    return await asyncio.to_thread(close_position_full_hedge_sync, base)
+
+async def close_position_full(base: str):
+    return await asyncio.to_thread(close_position_full_sync, base)
 
 def set_margin_mode_sync(symbol: str):
     try:
@@ -801,13 +798,20 @@ def normalize_price_from_tail(raw: float, entry: float, side: str, kind: str) ->
 # CLOSE INTENT (safe gate)
 # =========================
 CLOSE_INTENT_PATTERNS = [
-    r"\btp\b", r"\btp\d\b", r"\btake\s+profit\b", r"\btaking\s+profit\b",
-    r"\bclose\b", r"\bclosing\b", r"\bexit\b",
-    r"\bзакр(ити|иваю|ив)\b", r"\bвихід\b", r"\bпрофіт\b",
-    r"\bфикс\b", r"\bзакрыл\b",
-    r"\broe\b", r"\broi\b",
+    r"\btp\b",
+    r"\btp\d\b",
+    r"\btake\s+profit\b",
+    r"\btaking\s+profit\b",
+    r"\bclose\b",
+    r"\bclosing\b",
+    r"\bclosed\b",
+    r"\bexit\b",
+    r"\bexiting\b",
+    r"\broe\b",
+    r"\broi\b",
     r"\btp\s+these\b",
 ]
+
 def has_close_intent(text: str) -> bool:
     t = (text or "").strip()
     if not t:
@@ -985,16 +989,16 @@ def ai_parse_trade_multi(text: Optional[str], image_paths: Optional[list[str]]) 
     client = OpenAI(api_key=OPENAI_API_KEY)
 
     user_instructions = (
-        "Відповідай ТІЛЬКИ JSON без пояснень.\n"
-        f"Схема:\n{json.dumps(AI_JSON_SHAPE, ensure_ascii=False)}\n"
-        "Якщо це CLOSE і на зображеннях кілька токенів — поверни всі в bases[].\n"
+    "Reply with JSON only, without explanations.\n"
+    f"Schema:\n{json.dumps(AI_JSON_SHAPE, ensure_ascii=False)}\n"
+    "If this is CLOSE and there are multiple tickers in the images, return all of them in bases[].\n"
     )
 
     content: list[dict[str, Any]] = []
     if text and text.strip():
         content.append({"type": "text", "text": text.strip()})
     else:
-        content.append({"type": "text", "text": "Розпізнай сигнал зі скрінів та поверни JSON-команду."})
+        content.append({"type": "text", "text": "Parse the trading signal from the screenshots and return a JSON command."})
 
     for p in (image_paths or []):
         content.append({"type": "image_url", "image_url": {"url": _img_to_data_url(p)}})
@@ -1130,7 +1134,7 @@ async def handle_ai_command(cmd: dict):
                 continue
 
             try:
-                res = await close_position_full_oneway(b)
+                res = await close_position_full(b)
                 if b in LAST_SLTP:
                     del LAST_SLTP[b]
                     save_sltp()

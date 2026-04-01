@@ -248,7 +248,7 @@ async def _get_last_income_pnl(
         if close_ts_ms:
             start_ms = max(0, close_ts_ms - 10 * 60 * 1000)
 
-        # !!! WITHOUT symbol filter !!!
+        # no symbol filter here
         resp = await asyncio.to_thread(
             get_swap_income,
             api_key,
@@ -339,7 +339,6 @@ async def pnl_watcher(
                 income_info = None
                 close_ts_ms = int(time.time() * 1000)
 
-                # give BingX time to write income rows
                 for _ in range(4):
                     await asyncio.sleep(1.5)
                     income_info = await _get_last_income_pnl(

@@ -97,13 +97,6 @@ def _format_pnl_message(
 
 
 def _normalize_symbol_for_compare(symbol: str) -> str:
-    """
-    Normalizes:
-    - SOL/USDT:USDT -> SOLUSDT
-    - SOL-USDT      -> SOLUSDT
-    - SOL_USDT      -> SOLUSDT
-    - SOLUSDT       -> SOLUSDT
-    """
     s = str(symbol or "").upper().strip()
 
     if ":USDT" in s:
@@ -212,7 +205,7 @@ def _extract_income_rows(resp: dict) -> list:
 
 
 def _extract_income_symbol(row: dict) -> str:
-    # Only market-like fields. Do NOT use currency/asset here.
+    # only market-like fields
     return str(
         row.get("symbol")
         or row.get("market")
@@ -247,7 +240,51 @@ def _extract_income_type(row: dict) -> str:
         or row.get("type")
         or row.get("bizType")
         or ""
-    ).lower()
+    ).upper()
+
+
+def _extract_income_info_text(row: dict) -> str:
+    return str(row.get("info") or "").lower()
+
+
+def _is_relevant_income_type(income_type: str, info_text: str) -> bool:
+    t = (income_type or "").upper()
+    info_text = (info_text or "").lower()
+
+    if "FUNDING" in t:
+        return True
+    if "TRADING_FEE" in t:
+        return True
+    if "PNL" in t:
+        return True
+    if "COMMISSION" in t:
+        return True
+
+    if "fee" in info_text:
+        return True
+    if "pnl" in info_text:
+        return True
+    if "funding" in info_text:
+        return True
+
+    return False
+
+
+def _has_close_signal(rows: list[dict]) -> bool:
+    for row in rows:
+        income_type = _extract_income_type(row)
+        info_text = _extract_income_info_text(row)
+
+        if "PNL" in income_type:
+            return True
+        if "CLOS" in info_text:
+            return True
+        if "closed" in info_text:
+            return True
+        if "position closing fee" in info_text:
+            return True
+
+    return False
 
 
 async def _get_position_income_summary(
@@ -260,7 +297,7 @@ async def _get_position_income_summary(
 ) -> Optional[dict]:
     try:
         start_ms = max(0, opened_at_ms - 120_000)
-        end_ms = close_ts_ms + 180_000
+        end_ms = close_ts_ms + 240_000
 
         resp = await asyncio.to_thread(
             get_swap_income,
@@ -291,6 +328,7 @@ async def _get_position_income_summary(
         row_symbol = _normalize_symbol_for_compare(row_symbol_raw)
         income_value = _extract_income_value(row)
         income_type = _extract_income_type(row)
+        info_text = _extract_income_info_text(row)
         ts = _extract_income_time(row)
 
         log(
@@ -298,19 +336,18 @@ async def _get_position_income_summary(
             f"PNL DEBUG INCOME EXTRACT target={target_symbol} row_symbol={row_symbol} raw_symbol={row_symbol_raw} type={income_type} pnl={income_value} ts={ts}",
         )
 
-        # outside position time window
         if ts and (ts < start_ms or ts > end_ms):
             continue
 
-        # zero rows are useless
         if income_value == 0.0:
             continue
 
-        # if row has a symbol and it's clearly another market -> skip
+        if not _is_relevant_income_type(income_type, info_text):
+            continue
+
         if row_symbol and row_symbol != target_symbol:
             continue
 
-        # if row_symbol is empty but row is inside time window -> keep it
         matched_rows.append(row)
         total_pnl += income_value
 
@@ -324,6 +361,7 @@ async def _get_position_income_summary(
         "pnl": total_pnl,
         "count": len(matched_rows),
         "rows": matched_rows,
+        "has_close_signal": _has_close_signal(matched_rows),
     }
 
 
@@ -351,7 +389,6 @@ async def pnl_watcher(
                 current = current_positions.get(symbol)
                 curr_size = float(current.get("size", 0.0)) if current else 0.0
 
-                # only full close
                 if prev_size > 0 and curr_size == 0:
                     just_closed.append((symbol, prev))
 
@@ -367,11 +404,12 @@ async def pnl_watcher(
                 )
                 close_ts_ms = int(time.time() * 1000)
 
-                income_info = None
+                best_income_info = None
 
-                # Give BingX time to persist all income rows
-                for _ in range(4):
+                # wait longer and collect the best snapshot
+                for _ in range(6):
                     await asyncio.sleep(1.5)
+
                     income_info = await _get_position_income_summary(
                         symbol=symbol,
                         api_key=api_key,
@@ -380,9 +418,21 @@ async def pnl_watcher(
                         opened_at_ms=opened_at_ms,
                         close_ts_ms=close_ts_ms,
                     )
-                    if income_info and int(income_info.get("count", 0)) > 0:
+
+                    if not income_info:
+                        continue
+
+                    if (
+                        best_income_info is None
+                        or int(income_info.get("count", 0)) > int(best_income_info.get("count", 0))
+                    ):
+                        best_income_info = income_info
+
+                    if income_info.get("has_close_signal"):
+                        best_income_info = income_info
                         break
 
+                income_info = best_income_info
                 pnl = float(income_info["pnl"]) if income_info else 0.0
 
                 if pnl == 0.0:

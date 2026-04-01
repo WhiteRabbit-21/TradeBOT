@@ -4,7 +4,12 @@ import json
 import time
 import base64
 import asyncio
+import hashlib
+import hmac
+from urllib.parse import urlencode
 from datetime import datetime
+
+import requests
 from typing import Optional, Any
 from trade_notifier import pnl_watcher
 import ccxt
@@ -30,6 +35,7 @@ PNL_CHAT_ID = int(os.getenv("PNL_CHAT_ID", "-1003332013833")) # куди шле�
 
 BINGX_API_KEY = os.getenv("BINGX_API_KEY", "")
 BINGX_API_SECRET = os.getenv("BINGX_API_SECRET", "")
+BINGX_SWAP_HOST = os.getenv("BINGX_SWAP_HOST", "https://open-api.bingx.com").rstrip("/")
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4.1")
@@ -459,7 +465,7 @@ async def set_margin_mode(symbol: str):
     await asyncio.to_thread(set_margin_mode_sync, symbol)
 
 # =========================
-# STOP/TP helpers (best-effort)
+# STOP/TP helpers (RAW BingX API)
 # =========================
 def _looks_like_stop(o: dict) -> bool:
     t = (o.get("type") or "").lower()
@@ -472,6 +478,69 @@ def _looks_like_stop(o: dict) -> bool:
         or info.get("stopPrice") is not None
         or info.get("triggerPrice") is not None
     )
+
+def _symbol_to_bingx_market_id(symbol: str) -> str:
+    s = str(symbol or "").upper()
+    s = s.replace(":USDT", "")
+    s = s.replace("/", "-")
+    return s
+
+def _fmt_num(x: float) -> str:
+    s = f"{float(x):.16f}"
+    s = s.rstrip("0").rstrip(".")
+    return s or "0"
+
+def _bingx_raw_request_sync(method: str, path: str, params: dict) -> dict:
+    if not BINGX_API_KEY or not BINGX_API_SECRET:
+        raise RuntimeError("BingX API keys are missing")
+
+    payload = {k: v for k, v in (params or {}).items() if v is not None}
+    payload["timestamp"] = int(time.time() * 1000)
+    query = urlencode(sorted(payload.items()), doseq=True)
+    sign = hmac.new(
+        BINGX_API_SECRET.encode("utf-8"),
+        query.encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+
+    url = f"{BINGX_SWAP_HOST}{path}?{query}&signature={sign}"
+    headers = {
+        "X-BX-APIKEY": BINGX_API_KEY,
+        "Content-Type": "application/x-www-form-urlencoded",
+    }
+
+    resp = requests.request(method.upper(), url, headers=headers, timeout=15)
+    body_text = resp.text
+
+    try:
+        data = resp.json()
+    except Exception:
+        raise RuntimeError(f"BingX RAW {method} {path} bad json: {body_text[:500]}")
+
+    code = str(data.get("code", ""))
+    if resp.status_code >= 400 or code not in {"0", "", "None"}:
+        raise RuntimeError(
+            f"BingX RAW {method} {path} failed status={resp.status_code} code={data.get('code')} msg={data.get('msg') or data.get('message')} body={body_text[:500]}"
+        )
+
+    return data
+
+def _place_bingx_tpsl_raw_sync(symbol: str, pos_side: str, trigger_price: float, quantity: float, kind: str) -> dict:
+    side = "SELL" if pos_side.lower() == "long" else "BUY"
+    order_type = "STOP_MARKET" if kind == "sl" else "TAKE_PROFIT_MARKET"
+
+    payload = {
+        "symbol": _symbol_to_bingx_market_id(symbol),
+        "side": side,
+        "positionSide": pos_side.upper(),
+        "type": order_type,
+        "quantity": _fmt_num(quantity),
+        "stopPrice": _fmt_num(trigger_price),
+        "workingType": "MARK_PRICE",
+        "reduceOnly": "true",
+    }
+
+    return _bingx_raw_request_sync("POST", "/openApi/swap/v2/trade/order", payload)
 
 def cancel_order_safe_sync(symbol: str, order_id: str) -> bool:
     try:
@@ -530,22 +599,12 @@ def set_sl_oneway_sync(base: str, sl_price: float) -> str:
         or (pos.get("info") or {}).get("positionSide")
         or ""
     ).lower()
-    
-    
+
     if pos_side not in {"long", "short"}:
         return "NO_POSITION"
 
-    contracts = float(
-    abs(
-        pos.get("contracts")
-        or pos.get("size")
-        or pos.get("positionAmt")
-        or 0
-    )
-)
-
+    contracts = float(abs(pos.get("contracts") or pos.get("size") or pos.get("positionAmt") or 0))
     contracts = float(exchange.amount_to_precision(symbol, contracts))
-
     if contracts <= 0:
         return "NO_POSITION"
 
@@ -557,34 +616,11 @@ def set_sl_oneway_sync(base: str, sl_price: float) -> str:
         sl_prec = float(sl_price)
 
     cancel_all_stops_sync(symbol, stop_side, pos_side, "sl")
+    resp = _place_bingx_tpsl_raw_sync(symbol, pos_side, sl_prec, contracts, "sl")
 
-    candidates = [
-    ("stopMarket", {"stopPrice": sl_prec}),
-    ("stop_market", {"stopPrice": sl_prec}),
-    ("stop", {"stopPrice": sl_prec}),
-    ("market", {"triggerPrice": sl_prec}),
-    ]
-
-    last_err = None
-    for order_type, params in candidates:
-        try:
-            resp = exchange.create_order(
-    symbol,
-    order_type,
-    stop_side,
-    contracts,
-    None,
-    {
-        **params,
-        "positionSide": "LONG" if pos_side == "long" else "SHORT"
-    }
-)
-            new_id = resp.get("id")
-            return f"SL_SET id={new_id} sl={sl_prec}"
-        except Exception as e:
-            last_err = e
-
-    raise RuntimeError(f"Failed to set SL: {last_err}")
+    data = resp.get("data") or {}
+    new_id = data.get("orderId") or data.get("id") or data.get("clientOrderId")
+    return f"SL_SET_RAW id={new_id} sl={sl_prec}"
 
 async def set_sl_oneway(base: str, sl_price: float) -> str:
     return await asyncio.to_thread(set_sl_oneway_sync, base, sl_price)
@@ -608,16 +644,8 @@ def set_tp_oneway_sync(base: str, tp_price: float) -> str:
     if pos_side not in {"long", "short"}:
         return "NO_POSITION"
 
-    contracts = float(
-        abs(
-            pos.get("contracts")
-            or pos.get("size")
-            or pos.get("positionAmt")
-            or 0
-        )
-    )
+    contracts = float(abs(pos.get("contracts") or pos.get("size") or pos.get("positionAmt") or 0))
     contracts = float(exchange.amount_to_precision(symbol, contracts))
-
     if contracts <= 0:
         return "NO_POSITION"
 
@@ -628,38 +656,12 @@ def set_tp_oneway_sync(base: str, tp_price: float) -> str:
     except Exception:
         tp_prec = float(tp_price)
 
-    # 🔥 cancel старий TP
     cancel_all_stops_sync(symbol, close_side, pos_side, "tp")
+    resp = _place_bingx_tpsl_raw_sync(symbol, pos_side, tp_prec, contracts, "tp")
 
-    # 🔥 Спробуємо кілька типів (BingX любить різні назви)
-    candidates = [
-        ("takeProfitMarket", {"stopPrice": tp_prec}),
-        ("take_profit_market", {"stopPrice": tp_prec}),
-        ("market", {"triggerPrice": tp_prec}),
-    ]
-
-    last_err = None
-
-    for order_type, params in candidates:
-        try:
-            resp = exchange.create_order(
-                symbol,
-                order_type,
-                close_side,
-                contracts,
-                None,
-                {
-                    **params,
-                    "positionSide": "LONG" if pos_side == "long" else "SHORT"
-                }
-            )
-
-            return f"TP_SET id={resp.get('id')} tp={tp_prec}"
-
-        except Exception as e:
-            last_err = e
-
-    raise RuntimeError(f"Failed to set TP: {last_err}")
+    data = resp.get("data") or {}
+    new_id = data.get("orderId") or data.get("id") or data.get("clientOrderId")
+    return f"TP_SET_RAW id={new_id} tp={tp_prec}"
 
 async def set_tp_oneway(base: str, tp_price: float) -> str:
     return await asyncio.to_thread(set_tp_oneway_sync, base, tp_price)
@@ -1395,7 +1397,9 @@ async def handle_ai_command(cmd: dict):
             resp = await open_market(symbol, side, qty)
             log("INFO", f"SUCCESS OPEN placed id={resp.get('id')} {base_clean} side={side} qty={qty}")
 
-            await asyncio.sleep(0.7)
+            pos_seen = await wait_position_update(symbol, timeout=5.0)
+            log("INFO", f"POSITION_VISIBLE_AFTER_OPEN {base_clean}={pos_seen}")
+            await asyncio.sleep(0.5)
 
             LAST_SLTP[base_clean] = {"sl": sl_prec, "tp": tp_prec}
             save_sltp()
@@ -1503,7 +1507,9 @@ async def handle_ai_command(cmd: dict):
             log("INFO", f"MARKET ADD {base_clean} qty={qty} (~{pct}% balance)")
             log("INFO", f"ADD RESPONSE: {resp}")
 
-            await asyncio.sleep(0.7)
+            pos_seen = await wait_position_update(symbol, timeout=5.0)
+            log("INFO", f"POSITION_VISIBLE_AFTER_ADD {base_clean}={pos_seen}")
+            await asyncio.sleep(0.5)
 
             sltp = LAST_SLTP.get(base_clean)
             if sltp:

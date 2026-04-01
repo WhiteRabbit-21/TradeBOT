@@ -390,7 +390,27 @@ async def fetch_position_oneway(symbol: str):
     return await asyncio.to_thread(
         fetch_position_oneway_sync,
         symbol
-    )    
+    )
+
+
+async def wait_position_update(symbol: str, timeout: float = 5.0) -> bool:
+    start = time.time()
+
+    while time.time() - start < timeout:
+        pos = await fetch_position_oneway(symbol)
+        if pos:
+            size = float(
+                pos.get("contracts")
+                or pos.get("size")
+                or pos.get("positionAmt")
+                or 0
+            )
+            if abs(size) > 0:
+                return True
+
+        await asyncio.sleep(0.3)
+
+    return False
 
 def close_position_full_sync(base: str):
     symbol = resolve_symbol_sync(base)
@@ -1335,16 +1355,26 @@ async def handle_ai_command(cmd: dict):
             LAST_SLTP[base_clean] = {"sl": sl_prec, "tp": tp_prec}
             save_sltp()
 
+            ready = await wait_position_update(symbol, timeout=5.0)
+            if not ready:
+                log("WARNING", f"Position not visible yet after OPEN: {base_clean}")
+
             sltp = LAST_SLTP.get(base_clean)
             if sltp:
                 log("INFO", f"Reapplying SL/TP for {base_clean}")
                 try:
-                    await set_sl_oneway(base_clean, sltp["sl"])
+                    sl_res = await set_sl_oneway(base_clean, sltp["sl"])
+                    log("INFO", f"SET_SL result {base_clean}: {sl_res}")
+                    if not str(sl_res).startswith("SL_SET"):
+                        log("WARNING", f"SL was not placed for {base_clean}: {sl_res}")
                 except Exception as e:
                     log("WARNING", f"SL reset failed: {e}")
 
                 try:
-                    await set_tp_oneway(base_clean, sltp["tp"])
+                    tp_res = await set_tp_oneway(base_clean, sltp["tp"])
+                    log("INFO", f"SET_TP result {base_clean}: {tp_res}")
+                    if not str(tp_res).startswith("TP_SET"):
+                        log("WARNING", f"TP was not placed for {base_clean}: {tp_res}")
                 except Exception as e:
                     log("WARNING", f"TP reset failed: {e}")
             else:

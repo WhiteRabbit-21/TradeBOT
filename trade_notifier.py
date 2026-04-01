@@ -1,19 +1,28 @@
 import asyncio
 import time
 import json
+import hmac
+import hashlib
+import urllib.parse
 from typing import Any, Dict, Optional
+
+import requests
+
 
 # =========================
 # GLOBAL STATE
 # =========================
 LAST_POSITIONS: Dict[str, dict] = {}
-SENT_CLOSE_CACHE: Dict[str, int] = {}   # symbol -> last sent ts
+SENT_CLOSE_CACHE: Dict[str, int] = {}  # symbol -> last sent ts
 CACHE_TTL_SEC = 30
 
 weekly_pnl = 0.0
 week_start = time.time()
 
 
+# =========================
+# HELPERS
+# =========================
 def _to_float(value: Any, default: float = 0.0) -> float:
     try:
         if value is None or value == "":
@@ -33,12 +42,14 @@ def _extract_pos_side(pos: dict) -> str:
 
 
 def _extract_pos_size(pos: dict) -> float:
-    return abs(_to_float(
-        pos.get("contracts")
-        or pos.get("size")
-        or pos.get("positionAmt")
-        or 0
-    ))
+    return abs(
+        _to_float(
+            pos.get("contracts")
+            or pos.get("size")
+            or pos.get("positionAmt")
+            or 0
+        )
+    )
 
 
 def _extract_entry(pos: dict) -> float:
@@ -50,38 +61,6 @@ def _extract_entry(pos: dict) -> float:
     )
 
 
-def _extract_trade_pnl(trade: dict) -> float:
-    info = trade.get("info") or {}
-    for candidate in (
-        trade.get("realizedPnl"),
-        trade.get("closedPnl"),
-        trade.get("profit"),
-        info.get("realizedPnl"),
-        info.get("closedPnl"),
-        info.get("profit"),
-        info.get("profitValue"),
-    ):
-        pnl = _to_float(candidate, 0.0)
-        if pnl != 0:
-            return pnl
-    return 0.0
-
-
-def _extract_trade_qty(trade: dict) -> float:
-    return abs(_to_float(trade.get("amount"), 0.0))
-
-
-def _format_close_message(symbol: str, side: str, pnl: float, qty: float) -> str:
-    status = "🟢 PROFIT" if pnl > 0 else "🔴 LOSS"
-    lines = [
-        f"{status} #{symbol}",
-        f"Close side: {side.upper()}",
-        f"PnL: {round(pnl, 4)} USDT",
-        f"Qty: {round(qty, 4)}",
-    ]
-    return "\n".join(lines)
-
-
 def _should_send(symbol: str) -> bool:
     now = int(time.time())
     last = SENT_CLOSE_CACHE.get(symbol, 0)
@@ -91,8 +70,35 @@ def _should_send(symbol: str) -> bool:
     return True
 
 
+def _format_pnl_message(
+    symbol: str,
+    side: str,
+    pnl: float,
+    qty: float,
+    entry_price: float = 0.0,
+) -> str:
+    status = "🟢 PROFIT" if pnl > 0 else "🔴 LOSS"
+    side_text = side.upper() if side else "UNKNOWN"
+
+    lines = [
+        f"{status} #{symbol}",
+        f"Side: {side_text}",
+        f"PnL: {round(pnl, 4)} USDT",
+        f"Qty: {round(qty, 4)}",
+    ]
+
+    if entry_price > 0:
+        lines.append(f"Entry: {round(entry_price, 6)}")
+
+    return "\n".join(lines)
+
+
+# =========================
+# POSITIONS SNAPSHOT
+# =========================
 async def _fetch_positions_map(exchange) -> Dict[str, dict]:
     result: Dict[str, dict] = {}
+
     try:
         positions = await asyncio.to_thread(exchange.fetch_positions)
     except Exception:
@@ -117,68 +123,199 @@ async def _fetch_positions_map(exchange) -> Dict[str, dict]:
     return result
 
 
-async def _get_last_closed_trade_info(exchange, symbol: str, log) -> Optional[dict]:
+# =========================
+# BINGX INCOME API
+# =========================
+def bingx_signed_get(path: str, params: dict, api_key: str, api_secret: str):
+    params = dict(params or {})
+    params["timestamp"] = int(time.time() * 1000)
+
+    query = urllib.parse.urlencode(sorted(params.items()))
+    signature = hmac.new(
+        api_secret.encode("utf-8"),
+        query.encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+
+    url = f"https://open-api.bingx.com{path}?{query}&signature={signature}"
+    headers = {"X-BX-APIKEY": api_key}
+
+    resp = requests.get(url, headers=headers, timeout=15)
+    resp.raise_for_status()
+    return resp.json()
+
+
+def _bingx_income_symbol(symbol: str) -> str:
+    # "SOL/USDT:USDT" -> "SOL-USDT"
+    return symbol.replace("/", "-").replace(":USDT", "")
+
+
+def get_swap_income(
+    symbol: str,
+    api_key: str,
+    api_secret: str,
+    start_ms: int | None = None,
+    end_ms: int | None = None,
+    limit: int = 20,
+):
+    params = {
+        "symbol": _bingx_income_symbol(symbol),
+        "limit": limit,
+    }
+
+    if start_ms is not None:
+        params["startTime"] = start_ms
+    if end_ms is not None:
+        params["endTime"] = end_ms
+
+    return bingx_signed_get(
+        "/openApi/swap/v2/user/income",
+        params,
+        api_key,
+        api_secret,
+    )
+
+
+def _extract_income_rows(resp: dict) -> list:
+    if not isinstance(resp, dict):
+        return []
+
+    data = resp.get("data")
+
+    if isinstance(data, list):
+        return data
+
+    if isinstance(data, dict):
+        for key in ("rows", "list", "result"):
+            value = data.get(key)
+            if isinstance(value, list):
+                return value
+
+    return []
+
+
+def _extract_income_symbol(row: dict) -> str:
+    return str(
+        row.get("symbol")
+        or row.get("market")
+        or row.get("currency")
+        or ""
+    )
+
+
+def _extract_income_time(row: dict) -> int:
+    for key in ("time", "timestamp", "createdTime", "updateTime"):
+        try:
+            v = row.get(key)
+            if v is not None:
+                return int(v)
+        except Exception:
+            pass
+    return 0
+
+
+def _extract_income_value(row: dict) -> float:
+    for key in ("income", "profit", "realizedPnl", "amount"):
+        val = _to_float(row.get(key), 0.0)
+        if val != 0.0:
+            return val
+    return 0.0
+
+
+def _extract_income_type(row: dict) -> str:
+    return str(
+        row.get("incomeType")
+        or row.get("type")
+        or row.get("bizType")
+        or ""
+    ).lower()
+
+
+async def _get_last_income_pnl(
+    symbol: str,
+    api_key: str,
+    api_secret: str,
+    log,
+    close_ts_ms: int | None = None,
+) -> Optional[dict]:
     try:
-        trades = await asyncio.to_thread(exchange.fetch_my_trades, symbol, None, 20)
+        start_ms = None
+        if close_ts_ms:
+            # беремо вікно перед закриттям, щоб не витягувати занадто старі записи
+            start_ms = max(0, close_ts_ms - 10 * 60 * 1000)
+
+        resp = await asyncio.to_thread(
+            get_swap_income,
+            symbol,
+            api_key,
+            api_secret,
+            start_ms,
+            None,
+            20,
+        )
     except Exception as e:
-        log("ERROR", f"PNL DEBUG fetch_my_trades failed for {symbol}: {e}")
+        log("ERROR", f"PNL DEBUG income request failed for {symbol}: {e}")
         return None
 
-    if not trades:
-        log("INFO", f"PNL DEBUG {symbol}: no trades returned")
+    rows = _extract_income_rows(resp)
+    if not rows:
+        log("INFO", f"PNL DEBUG income empty for {symbol}: {resp}")
         return None
 
-    trades = sorted(trades, key=lambda t: int(t.get("timestamp") or 0), reverse=True)
+    target_symbol = _bingx_income_symbol(symbol).upper()
 
-    for t in trades[:10]:
-        info = t.get("info") or {}
+    # дебаг останніх рядків
+    for row in rows[:10]:
+        log("INFO", f"PNL DEBUG INCOME {symbol}: {json.dumps(row, ensure_ascii=False)}")
 
-        debug_payload = {
-            "id": t.get("id"),
-            "order": t.get("order"),
-            "timestamp": t.get("timestamp"),
-            "side": t.get("side"),
-            "amount": t.get("amount"),
-            "realizedPnl": t.get("realizedPnl"),
-            "closedPnl": t.get("closedPnl"),
-            "profit": t.get("profit"),
-            "info_realizedPnl": info.get("realizedPnl"),
-            "info_closedPnl": info.get("closedPnl"),
-            "info_profit": info.get("profit"),
-            "info_profitValue": info.get("profitValue"),
-            "info_reduceOnly": info.get("reduceOnly"),
-            "info_positionSide": info.get("positionSide"),
+    rows = sorted(rows, key=_extract_income_time, reverse=True)
+
+    for row in rows:
+        row_symbol = _extract_income_symbol(row).upper()
+        pnl = _extract_income_value(row)
+        income_type = _extract_income_type(row)
+        ts = _extract_income_time(row)
+
+        log(
+            "INFO",
+            f"PNL DEBUG INCOME EXTRACT {symbol} row_symbol={row_symbol} type={income_type} pnl={pnl} ts={ts}",
+        )
+
+        if row_symbol and target_symbol not in row_symbol:
+            continue
+
+        if pnl == 0.0:
+            continue
+
+        return {
+            "pnl": pnl,
+            "ts": ts,
+            "type": income_type,
+            "raw": row,
         }
 
-        log("INFO", f"PNL DEBUG {symbol} trade={json.dumps(debug_payload, ensure_ascii=False)}")
-
-    best = None
-    for t in trades:
-        pnl = _extract_trade_pnl(t)
-        qty = _extract_trade_qty(t)
-
-        log("INFO", f"PNL DEBUG EXTRACT {symbol} id={t.get('id')} pnl={pnl} qty={qty}")
-
-        if pnl != 0 and qty > 0:
-            best = {
-                "pnl": pnl,
-                "qty": qty,
-                "ts": int(t.get("timestamp") or 0),
-                "side": str(t.get("side") or (t.get("info") or {}).get("side") or ""),
-            }
-            break
-
-    return best
+    return None
 
 
-async def pnl_watcher(app, exchange, log, log_chat_id, interval: int = 3):
+# =========================
+# MAIN WATCHER
+# =========================
+async def pnl_watcher(
+    app,
+    exchange,
+    log,
+    log_chat_id,
+    api_key: str,
+    api_secret: str,
+    interval: int = 3,
+):
     global LAST_POSITIONS, weekly_pnl, week_start
 
     while True:
         try:
             current_positions = await _fetch_positions_map(exchange)
 
-            # only full close: prev > 0 and current == 0
+            # тільки повне закриття: було > 0, стало 0
             just_closed = []
             for symbol, prev in LAST_POSITIONS.items():
                 prev_size = float(prev.get("size", 0.0))
@@ -192,26 +329,39 @@ async def pnl_watcher(app, exchange, log, log_chat_id, interval: int = 3):
                 if not _should_send(symbol):
                     continue
 
-                info = None
-                for _ in range(3):
+                side = str(prev.get("side", ""))
+                qty = float(prev.get("size", 0.0))
+                entry_price = float(prev.get("entry", 0.0))
+
+                income_info = None
+                close_ts_ms = int(time.time() * 1000)
+
+                # BingX може віддати income із затримкою
+                for _ in range(4):
                     await asyncio.sleep(1.5)
-                    info = await _get_last_closed_trade_info(exchange, symbol, log)
-                    if info and float(info.get("pnl", 0.0)) != 0.0:
+                    income_info = await _get_last_income_pnl(
+                        symbol=symbol,
+                        api_key=api_key,
+                        api_secret=api_secret,
+                        log=log,
+                        close_ts_ms=close_ts_ms,
+                    )
+                    if income_info and float(income_info.get("pnl", 0.0)) != 0.0:
                         break
 
-                pnl = 0.0
-                qty = prev.get("size", 0.0)
-                side = prev.get("side", "")
-
-                if info:
-                    pnl = float(info["pnl"])
-                    qty = info["qty"] or qty
+                pnl = float(income_info["pnl"]) if income_info else 0.0
 
                 if pnl == 0.0:
                     log("INFO", f"PNL notifier skip: {symbol} pnl=0.0")
                     continue
 
-                msg = _format_close_message(symbol, side, pnl, qty)
+                msg = _format_pnl_message(
+                    symbol=symbol,
+                    side=side,
+                    pnl=pnl,
+                    qty=qty,
+                    entry_price=entry_price,
+                )
 
                 try:
                     await app.send_message(log_chat_id, msg)

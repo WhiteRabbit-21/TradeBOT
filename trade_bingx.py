@@ -1815,7 +1815,16 @@ async def main():
             log("ERROR", f"BINGX load_markets failed: {e}")
 
         if pnl_ready:
-            asyncio.create_task(pnl_watcher(app, exchange, log, PNL_CHAT_ID))
+            asyncio.create_task(
+            pnl_watcher(
+                app,
+                exchange,
+                log,
+                PNL_CHAT_ID,
+                BINGX_API_KEY,
+                BINGX_API_SECRET,
+            )
+        )
 
         log("INFO", f"DRY_RUN={DRY_RUN} | Listening TARGET_CHAT_ID={TARGET_CHAT_ID}")
         await idle()

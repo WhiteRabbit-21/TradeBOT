@@ -76,6 +76,7 @@ def _format_pnl_message(
     pnl: float,
     qty: float,
     entry_price: float = 0.0,
+    income_count: int = 0,
 ) -> str:
     status = "🟢 PROFIT" if pnl > 0 else "🔴 LOSS"
     side_text = side.upper() if side else "UNKNOWN"
@@ -83,12 +84,15 @@ def _format_pnl_message(
     lines = [
         f"{status} #{symbol}",
         f"Side: {side_text}",
-        f"PnL: {round(pnl, 4)} USDT",
+        f"Realized PnL: {round(pnl, 4)} USDT",
         f"Qty: {round(qty, 4)}",
     ]
 
     if entry_price > 0:
         lines.append(f"Entry: {round(entry_price, 6)}")
+
+    if income_count > 0:
+        lines.append(f"Income rows: {income_count}")
 
     return "\n".join(lines)
 
@@ -109,6 +113,7 @@ def _normalize_symbol_for_compare(symbol: str) -> str:
 # =========================
 async def _fetch_positions_map(exchange) -> Dict[str, dict]:
     result: Dict[str, dict] = {}
+    now_ms = int(time.time() * 1000)
 
     try:
         positions = await asyncio.to_thread(exchange.fetch_positions)
@@ -124,10 +129,12 @@ async def _fetch_positions_map(exchange) -> Dict[str, dict]:
         size = _extract_pos_size(pos)
 
         if side in {"long", "short"} and size > 0:
+            prev = LAST_POSITIONS.get(symbol) or {}
             result[symbol] = {
                 "side": side,
                 "size": size,
                 "entry": _extract_entry(pos),
+                "opened_at": prev.get("opened_at", now_ms),
                 "raw": pos,
             }
 
@@ -161,7 +168,7 @@ def get_swap_income(
     api_secret: str,
     start_ms: int | None = None,
     end_ms: int | None = None,
-    limit: int = 50,
+    limit: int = 100,
 ):
     params = {
         "limit": limit,
@@ -211,9 +218,9 @@ def _extract_income_symbol(row: dict) -> str:
 def _extract_income_time(row: dict) -> int:
     for key in ("time", "timestamp", "createdTime", "updateTime"):
         try:
-            v = row.get(key)
-            if v is not None:
-                return int(v)
+            value = row.get(key)
+            if value is not None:
+                return int(value)
         except Exception:
             pass
     return 0
@@ -221,9 +228,9 @@ def _extract_income_time(row: dict) -> int:
 
 def _extract_income_value(row: dict) -> float:
     for key in ("income", "profit", "realizedPnl", "amount"):
-        val = _to_float(row.get(key), 0.0)
-        if val != 0.0:
-            return val
+        value = _to_float(row.get(key), 0.0)
+        if value != 0.0:
+            return value
     return 0.0
 
 
@@ -236,26 +243,25 @@ def _extract_income_type(row: dict) -> str:
     ).lower()
 
 
-async def _get_last_income_pnl(
+async def _get_position_income_summary(
     symbol: str,
     api_key: str,
     api_secret: str,
     log,
-    close_ts_ms: int | None = None,
+    opened_at_ms: int,
+    close_ts_ms: int,
 ) -> Optional[dict]:
     try:
-        start_ms = None
-        if close_ts_ms:
-            start_ms = max(0, close_ts_ms - 10 * 60 * 1000)
+        start_ms = max(0, opened_at_ms - 60_000)
+        end_ms = close_ts_ms + 120_000
 
-        # no symbol filter here
         resp = await asyncio.to_thread(
             get_swap_income,
             api_key,
             api_secret,
             start_ms,
-            None,
-            50,
+            end_ms,
+            100,
         )
     except Exception as e:
         log("ERROR", f"PNL DEBUG income request failed for {symbol}: {e}")
@@ -268,37 +274,44 @@ async def _get_last_income_pnl(
 
     target_symbol = _normalize_symbol_for_compare(symbol)
 
-    for row in rows[:15]:
-        log("INFO", f"PNL DEBUG INCOME {symbol}: {json.dumps(row, ensure_ascii=False)}")
-
-    rows = sorted(rows, key=_extract_income_time, reverse=True)
+    matched_rows = []
+    total_pnl = 0.0
 
     for row in rows:
         row_symbol_raw = _extract_income_symbol(row)
         row_symbol = _normalize_symbol_for_compare(row_symbol_raw)
-        pnl = _extract_income_value(row)
+        income_value = _extract_income_value(row)
         income_type = _extract_income_type(row)
         ts = _extract_income_time(row)
 
         log(
             "INFO",
-            f"PNL DEBUG INCOME EXTRACT target={target_symbol} row_symbol={row_symbol} type={income_type} pnl={pnl} ts={ts}",
+            f"PNL DEBUG INCOME EXTRACT target={target_symbol} row_symbol={row_symbol} type={income_type} pnl={income_value} ts={ts}",
         )
 
         if row_symbol and target_symbol not in row_symbol:
             continue
 
-        if pnl == 0.0:
+        if ts and (ts < start_ms or ts > end_ms):
             continue
 
-        return {
-            "pnl": pnl,
-            "ts": ts,
-            "type": income_type,
-            "raw": row,
-        }
+        if income_value == 0.0:
+            continue
 
-    return None
+        matched_rows.append(row)
+        total_pnl += income_value
+
+    for row in matched_rows[:20]:
+        log("INFO", f"PNL DEBUG INCOME MATCHED {symbol}: {json.dumps(row, ensure_ascii=False)}")
+
+    if not matched_rows:
+        return None
+
+    return {
+        "pnl": total_pnl,
+        "count": len(matched_rows),
+        "rows": matched_rows,
+    }
 
 
 # =========================
@@ -325,6 +338,7 @@ async def pnl_watcher(
                 current = current_positions.get(symbol)
                 curr_size = float(current.get("size", 0.0)) if current else 0.0
 
+                # тільки повне закриття
                 if prev_size > 0 and curr_size == 0:
                     just_closed.append((symbol, prev))
 
@@ -335,17 +349,18 @@ async def pnl_watcher(
                 side = str(prev.get("side", ""))
                 qty = float(prev.get("size", 0.0))
                 entry_price = float(prev.get("entry", 0.0))
-
-                income_info = None
+                opened_at_ms = int(prev.get("opened_at", int(time.time() * 1000) - 10 * 60 * 1000))
                 close_ts_ms = int(time.time() * 1000)
 
+                income_info = None
                 for _ in range(4):
                     await asyncio.sleep(1.5)
-                    income_info = await _get_last_income_pnl(
+                    income_info = await _get_position_income_summary(
                         symbol=symbol,
                         api_key=api_key,
                         api_secret=api_secret,
                         log=log,
+                        opened_at_ms=opened_at_ms,
                         close_ts_ms=close_ts_ms,
                     )
                     if income_info and float(income_info.get("pnl", 0.0)) != 0.0:
@@ -363,6 +378,7 @@ async def pnl_watcher(
                     pnl=pnl,
                     qty=qty,
                     entry_price=entry_price,
+                    income_count=int(income_info.get("count", 0)) if income_info else 0,
                 )
 
                 try:

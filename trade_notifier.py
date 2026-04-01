@@ -8,9 +8,6 @@ from typing import Any, Dict, Optional
 import requests
 
 
-# =========================
-# GLOBAL STATE
-# =========================
 LAST_POSITIONS: Dict[str, dict] = {}
 SENT_CLOSE_CACHE: Dict[str, int] = {}
 CACHE_TTL_SEC = 90
@@ -19,9 +16,6 @@ weekly_pnl = 0.0
 week_start = time.time()
 
 
-# =========================
-# HELPERS
-# =========================
 def _to_float(value: Any, default: float = 0.0) -> float:
     try:
         if value is None or value == "":
@@ -105,9 +99,6 @@ def _normalize_symbol_for_compare(symbol: str) -> str:
     return s
 
 
-# =========================
-# POSITIONS SNAPSHOT
-# =========================
 async def _fetch_positions_map(exchange) -> Dict[str, dict]:
     result: Dict[str, dict] = {}
     now_ms = int(time.time() * 1000)
@@ -138,9 +129,6 @@ async def _fetch_positions_map(exchange) -> Dict[str, dict]:
     return result
 
 
-# =========================
-# BINGX INCOME API
-# =========================
 def bingx_signed_get(path: str, params: dict, api_key: str, api_secret: str):
     params = dict(params or {})
     params["timestamp"] = int(time.time() * 1000)
@@ -352,18 +340,9 @@ async def _get_position_income_summary(
     }
 
 
-# =========================
-# STABLE SNAPSHOT CHOOSER
-# =========================
 def _is_better_income_snapshot(new_info: dict, best_info: Optional[dict]) -> bool:
     if best_info is None:
         return True
-
-    new_count = int(new_info.get("count", 0))
-    best_count = int(best_info.get("count", 0))
-
-    new_pnl = float(new_info.get("pnl", 0.0))
-    best_pnl = float(best_info.get("pnl", 0.0))
 
     new_has_real = bool(new_info.get("has_real_pnl_signal"))
     best_has_real = bool(best_info.get("has_real_pnl_signal"))
@@ -373,10 +352,16 @@ def _is_better_income_snapshot(new_info: dict, best_info: Optional[dict]) -> boo
     if best_has_real and not new_has_real:
         return False
 
+    new_count = int(new_info.get("count", 0))
+    best_count = int(best_info.get("count", 0))
+
     if new_count > best_count:
         return True
     if new_count < best_count:
         return False
+
+    new_pnl = float(new_info.get("pnl", 0.0))
+    best_pnl = float(best_info.get("pnl", 0.0))
 
     if abs(new_pnl) > abs(best_pnl):
         return True
@@ -396,7 +381,7 @@ async def _wait_final_income_summary(
     stable_rounds = 0
     last_signature = None
 
-    for _ in range(12):
+    for _ in range(15):
         await asyncio.sleep(2)
 
         income_info = await _get_position_income_summary(
@@ -426,15 +411,12 @@ async def _wait_final_income_summary(
 
         last_signature = signature
 
-        if stable_rounds >= 2:
+        if stable_rounds >= 2 and has_real:
             break
 
     return best_income_info
 
 
-# =========================
-# MAIN WATCHER
-# =========================
 async def pnl_watcher(
     app,
     exchange,
@@ -484,11 +466,15 @@ async def pnl_watcher(
                     close_ts_ms=close_ts_ms,
                 )
 
-                pnl = float(income_info["pnl"]) if income_info else 0.0
-
                 if income_info is None:
                     log("WARNING", f"PNL notifier: no income rows found for {symbol}")
                     continue
+
+                if not income_info.get("has_real_pnl_signal"):
+                    log("WARNING", f"PNL notifier skip: no real pnl row yet for {symbol}")
+                    continue
+
+                pnl = float(income_info["pnl"])
 
                 if pnl == 0.0:
                     log("INFO", f"PNL notifier skip: {symbol} pnl=0.0")

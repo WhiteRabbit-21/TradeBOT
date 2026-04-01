@@ -4,6 +4,7 @@ import json
 import hmac
 import hashlib
 import urllib.parse
+import re
 from typing import Any, Dict, Optional
 
 import requests
@@ -97,14 +98,8 @@ def _format_pnl_message(
 
 
 def _normalize_symbol_for_compare(symbol: str) -> str:
-    return (
-        str(symbol or "")
-        .upper()
-        .replace("/", "-")
-        .replace(":USDT", "")
-        .replace("_", "-")
-        .strip()
-    )
+    # "SOL/USDT:USDT" -> "SOLUSDT"
+    return re.sub(r"[^A-Z0-9]", "", str(symbol or "").upper())
 
 
 # =========================
@@ -169,9 +164,7 @@ def get_swap_income(
     end_ms: int | None = None,
     limit: int = 100,
 ):
-    params = {
-        "limit": limit,
-    }
+    params = {"limit": limit}
 
     if start_ms is not None:
         params["startTime"] = start_ms
@@ -205,11 +198,14 @@ def _extract_income_rows(resp: dict) -> list:
 
 
 def _extract_income_symbol(row: dict) -> str:
+    # IMPORTANT:
+    # беремо лише поля, які реально можуть бути символом ринку
+    # не беремо currency/asset, бо там часто просто USDT
     return str(
         row.get("symbol")
         or row.get("market")
-        or row.get("currency")
-        or row.get("asset")
+        or row.get("pair")
+        or row.get("contract")
         or ""
     )
 
@@ -287,20 +283,22 @@ async def _get_position_income_summary(
 
         log(
             "INFO",
-            f"PNL DEBUG INCOME EXTRACT target={target_symbol} row_symbol={row_symbol} type={income_type} pnl={income_value} ts={ts}",
+            f"PNL DEBUG INCOME EXTRACT target={target_symbol} row_symbol={row_symbol} raw_symbol={row_symbol_raw} type={income_type} pnl={income_value} ts={ts}",
         )
 
+        # поза часовим вікном позиції
         if ts and (ts < start_ms or ts > end_ms):
             continue
 
+        # нульові записи не потрібні
         if income_value == 0.0:
             continue
 
         # якщо символ у рядку є і він явно інший — пропускаємо
-        if row_symbol and target_symbol not in row_symbol:
+        if row_symbol and row_symbol != target_symbol:
             continue
 
-        # якщо символ пустий, але час підходить — беремо
+        # якщо row_symbol порожній, але час підходить — беремо
         matched_rows.append(row)
         total_pnl += income_value
 
@@ -352,12 +350,14 @@ async def pnl_watcher(
                 side = str(prev.get("side", ""))
                 qty = float(prev.get("size", 0.0))
                 entry_price = float(prev.get("entry", 0.0))
-                opened_at_ms = int(prev.get("opened_at", int(time.time() * 1000) - 10 * 60 * 1000))
+                opened_at_ms = int(
+                    prev.get("opened_at", int(time.time() * 1000) - 10 * 60 * 1000)
+                )
                 close_ts_ms = int(time.time() * 1000)
 
                 income_info = None
 
-                # даємо BingX час записати всі income rows
+                # даємо BingX час дозаписати всі income rows
                 for _ in range(4):
                     await asyncio.sleep(1.5)
                     income_info = await _get_position_income_summary(
@@ -368,7 +368,7 @@ async def pnl_watcher(
                         opened_at_ms=opened_at_ms,
                         close_ts_ms=close_ts_ms,
                     )
-                    if income_info and float(income_info.get("pnl", 0.0)) != 0.0:
+                    if income_info and int(income_info.get("count", 0)) > 0:
                         break
 
                 pnl = float(income_info["pnl"]) if income_info else 0.0

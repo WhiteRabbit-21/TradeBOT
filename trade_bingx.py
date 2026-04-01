@@ -51,6 +51,8 @@ LOG_LEVEL = "INFO"   # DEBUG / INFO / WARNING / ERROR
 LOG_FLUSH_SEC = 20   # INFO пачкою раз на N секунд
 SLTP_FILE = "/data/sltp.json"
 LAST_SLTP = {}
+ORDER_IDS_FILE = "/data/order_ids.json"
+LAST_ORDER_IDS = {}
 
 # =========================
 # PYROGRAM CLIENT (USER)
@@ -116,6 +118,23 @@ def load_sltp():
                 LAST_SLTP = json.load(f)
     except Exception as e:
         print("SLTP load error:", e)
+
+
+def save_order_ids():
+    try:
+        with open(ORDER_IDS_FILE, "w") as f:
+            json.dump(LAST_ORDER_IDS, f)
+    except Exception as e:
+        print("ORDER_IDS save error:", e)
+
+def load_order_ids():
+    global LAST_ORDER_IDS
+    try:
+        if os.path.exists(ORDER_IDS_FILE):
+            with open(ORDER_IDS_FILE, "r") as f:
+                LAST_ORDER_IDS = json.load(f)
+    except Exception as e:
+        print("ORDER_IDS load error:", e)
 
 # =========================
 # TG LOGGER (batched)
@@ -558,6 +577,31 @@ def _place_bingx_tpsl_raw_sync(symbol: str, pos_side: str, trigger_price: float,
 
     return _bingx_raw_request_sync("POST", "/openApi/swap/v2/trade/order", payload)
 
+def _extract_bingx_order_id(data: dict):
+    try:
+        return (
+            data.get("data", {}).get("order", {}).get("orderId")
+            or data.get("data", {}).get("order", {}).get("orderID")
+            or data.get("data", {}).get("orderId")
+            or data.get("data", {}).get("id")
+        )
+    except Exception:
+        return None
+
+def cancel_order_exact_sync(symbol: str, order_id: str) -> bool:
+    if not order_id:
+        return False
+    try:
+        exchange.cancel_order(str(order_id), symbol)
+        log("INFO", f"CANCEL EXACT OK symbol={symbol} id={order_id}")
+        return True
+    except Exception as e:
+        log("WARNING", f"CANCEL EXACT FAILED symbol={symbol} id={order_id} err={e}")
+        return False
+
+async def cancel_order_exact(symbol: str, order_id: str) -> bool:
+    return await asyncio.to_thread(cancel_order_exact_sync, symbol, order_id)
+
 def cancel_order_safe_sync(symbol: str, order_id: str) -> bool:
     try:
         exchange.cancel_order(order_id, symbol)
@@ -633,14 +677,21 @@ def set_sl_oneway_sync(base: str, sl_price: float) -> str:
         sl_prec = float(sl_price)
 
     log("INFO", f"SET_SL prepared symbol={symbol} pos_side={pos_side} stop_side={stop_side} qty={contracts} sl_prec={sl_prec}")
-    log("INFO", "SET_SL cancel old stops start")
-    cancel_all_stops_sync(symbol, stop_side, pos_side, "sl")
-    log("INFO", "SET_SL cancel old stops done")
+
+    key = f"{str(base).upper()}:{pos_side}"
+    old_id = ((LAST_ORDER_IDS.get(key) or {}).get("sl_id"))
+    if old_id:
+        log("INFO", f"SET_SL cancel exact old sl id={old_id}")
+        cancel_order_exact_sync(symbol, old_id)
+
     resp = _place_bingx_tpsl_raw_sync(symbol, pos_side, sl_prec, contracts, "sl")
     log("INFO", f"SET_SL raw response={resp}")
 
-    data = resp.get("data") or {}
-    new_id = data.get("orderId") or data.get("id") or data.get("clientOrderId")
+    new_id = _extract_bingx_order_id(resp)
+    LAST_ORDER_IDS.setdefault(key, {})
+    LAST_ORDER_IDS[key]["sl_id"] = new_id
+    save_order_ids()
+
     log("INFO", f"SL_SET_RAW success symbol={symbol} pos_side={pos_side} sl={sl_prec} order_id={new_id} raw={resp}")
     return f"SL_SET_RAW id={new_id} sl={sl_prec}"
 
@@ -680,14 +731,21 @@ def set_tp_oneway_sync(base: str, tp_price: float) -> str:
         tp_prec = float(tp_price)
 
     log("INFO", f"SET_TP prepared symbol={symbol} pos_side={pos_side} close_side={close_side} qty={contracts} tp_prec={tp_prec}")
-    log("INFO", "SET_TP cancel old tps start")
-    cancel_all_stops_sync(symbol, close_side, pos_side, "tp")
-    log("INFO", "SET_TP cancel old tps done")
+
+    key = f"{str(base).upper()}:{pos_side}"
+    old_id = ((LAST_ORDER_IDS.get(key) or {}).get("tp_id"))
+    if old_id:
+        log("INFO", f"SET_TP cancel exact old tp id={old_id}")
+        cancel_order_exact_sync(symbol, old_id)
+
     resp = _place_bingx_tpsl_raw_sync(symbol, pos_side, tp_prec, contracts, "tp")
     log("INFO", f"SET_TP raw response={resp}")
 
-    data = resp.get("data") or {}
-    new_id = data.get("orderId") or data.get("id") or data.get("clientOrderId")
+    new_id = _extract_bingx_order_id(resp)
+    LAST_ORDER_IDS.setdefault(key, {})
+    LAST_ORDER_IDS[key]["tp_id"] = new_id
+    save_order_ids()
+
     log("INFO", f"TP_SET_RAW success symbol={symbol} pos_side={pos_side} tp={tp_prec} order_id={new_id} raw={resp}")
     return f"TP_SET_RAW id={new_id} tp={tp_prec}"
 
@@ -1924,6 +1982,7 @@ async def on_signal(_, message):
 
 async def main():
     load_sltp()
+    load_order_ids()
     await app.start()
 
     asyncio.create_task(log_pump())

@@ -554,7 +554,6 @@ def _place_bingx_tpsl_raw_sync(symbol: str, pos_side: str, trigger_price: float,
         "quantity": _fmt_num(quantity),
         "stopPrice": _fmt_num(trigger_price),
         "workingType": "MARK_PRICE",
-        "reduceOnly": True,
     }
 
     return _bingx_raw_request_sync("POST", "/openApi/swap/v2/trade/order", payload)

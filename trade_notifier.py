@@ -1,7 +1,7 @@
 import asyncio
 import time
-from typing import Any, Dict, Optional
 import json
+from typing import Any, Dict, Optional
 
 # =========================
 # GLOBAL STATE
@@ -126,28 +126,30 @@ async def _get_last_closed_trade_info(exchange, symbol: str) -> Optional[dict]:
     if not trades:
         return None
 
-    
-
     trades = sorted(trades, key=lambda t: int(t.get("timestamp") or 0), reverse=True)
 
+    # DEBUG: show raw fields from the last trades
     for t in trades[:10]:
         info = t.get("info") or {}
-        print("INFO", f"PNL DEBUG {symbol} trade={json.dumps({
-            'id': t.get('id'),
-            'order': t.get('order'),
-            'timestamp': t.get('timestamp'),
-            'side': t.get('side'),
-            'amount': t.get('amount'),
-            'realizedPnl': t.get('realizedPnl'),
-            'closedPnl': t.get('closedPnl'),
-            'profit': t.get('profit'),
-            'info_realizedPnl': info.get('realizedPnl'),
-            'info_closedPnl': info.get('closedPnl'),
-            'info_profit': info.get('profit'),
-            'info_profitValue': info.get('profitValue'),
-            'info_reduceOnly': info.get('reduceOnly'),
-            'info_positionSide': info.get('positionSide'),
-        }, ensure_ascii=False)}")
+
+        debug_payload = {
+            "id": t.get("id"),
+            "order": t.get("order"),
+            "timestamp": t.get("timestamp"),
+            "side": t.get("side"),
+            "amount": t.get("amount"),
+            "realizedPnl": t.get("realizedPnl"),
+            "closedPnl": t.get("closedPnl"),
+            "profit": t.get("profit"),
+            "info_realizedPnl": info.get("realizedPnl"),
+            "info_closedPnl": info.get("closedPnl"),
+            "info_profit": info.get("profit"),
+            "info_profitValue": info.get("profitValue"),
+            "info_reduceOnly": info.get("reduceOnly"),
+            "info_positionSide": info.get("positionSide"),
+        }
+
+        print(f"PNL DEBUG {symbol} trade={json.dumps(debug_payload, ensure_ascii=False)}")
 
     best = None
     for t in trades:
@@ -175,14 +177,13 @@ async def pnl_watcher(app, exchange, log, log_chat_id, interval: int = 3):
         try:
             current_positions = await _fetch_positions_map(exchange)
 
-            # шукаємо ТІЛЬКИ повне закриття позиції
+            # only full close: prev > 0 and current == 0
             just_closed = []
             for symbol, prev in LAST_POSITIONS.items():
                 prev_size = float(prev.get("size", 0.0))
                 current = current_positions.get(symbol)
                 curr_size = float(current.get("size", 0.0)) if current else 0.0
 
-                # тільки якщо було > 0 і стало 0
                 if prev_size > 0 and curr_size == 0:
                     just_closed.append((symbol, prev))
 
@@ -192,14 +193,18 @@ async def pnl_watcher(app, exchange, log, log_chat_id, interval: int = 3):
 
                 info = await _get_last_closed_trade_info(exchange, symbol)
 
-                # fallback если pnl не нашли
                 pnl = 0.0
                 qty = prev.get("size", 0.0)
                 side = prev.get("side", "")
 
                 if info:
-                    pnl = info["pnl"]
+                    pnl = float(info["pnl"])
                     qty = info["qty"] or qty
+
+                # don't send fake zero-pnl messages
+                if pnl == 0.0:
+                    log("INFO", f"PNL notifier skip: {symbol} pnl=0.0")
+                    continue
 
                 msg = _format_close_message(symbol, side, pnl, qty)
 
@@ -208,7 +213,7 @@ async def pnl_watcher(app, exchange, log, log_chat_id, interval: int = 3):
                     weekly_pnl += pnl
                     log("INFO", f"PNL notifier sent: {symbol} pnl={pnl} qty={qty}")
                 except Exception as e:
-                    log("ERROR", f"PNL send failed for {symbol}: {e}")     
+                    log("ERROR", f"PNL send failed for {symbol}: {e}")
 
             LAST_POSITIONS = current_positions
 

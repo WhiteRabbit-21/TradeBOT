@@ -1,6 +1,10 @@
+# trade_app.py
 import os
 import re
 import json
+import hmac
+import hashlib
+import urllib.parse
 import time
 import base64
 import asyncio
@@ -8,6 +12,7 @@ from datetime import datetime
 from typing import Optional, Any
 from trade_notifier import pnl_watcher
 import ccxt
+import requests
 from pyrogram import Client, filters, idle
 from pyrogram.errors import PeerIdInvalid, FloodWait, RPCError
 
@@ -83,19 +88,13 @@ def cancel_all_stops_sync(symbol: str, side: str, pos_side: str, kind: str):
                     continue
 
                 # 🔥 розділяємо SL / TP
-                if kind == "sl":
-                    if not is_sl_order(o):
-                        continue
+                if kind == "sl" and not is_sl_order(o):
+                    continue
 
-                if kind == "tp":
-                    if not is_tp_order(o):
-                        continue
-
+                if kind == "tp" and not is_tp_order(o):
+                    continue
                 exchange.cancel_order(o["id"], symbol)
-                print(
-                    f"CANCEL kind={kind} symbol={symbol} "
-                    f"type={o.get('type')} side={o_side} posSide={o_pos_side} id={o['id']}"
-                )
+                print(f"CANCEL {symbol} {o_side} {o_pos_side} id={o['id']}")
 
             except Exception:
                 continue
@@ -246,6 +245,76 @@ exchange = ccxt.bingx({
     "enableRateLimit": True,
 })
 
+BINGX_BASE_URL = "https://open-api.bingx.com"
+
+
+def _bingx_sign(params: dict, secret: str) -> str:
+    query = urllib.parse.urlencode(sorted(params.items()))
+    return hmac.new(
+        secret.encode("utf-8"),
+        query.encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+
+
+def _bingx_request(method: str, path: str, params: dict):
+    params = dict(params or {})
+    params["timestamp"] = int(time.time() * 1000)
+
+    query = urllib.parse.urlencode(sorted(params.items()))
+    signature = _bingx_sign(params, BINGX_API_SECRET)
+    url = f"{BINGX_BASE_URL}{path}?{query}&signature={signature}"
+    headers = {"X-BX-APIKEY": BINGX_API_KEY}
+
+    if method.upper() == "POST":
+        resp = requests.post(url, headers=headers, timeout=15)
+    else:
+        resp = requests.get(url, headers=headers, timeout=15)
+
+    resp.raise_for_status()
+    data = resp.json()
+
+    code = data.get("code")
+    if code not in (0, "0", None):
+        raise RuntimeError(f"BingX API error: code={code} msg={data.get('msg')} payload={data}")
+
+    return data
+
+
+def _bingx_symbol_for_api(symbol: str) -> str:
+    return str(symbol).replace("/USDT:USDT", "-USDT").replace("/USDT", "-USDT")
+
+
+def place_bingx_trigger_order(
+    symbol: str,
+    side: str,
+    order_type: str,
+    quantity: float,
+    trigger_price: float,
+    position_side: str,
+    reduce_only: bool = True,
+    working_type: str = "MARK_PRICE",
+):
+    params = {
+        "symbol": _bingx_symbol_for_api(symbol),
+        "side": side.upper(),
+        "type": order_type,
+        "quantity": str(quantity),
+        "stopPrice": str(trigger_price),
+        "positionSide": position_side,
+        "reduceOnly": "true" if reduce_only else "false",
+        "workingType": working_type,
+    }
+    return _bingx_request("POST", "/openApi/swap/v2/trade/order", params)
+
+
+def query_bingx_order(symbol: str, order_id: str):
+    params = {
+        "symbol": _bingx_symbol_for_api(symbol),
+        "orderId": str(order_id),
+    }
+    return _bingx_request("GET", "/openApi/swap/v2/trade/order", params)
+
 def ensure_markets_loaded_sync():
     if not getattr(exchange, "markets", None):
         exchange.load_markets()
@@ -390,27 +459,7 @@ async def fetch_position_oneway(symbol: str):
     return await asyncio.to_thread(
         fetch_position_oneway_sync,
         symbol
-    )
-
-
-async def wait_position_update(symbol: str, timeout: float = 5.0) -> bool:
-    start = time.time()
-
-    while time.time() - start < timeout:
-        pos = await fetch_position_oneway(symbol)
-        if pos:
-            size = float(
-                pos.get("contracts")
-                or pos.get("size")
-                or pos.get("positionAmt")
-                or 0
-            )
-            if abs(size) > 0:
-                return True
-
-        await asyncio.sleep(0.3)
-
-    return False
+    )    
 
 def close_position_full_sync(base: str):
     symbol = resolve_symbol_sync(base)
@@ -551,61 +600,55 @@ def set_sl_oneway_sync(base: str, sl_price: float) -> str:
         or (pos.get("info") or {}).get("positionSide")
         or ""
     ).lower()
-    
-    
+
     if pos_side not in {"long", "short"}:
         return "NO_POSITION"
 
     contracts = float(
-    abs(
-        pos.get("contracts")
-        or pos.get("size")
-        or pos.get("positionAmt")
-        or 0
+        abs(
+            pos.get("contracts")
+            or pos.get("size")
+            or pos.get("positionAmt")
+            or 0
+        )
     )
-)
-
     contracts = float(exchange.amount_to_precision(symbol, contracts))
-
     if contracts <= 0:
         return "NO_POSITION"
 
-    stop_side = "sell" if pos_side == "long" else "buy"
+    stop_side = "SELL" if pos_side == "long" else "BUY"
+    position_side = "LONG" if pos_side == "long" else "SHORT"
 
     try:
         sl_prec = float(exchange.price_to_precision(symbol, float(sl_price)))
     except Exception:
         sl_prec = float(sl_price)
 
-    cancel_all_stops_sync(symbol, stop_side, pos_side, "sl")
+    cancel_all_stops_sync(symbol, stop_side.lower(), pos_side, "sl")
 
-    candidates = [
-    ("stopMarket", {"stopPrice": sl_prec}),
-    ("stop_market", {"stopPrice": sl_prec}),
-    ("stop", {"stopPrice": sl_prec}),
-    ("market", {"triggerPrice": sl_prec}),
-    ]
+    resp = place_bingx_trigger_order(
+        symbol=symbol,
+        side=stop_side,
+        order_type="STOP_MARKET",
+        quantity=contracts,
+        trigger_price=sl_prec,
+        position_side=position_side,
+        reduce_only=True,
+        working_type="MARK_PRICE",
+    )
 
-    last_err = None
-    for order_type, params in candidates:
-        try:
-            resp = exchange.create_order(
-    symbol,
-    order_type,
-    stop_side,
-    contracts,
-    None,
-    {
-        **params,
-        "positionSide": "LONG" if pos_side == "long" else "SHORT"
-    }
-)
-            new_id = resp.get("id")
-            return f"SL_SET id={new_id} sl={sl_prec}"
-        except Exception as e:
-            last_err = e
+    data = (resp or {}).get("data") or {}
+    order = data.get("order") or {}
+    order_id = order.get("orderId") or data.get("orderId") or resp.get("orderId")
 
-    raise RuntimeError(f"Failed to set SL: {last_err}")
+    if not order_id:
+        return f"SL_SET_NO_ORDER_ID sl={sl_prec} resp={resp}"
+
+    try:
+        chk = query_bingx_order(symbol, str(order_id))
+        return f"SL_SET id={order_id} sl={sl_prec} check={chk}"
+    except Exception as e:
+        return f"SL_SET id={order_id} sl={sl_prec} check_failed={e}"
 
 async def set_sl_oneway(base: str, sl_price: float) -> str:
     return await asyncio.to_thread(set_sl_oneway_sync, base, sl_price)
@@ -638,49 +681,42 @@ def set_tp_oneway_sync(base: str, tp_price: float) -> str:
         )
     )
     contracts = float(exchange.amount_to_precision(symbol, contracts))
-
     if contracts <= 0:
         return "NO_POSITION"
 
-    close_side = "sell" if pos_side == "long" else "buy"
+    close_side = "SELL" if pos_side == "long" else "BUY"
+    position_side = "LONG" if pos_side == "long" else "SHORT"
 
     try:
         tp_prec = float(exchange.price_to_precision(symbol, float(tp_price)))
     except Exception:
         tp_prec = float(tp_price)
 
-    # 🔥 cancel старий TP
-    cancel_all_stops_sync(symbol, close_side, pos_side, "tp")
+    cancel_all_stops_sync(symbol, close_side.lower(), pos_side, "tp")
 
-    # 🔥 Спробуємо кілька типів (BingX любить різні назви)
-    candidates = [
-        ("takeProfitMarket", {"stopPrice": tp_prec}),
-        ("take_profit_market", {"stopPrice": tp_prec}),
-        ("market", {"triggerPrice": tp_prec}),
-    ]
+    resp = place_bingx_trigger_order(
+        symbol=symbol,
+        side=close_side,
+        order_type="TAKE_PROFIT_MARKET",
+        quantity=contracts,
+        trigger_price=tp_prec,
+        position_side=position_side,
+        reduce_only=True,
+        working_type="MARK_PRICE",
+    )
 
-    last_err = None
+    data = (resp or {}).get("data") or {}
+    order = data.get("order") or {}
+    order_id = order.get("orderId") or data.get("orderId") or resp.get("orderId")
 
-    for order_type, params in candidates:
-        try:
-            resp = exchange.create_order(
-                symbol,
-                order_type,
-                close_side,
-                contracts,
-                None,
-                {
-                    **params,
-                    "positionSide": "LONG" if pos_side == "long" else "SHORT"
-                }
-            )
+    if not order_id:
+        return f"TP_SET_NO_ORDER_ID tp={tp_prec} resp={resp}"
 
-            return f"TP_SET id={resp.get('id')} tp={tp_prec}"
-
-        except Exception as e:
-            last_err = e
-
-    raise RuntimeError(f"Failed to set TP: {last_err}")
+    try:
+        chk = query_bingx_order(symbol, str(order_id))
+        return f"TP_SET id={order_id} tp={tp_prec} check={chk}"
+    except Exception as e:
+        return f"TP_SET id={order_id} tp={tp_prec} check_failed={e}"
 
 async def set_tp_oneway(base: str, tp_price: float) -> str:
     return await asyncio.to_thread(set_tp_oneway_sync, base, tp_price)
@@ -772,47 +808,6 @@ def calc_qty(usdt_free: float, risk_pct: float, lev: int, entry_price: float) ->
     margin = usdt_free * (risk_pct / 100.0)
     notional = margin * lev
     return 0.0 if entry_price <= 0 else notional / entry_price
-
-
-def calc_tp_from_rr(entry: float, sl: float, rr: float, side: str) -> float:
-    entry = float(entry)
-    sl = float(sl)
-    rr = float(rr)
-
-    risk = abs(entry - sl)
-    if risk <= 0 or rr <= 0:
-        raise ValueError("bad rr inputs")
-
-    if side == "short":
-        return entry - risk * rr
-    return entry + risk * rr
-
-
-def extract_rr_from_text(text: str) -> Optional[float]:
-    t = (text or "").strip()
-    if not t:
-        return None
-
-    patterns = [
-        r'\brr\s*[:=\-]?\s*(\d+(?:[\.,]\d+)?)\b',      # RR2 / RR 2 / RR:2
-        r'\brr\s*1\s*[:/]\s*(\d+(?:[\.,]\d+)?)\b',     # RR 1:2
-        r'\b(\d+(?:[\.,]\d+)?)\s*r\b',                   # 2R / 2.5R
-        r'\btp\s*(?:at|@)?\s*(\d+(?:[\.,]\d+)?)\s*r\b' # TP at 3R
-    ]
-
-    for pat in patterns:
-        m = re.search(pat, t, re.I)
-        if not m:
-            continue
-        raw = m.group(1).replace(",", ".")
-        try:
-            rr = float(raw)
-            if rr > 0:
-                return rr
-        except Exception:
-            continue
-
-    return None
 
 def normalize_price_from_tail(raw: float, entry: float, side: str, kind: str) -> float:
     raw = float(raw)
@@ -914,75 +909,90 @@ AI_SYSTEM = """
 You are a crypto futures trading signal parser.
 
 Your ONLY task:
-Convert any trading signal into VALID JSON.
+Convert ANY trading signal into VALID JSON.
 
 CRITICAL RULES:
-- ALWAYS return JSON only.
-- NEVER return NONE if there is any actionable trading intent.
-- Confidence must reflect PARSING certainty, not trade quality.
-- Do not return confidence 0.0 when the command is structurally clear.
+- ALWAYS return JSON
+- NEVER return NONE if there is ANY of:
+  base, SL, TP, LONG, SHORT
 
-ACTION RULES:
-- If signal contains add / adding / add more / increasing size / increase size / increase position / scale in / averaging / dca -> action = ADD
-- If signal contains stop loss / stoploss / SL -> action = SET_SL unless it is clearly a full OPEN signal
-- If signal contains take profit / TP / target update -> action = SET_TP unless it is clearly a full OPEN signal
-- If signal contains break even / breakeven / BE -> action = BE
-- If signal contains close / closing / closed / exit / take profit hit / TP hit -> action = CLOSE
-- Otherwise, if it is a full entry setup -> action = OPEN
+- If signal contains "ADD" or "add" → return action = ADD
+- If signal contains "SL" → return SET_SL
+- If signal contains "TP" → return SET_TP
+Otherwise:
+- If full signal → OPEN
 
-EXTRACTION RULES:
-- BASE: extract ticker and remove USDT. Example: #ETHUSDT -> ETH
-- SIDE: long or short
-- LEVERAGE: parse X10 / 10x / leverage 10
-- RISK_PCT: parse phrases like "1.5% balance", "risk 2%", "margin 0.75%"
-- ADD_PCT: for ADD signals parse the percentage being added now
-- SL: number after SL / stop loss
-- TP: first target PRICE number if a real target price is present
-- RR: if take profit is expressed as RR instead of a price, extract rr as a positive number
-- Examples of RR targets:
-  - RR2 -> rr=2
-  - RR 1:2 -> rr=2
-  - TP at 3R -> rr=3
-  - Target 2R -> rr=2
-- If TP is expressed only as RR, set "tp": null and fill "rr"
-- DCA_PRICE: if ADD includes a specific price/zone, extract it
-- PRICE: if signal explicitly provides an add/limit price, extract it
-- ENTRY may be missing and that is acceptable
+- ENTRY can be missing → assume it's valid
 
-DCA RULES:
-- If ADD has a specific price -> treat it as DCA
-- If ADD has no specific price -> treat it as market ADD
+---
 
-CONFIDENCE RULES:
-- If action/base/add_pct or risk_pct are clearly present for ADD, confidence should be at least 0.85
-- If action/base/side/sl and either tp or rr are clearly present for OPEN, confidence should be at least 0.85
-- If CLOSE intent is explicit and ticker is clear, confidence should be at least 0.85
-- Use low confidence only when fields are ambiguous or missing
-- RR may be used only as an extra hint for OPEN setups
-- Do not reduce confidence for ADD / SET_SL / SET_TP / CLOSE just because RR is unavailable
+EXTRACTION:
 
-RR CALCULATION (ONLY when entry/sl/tp are available for OPEN):
-- LONG: RR = (TP - ENTRY) / (ENTRY - SL)
-- SHORT: RR = (ENTRY - TP) / (SL - ENTRY)
+BASE:
+- Extract from #ETHUSDT → ETH
+- Remove USDT
+
+SIDE:
+- LONG or SHORT
+
+LEVERAGE:
+- X10, 10x → 10
+
+RISK:
+- "1.5% balance" → 1.5
+
+SL:
+- number after SL
+
+TP:
+- first number from TARGET
+
+---
+
+RR CALCULATION:
+
+LONG:
+RR = (TP - ENTRY) / (ENTRY - SL)
+
+SHORT:
+RR = (ENTRY - TP) / (SL - ENTRY)
+
+---
+
+CONFIDENCE:
+
+- RR < 1 → 0.5
+- RR 1-2 → 0.75
+- RR > 2 → 0.9+
+
+---
 
 OUTPUT FORMAT:
+
 {
-  "action": "OPEN | CLOSE | ADD | SET_SL | SET_TP | BE | NONE",
-  "base": "string|null",
-  "bases": ["string"] | null,
-  "side": "long|short|null",
-  "leverage": 10,
-  "risk_pct": 1.5,
-  "sl": 123.45,
-  "tp": 120.00,
-  "add_pct": 0.75,
-  "confidence": 0.92,
-  "raw_text": "string|null",
-  "rr": 2.5,
-  "dca_price": 123.0,
-  "dca_pct": 0.75,
-  "price": 123.0
+  "action": "OPEN",
+  "base": "...",
+  "side": "...",
+  "leverage": ...,
+  "risk_pct": ...,
+  "sl": ...,
+  "tp": ...,
+  "add_pct": null,
+  "rr": ...,
+  "confidence": ...
 }
+
+If signal contains DCA or additional entry price:
+- extract it as:
+  "dca_price": number
+  "dca_pct": percent
+
+If ADD has a price → it is DCA, not market add
+
++ ADD:
++ - "add", "add more", "increase position" → action = ADD
++ - Extract percent → add_pct
+
 """
 
 AI_JSON_SHAPE = {
@@ -1007,55 +1017,21 @@ def is_sl_order(o):
     t = (o.get("type") or "").lower()
     info = o.get("info") or {}
 
-    # явні TP-ознаки -> це не SL
-    if "take" in t or "profit" in t:
-        return False
-
-    if str(info.get("takeProfit") or "").strip():
-        return False
-
-    client_oid = str(
-        info.get("clientOrderId")
-        or info.get("clientOrderID")
-        or ""
-    ).lower()
-
-    if "tp" in client_oid or "take" in client_oid or "profit" in client_oid:
-        return False
-
-    # явні SL-ознаки
-    if "stop" in t and "take" not in t and "profit" not in t:
-        return True
-
-    if str(info.get("stopLoss") or "").strip():
-        return True
-
-    if "sl" in client_oid or "stop" in client_oid:
-        return True
-
-    return False
+    return (
+        "stop" in t
+        or info.get("stopPrice") is not None
+    )
 
 
 def is_tp_order(o):
     t = (o.get("type") or "").lower()
     info = o.get("info") or {}
 
-    if "take" in t or "profit" in t:
-        return True
-
-    if str(info.get("takeProfit") or "").strip():
-        return True
-
-    client_oid = str(
-        info.get("clientOrderId")
-        or info.get("clientOrderID")
-        or ""
-    ).lower()
-
-    if "tp" in client_oid or "take" in client_oid or "profit" in client_oid:
-        return True
-
-    return False
+    return (
+        "profit" in t
+        or "take" in t
+        or info.get("triggerPrice") is not None
+    )
 
 def _img_to_data_url(path: str) -> str:
     with open(path, "rb") as f:
@@ -1132,20 +1108,13 @@ ACTION_MIN_CONF = {
     "SET_SL": 0.60,
     "SET_TP": 0.60,
     "BE": 0.60,
-    "ADD": 0.00,
+    "ADD": 0.65,
     "OPEN": 0.40,
 }
 
 # =========================
 # EXECUTION ROUTER
 # =========================
-def _has_add_intent_text(text: str) -> bool:
-    t = (text or "").strip()
-    if not t:
-        return False
-    return bool(re.search(r"\b(add|adding|increase|increasing|scale\s*in|averag\w*|dca)\b", t, re.I))
-
-
 def _clean_base(x: str) -> str:
     b = str(x).upper().strip()
     b = b.replace("USDT", "")
@@ -1171,32 +1140,18 @@ async def handle_ai_command(cmd: dict):
 
     log("INFO", f"AI action={action} conf={conf} base={base} side={side} lev={lev} risk={risk_pct} sl={sl} tp={tp} add_pct={add_pct}")
 
-    # -------------------------
-    # TEXT-BASED FORCE FIXES
-    # -------------------------
-    if action in {"NONE", "OPEN"} and _has_add_intent_text(tg_text):
-        if base and (add_pct is not None or risk_pct is not None):
-            log("WARNING", "FORCE FIX: OPEN/NONE -> ADD by text rule")
-            action = "ADD"
-
     if action == "NONE":
         log("DEBUG", "AI SKIP: action=NONE")
         return
+    
+    # 🔥 FIX: force ADD if text contains "add"
+    if action == "OPEN" and re.search(r"\badd\b", (tg_text or ""), re.I):
+        log("WARNING", "FORCE FIX: OPEN -> ADD by text rule")
+        action = "ADD"
 
     min_conf = ACTION_MIN_CONF.get(action, 0.70)
 
-    # -------------------------
-    # CONFIDENCE GATE
-    # -------------------------
-    # Для ADD опираємось на структуру, а не на self-reported confidence.
-    if action == "ADD":
-        if not base:
-            log("INFO", "AI SKIP ADD: base missing")
-            return
-        if add_pct is None and risk_pct is None:
-            log("INFO", "AI SKIP ADD: no add_pct/risk_pct")
-            return
-    elif action not in {"SET_SL", "SET_TP", "BE", "CLOSE"} and conf < min_conf:
+    if action not in {"SET_SL", "SET_TP", "BE", "CLOSE"} and conf < min_conf:
         log("INFO", f"AI SKIP: low confidence {conf} < {min_conf} for action={action}")
         return
 
@@ -1204,6 +1159,7 @@ async def handle_ai_command(cmd: dict):
     # CLOSE
     # -------------------------
     if action == "CLOSE":
+        
         if not has_close_intent(tg_text):
             log("INFO", "SAFE SKIP CLOSE: no close intent words in text")
             return
@@ -1228,6 +1184,7 @@ async def handle_ai_command(cmd: dict):
 
         for b in cleaned:
             symbol = await resolve_symbol(b)
+            
 
             if not symbol:
                 log("ERROR", f"CLOSE skip: symbol not listed on BingX: {b}/USDT")
@@ -1252,6 +1209,7 @@ async def handle_ai_command(cmd: dict):
     # OPEN
     # -------------------------
     if action == "OPEN":
+
         if not base:
             log("INFO", "AI SKIP OPEN: base missing")
             return
@@ -1264,16 +1222,8 @@ async def handle_ai_command(cmd: dict):
             log("INFO", "AI SKIP OPEN: leverage or risk_pct missing")
             return
 
-        rr_value = cmd.get("rr")
-        if rr_value is None:
-            rr_value = extract_rr_from_text(tg_text)
-
-        if sl is None:
-            log("INFO", "AI SKIP OPEN: sl missing")
-            return
-
-        if tp is None and rr_value is None:
-            log("INFO", "AI SKIP OPEN: tp/rr missing")
+        if sl is None or tp is None:
+            log("INFO", "AI SKIP OPEN: sl or tp missing")
             return
 
         base_clean = _clean_base(base)
@@ -1283,25 +1233,18 @@ async def handle_ai_command(cmd: dict):
             log("ERROR", f"Symbol not listed on BingX: {base_clean}/USDT")
             return
 
+        # 🔥 ENTRY PRICE
         try:
             entry = float((await asyncio.to_thread(exchange.fetch_ticker, symbol))["last"])
         except Exception as e:
             log("ERROR", f"fetch_ticker failed: {e}")
             return
 
+        # 🔥 FIX SL/TP
         sl_fixed = normalize_price_from_tail(float(sl), entry, side, "sl")
-
-        if tp is None and rr_value is not None:
-            try:
-                tp = calc_tp_from_rr(entry, sl_fixed, float(rr_value), side)
-                log("INFO", f"TP_FROM_RR {base_clean} entry={entry} sl={sl_fixed} rr={rr_value} -> tp={tp}")
-            except Exception as e:
-                log("ERROR", f"TP_FROM_RR failed: {e}")
-                return
-
         tp_fixed = normalize_price_from_tail(float(tp), entry, side, "tp")
 
-        log("INFO", f"FIX {base_clean} entry={entry} rawSL={sl} -> {sl_fixed} | rawTP={tp} -> {tp_fixed} | rr={rr_value}")
+        log("INFO", f"FIX {base_clean} entry={entry} rawSL={sl} -> {sl_fixed} | rawTP={tp} -> {tp_fixed}")
 
         try:
             sl_prec = float(await asyncio.to_thread(exchange.price_to_precision, symbol, sl_fixed))
@@ -1313,15 +1256,19 @@ async def handle_ai_command(cmd: dict):
         except Exception:
             tp_prec = float(tp_fixed)
 
+        # 🔥 VALIDATION
         if not validate_sl_tp(side, entry, sl_prec, tp_prec):
             log("INFO", f"SKIP Bad SL/TP vs entry. entry={entry} SL={sl_prec} TP={tp_prec}")
             return
 
+        # 🔥 CALC QTY
         try:
             usdt_free = await get_usdt_free()
             qty_raw = calc_qty(usdt_free, float(risk_pct), int(lev), entry)
             qty = float(await asyncio.to_thread(exchange.amount_to_precision, symbol, qty_raw))
+
             log("INFO", f"QTY USDT free={usdt_free} qty_raw≈{qty_raw} qty_prec={qty}")
+
         except Exception as e:
             log("ERROR", f"balance/qty failed: {e}")
             return
@@ -1334,145 +1281,44 @@ async def handle_ai_command(cmd: dict):
             log("INFO", "DRY_RUN OPEN skipped (test mode)")
             return
 
+        # 🔥 SET LEVERAGE (HEDGE)
         log("INFO", f"TRY SET LEVERAGE {symbol} lev={lev} side={side}")
 
         try:
-            await set_margin_mode(symbol)
+            await set_margin_mode(symbol) 
             await set_leverage(symbol, int(lev), side)
-            await asyncio.sleep(1.0)
+
+            await asyncio.sleep(1.0)       
+
             log("INFO", "LEVERAGE SET OK")
+
         except Exception as e:
             log("ERROR", f"LEVERAGE FAILED: {e}")
 
+        # 🔥 OPEN ORDER
         log("INFO", f"TRY OPEN {symbol} side={side} qty={qty}")
 
         try:
             resp = await open_market(symbol, side, qty)
+            
+            log("INFO", f"OPEN RESPONSE: {resp}")
             log("INFO", f"SUCCESS OPEN placed id={resp.get('id')} {base_clean} side={side} qty={qty}")
 
             await asyncio.sleep(0.7)
 
-            LAST_SLTP[base_clean] = {"sl": sl_prec, "tp": tp_prec}
+            # 🔥 ЗБЕРЕГТИ SL/TP
+            LAST_SLTP[base_clean] = {
+                "sl": sl_prec,
+                "tp": tp_prec
+            }
+
             save_sltp()
 
-            ready = await wait_position_update(symbol, timeout=5.0)
-            if not ready:
-                log("WARNING", f"Position not visible yet after OPEN: {base_clean}")
-
             sltp = LAST_SLTP.get(base_clean)
+
             if sltp:
                 log("INFO", f"Reapplying SL/TP for {base_clean}")
-                try:
-                    sl_res = await set_sl_oneway(base_clean, sltp["sl"])
-                    log("INFO", f"SET_SL result {base_clean}: {sl_res}")
-                    if not str(sl_res).startswith("SL_SET"):
-                        log("WARNING", f"SL was not placed for {base_clean}: {sl_res}")
-                except Exception as e:
-                    log("WARNING", f"SL reset failed: {e}")
 
-                try:
-                    tp_res = await set_tp_oneway(base_clean, sltp["tp"])
-                    log("INFO", f"SET_TP result {base_clean}: {tp_res}")
-                    if not str(tp_res).startswith("TP_SET"):
-                        log("WARNING", f"TP was not placed for {base_clean}: {tp_res}")
-                except Exception as e:
-                    log("WARNING", f"TP reset failed: {e}")
-            else:
-                log("WARNING", f"No SL/TP stored for {base_clean}")
-
-            dca_price = cmd.get("dca_price")
-            dca_pct = cmd.get("dca_pct")
-            if dca_price and dca_pct:
-                await place_dca(symbol, side, float(dca_pct), float(dca_price), lev)
-
-        except Exception as e:
-            log("ERROR", f"OPEN FAILED: {e}")
-            return
-        return
-
-    # -------------------------
-    # ADD
-    # -------------------------
-    if action == "ADD":
-        base_clean = _clean_base(base)
-        symbol = await resolve_symbol(base_clean)
-
-        if not symbol:
-            log("ERROR", f"symbol not listed: {base_clean}")
-            return
-
-        pos = await fetch_position_oneway(symbol)
-        if not pos:
-            log("ERROR", "ADD: no existing position")
-            return
-
-        side = (pos.get("side") or "").lower()
-        lev = int(float(pos.get("leverage") or (pos.get("info") or {}).get("leverage") or 1))
-
-        pct = add_pct if add_pct is not None else risk_pct
-        if pct is None:
-            log("INFO", "ADD skip: no pct")
-            return
-
-        mode = detect_add_mode(cmd)
-        log("INFO", f"ADD MODE = {mode}")
-
-        if mode == "DCA":
-            dca_price = cmd.get("price") or cmd.get("dca_price")
-            if not dca_price:
-                log("ERROR", "DCA but no price")
-                return
-
-            dca_price = float(dca_price)
-
-            try:
-                usdt_free = await get_usdt_free()
-                entry = float((await asyncio.to_thread(exchange.fetch_ticker, symbol))["last"])
-
-                margin = usdt_free * (float(pct) / 100.0)
-                notional = margin * lev
-                qty_raw = notional / entry
-                qty = float(await asyncio.to_thread(exchange.amount_to_precision, symbol, qty_raw))
-
-                if DRY_RUN:
-                    log("INFO", f"DRY_RUN DCA {base_clean} at {dca_price} qty={qty}")
-                    return
-
-                await place_dca(symbol, side, float(pct), dca_price, lev)
-                log("INFO", f"DCA placed {base_clean} at {dca_price} qty={qty}")
-            except Exception as e:
-                log("ERROR", f"DCA failed: {e}")
-            return
-
-        try:
-            usdt_free = await get_usdt_free()
-            pct = float(pct)
-            margin = usdt_free * (pct / 100.0)
-            notional = margin * lev
-
-            entry = float((await asyncio.to_thread(exchange.fetch_ticker, symbol))["last"])
-            qty_raw = notional / entry
-            qty = float(await asyncio.to_thread(exchange.amount_to_precision, symbol, qty_raw))
-
-            market = exchange.market(symbol)
-            min_qty = market.get("limits", {}).get("amount", {}).get("min")
-            if min_qty and qty < min_qty:
-                qty = float(min_qty)
-                log("INFO", f"ADD qty adjusted to min: {qty}")
-
-            if DRY_RUN:
-                log("INFO", f"DRY_RUN ADD {base_clean} qty={qty} (~{pct}% balance)")
-                return
-
-            resp = await open_market(symbol, side, qty)
-            log("INFO", f"MARKET ADD {base_clean} qty={qty} (~{pct}% balance)")
-            log("INFO", f"ADD RESPONSE: {resp}")
-
-            await asyncio.sleep(0.7)
-
-            sltp = LAST_SLTP.get(base_clean)
-            if sltp:
-                log("INFO", f"Reapplying SL/TP for {base_clean}")
                 try:
                     await set_sl_oneway(base_clean, sltp["sl"])
                 except Exception as e:
@@ -1482,13 +1328,148 @@ async def handle_ai_command(cmd: dict):
                     await set_tp_oneway(base_clean, sltp["tp"])
                 except Exception as e:
                     log("WARNING", f"TP reset failed: {e}")
+            else:
+                log("WARNING", f"No SL/TP stored for {base_clean}")
+
+            # 🔥 DCA після OPEN
+                    
+            dca_price = cmd.get("dca_price")
+            dca_pct = cmd.get("dca_pct")
+
+            if dca_price and dca_pct:
+                await place_dca(symbol, side, float(dca_pct), float(dca_price), lev)
+                
+
+        except Exception as e:
+            log("ERROR", f"OPEN FAILED: {e}")
+            return
+        return    
+    
+    # -------------------------
+    # ADD (from balance)
+    # -------------------------
+    if action == "ADD" and not base:
+        log("INFO", "AI SKIP ADD: base missing")
+        return
+
+    if action == "ADD":
+
+        base_clean = _clean_base(base)
+        symbol = await resolve_symbol(base_clean)
+
+        if not symbol:
+            log("ERROR", f"symbol not listed: {base_clean}")
+            return
+
+        pos = await fetch_position_oneway(symbol)
+
+        if not pos:
+            log("ERROR", "ADD: no existing position")
+            return
+
+        side = (pos.get("side") or "").lower()
+
+        lev = int(
+            float(
+                pos.get("leverage")
+                or (pos.get("info") or {}).get("leverage")
+                or 1
+            )
+        )
+
+        entry = float((await asyncio.to_thread(exchange.fetch_ticker, symbol))["last"])
+
+        pct = add_pct or risk_pct
+        if pct is None:
+            log("INFO", "ADD skip: no pct")
+            return
+
+        mode = detect_add_mode(cmd)
+
+        log("INFO", f"ADD MODE = {mode}")
+
+        # =========================
+        # 🔥 DCA
+        # =========================
+        if mode == "DCA":
+
+            dca_price = cmd.get("price") or cmd.get("dca_price")
+
+            if not dca_price:
+                log("ERROR", "DCA but no price")
+                return
+
+            dca_price = float(dca_price)
+
+            try:
+                usdt_free = await get_usdt_free()
+
+                margin = usdt_free * (pct / 100)
+                notional = margin * lev
+                qty_raw = notional / entry
+
+                qty = float(await asyncio.to_thread(exchange.amount_to_precision, symbol, qty_raw))
+
+                await place_dca(symbol, side, pct, dca_price, lev)
+                log("INFO", f"DCA placed {base_clean} at {dca_price} qty={qty}")
+
+            except Exception as e:
+                log("ERROR", f"DCA failed: {e}")
+
+            return
+
+        # =========================
+        # 🔥 MARKET ADD
+        # =========================
+        try:
+            usdt_free = await get_usdt_free()
+
+            pct = float(pct)
+
+            margin = usdt_free * (pct / 100)
+            notional = margin * lev
+
+            entry = float((await asyncio.to_thread(exchange.fetch_ticker, symbol))["last"])
+
+            qty_raw = notional / entry
+
+            qty = float(await asyncio.to_thread(exchange.amount_to_precision, symbol, qty_raw))
+
+            market = exchange.market(symbol)
+            min_qty = market.get("limits", {}).get("amount", {}).get("min")
+
+            if min_qty and qty < min_qty:
+                qty = float(min_qty)
+                log("INFO", f"ADD qty adjusted to min: {qty}")
+
+            resp = await open_market(symbol, side, qty)
+           
+
+            log("INFO", f"MARKET ADD {base_clean} qty={qty} (~{pct}% balance)")
+            await asyncio.sleep(0.7)
+
+            # 🔥 RESET SL/TP після ADD
+            sltp = LAST_SLTP.get(base_clean)
+
+            if sltp:
+                log("INFO", f"Reapplying SL/TP for {base_clean}")
+
+                try:
+                    await set_sl_oneway(base_clean, sltp["sl"])
+                except Exception as e:
+                    log("WARNING", f"SL reset failed: {e}")
+
+                try:
+                    await set_tp_oneway(base_clean, sltp["tp"])
+                except Exception as e:
+                    log("WARNING", f"TP reset failed: {e}")
+
             return
         except Exception as e:
             log("ERROR", f"ADD failed: {e}")
             return
-
     # -------------------------
-    # SET_SL
+    # SET_SL (always cancel old -> set new)
     # -------------------------
     if action == "SET_SL":
         if not base or sl is None:
@@ -1502,6 +1483,7 @@ async def handle_ai_command(cmd: dict):
             return
 
         new_sl = float(sl)
+
         pos = await fetch_position_oneway(symbol)
         pos_side = (pos.get("side") or "").lower() if pos else None
         if pos_side in {"long", "short"}:
@@ -1517,11 +1499,16 @@ async def handle_ai_command(cmd: dict):
             return
 
         try:
-            res = await set_sl_oneway(base_clean, new_sl)
+            res = await set_sl_oneway(base_clean, new_sl)  # cancels old SL inside
+            # 🔥 SAVE SL
             if base_clean in LAST_SLTP:
                 LAST_SLTP[base_clean]["sl"] = new_sl
             else:
-                LAST_SLTP[base_clean] = {"sl": new_sl, "tp": None}
+                LAST_SLTP[base_clean] = {
+                    "sl": new_sl,
+                    "tp": None
+                }
+
             save_sltp()
             log("INFO", f"SUCCESS SET_SL {base_clean}: {res}")
         except Exception as e:
@@ -1543,6 +1530,7 @@ async def handle_ai_command(cmd: dict):
             return
 
         new_tp = float(tp)
+
         pos = await fetch_position_oneway(symbol)
         pos_side = (pos.get("side") or "").lower() if pos else None
         if pos_side in {"long", "short"}:
@@ -1559,10 +1547,16 @@ async def handle_ai_command(cmd: dict):
 
         try:
             res = await set_tp_oneway(base_clean, new_tp)
+
+            # 🔥 SAVE TP
             if base_clean in LAST_SLTP:
                 LAST_SLTP[base_clean]["tp"] = new_tp
             else:
-                LAST_SLTP[base_clean] = {"sl": None, "tp": new_tp}
+                LAST_SLTP[base_clean] = {
+                    "sl": None,
+                    "tp": new_tp
+                }
+
             save_sltp()
             log("INFO", f"SUCCESS SET_TP {base_clean}: {res}")
         except Exception as e:
@@ -1570,7 +1564,7 @@ async def handle_ai_command(cmd: dict):
         return
 
     # -------------------------
-    # BE
+    # BE (cancel old SL -> set SL=entry)
     # -------------------------
     if action == "BE":
         if not base:
@@ -1596,6 +1590,7 @@ async def handle_ai_command(cmd: dict):
         return
 
     log("INFO", f"Unknown/unsupported action: {action}")
+    
 
 def detect_add_mode(cmd: dict) -> str:
     """

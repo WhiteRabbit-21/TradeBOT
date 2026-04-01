@@ -117,18 +117,19 @@ async def _fetch_positions_map(exchange) -> Dict[str, dict]:
     return result
 
 
-async def _get_last_closed_trade_info(exchange, symbol: str) -> Optional[dict]:
+async def _get_last_closed_trade_info(exchange, symbol: str, log) -> Optional[dict]:
     try:
         trades = await asyncio.to_thread(exchange.fetch_my_trades, symbol, None, 20)
-    except Exception:
+    except Exception as e:
+        log("ERROR", f"PNL DEBUG fetch_my_trades failed for {symbol}: {e}")
         return None
 
     if not trades:
+        log("INFO", f"PNL DEBUG {symbol}: no trades returned")
         return None
 
     trades = sorted(trades, key=lambda t: int(t.get("timestamp") or 0), reverse=True)
 
-    # DEBUG: show raw fields from the last trades
     for t in trades[:10]:
         info = t.get("info") or {}
 
@@ -149,14 +150,14 @@ async def _get_last_closed_trade_info(exchange, symbol: str) -> Optional[dict]:
             "info_positionSide": info.get("positionSide"),
         }
 
-        print(f"PNL DEBUG {symbol} trade={json.dumps(debug_payload, ensure_ascii=False)}")
+        log("INFO", f"PNL DEBUG {symbol} trade={json.dumps(debug_payload, ensure_ascii=False)}")
 
     best = None
     for t in trades:
         pnl = _extract_trade_pnl(t)
         qty = _extract_trade_qty(t)
 
-        print(f"PNL DEBUG EXTRACT {symbol} id={t.get('id')} pnl={pnl} qty={qty}")
+        log("INFO", f"PNL DEBUG EXTRACT {symbol} id={t.get('id')} pnl={pnl} qty={qty}")
 
         if pnl != 0 and qty > 0:
             best = {
@@ -191,7 +192,12 @@ async def pnl_watcher(app, exchange, log, log_chat_id, interval: int = 3):
                 if not _should_send(symbol):
                     continue
 
-                info = await _get_last_closed_trade_info(exchange, symbol)
+                info = None
+                for _ in range(3):
+                    await asyncio.sleep(1.5)
+                    info = await _get_last_closed_trade_info(exchange, symbol, log)
+                    if info and float(info.get("pnl", 0.0)) != 0.0:
+                        break
 
                 pnl = 0.0
                 qty = prev.get("size", 0.0)
@@ -201,7 +207,6 @@ async def pnl_watcher(app, exchange, log, log_chat_id, interval: int = 3):
                     pnl = float(info["pnl"])
                     qty = info["qty"] or qty
 
-                # don't send fake zero-pnl messages
                 if pnl == 0.0:
                     log("INFO", f"PNL notifier skip: {symbol} pnl=0.0")
                     continue

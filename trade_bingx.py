@@ -83,13 +83,19 @@ def cancel_all_stops_sync(symbol: str, side: str, pos_side: str, kind: str):
                     continue
 
                 # 🔥 розділяємо SL / TP
-                if kind == "sl" and not is_sl_order(o):
-                    continue
+                if kind == "sl":
+                    if not is_sl_order(o):
+                        continue
 
-                if kind == "tp" and not is_tp_order(o):
-                    continue
+                if kind == "tp":
+                    if not is_tp_order(o):
+                        continue
+
                 exchange.cancel_order(o["id"], symbol)
-                print(f"CANCEL {symbol} {o_side} {o_pos_side} id={o['id']}")
+                print(
+                    f"CANCEL kind={kind} symbol={symbol} "
+                    f"type={o.get('type')} side={o_side} posSide={o_pos_side} id={o['id']}"
+                )
 
             except Exception:
                 continue
@@ -981,21 +987,55 @@ def is_sl_order(o):
     t = (o.get("type") or "").lower()
     info = o.get("info") or {}
 
-    return (
-        "stop" in t
-        or info.get("stopPrice") is not None
-    )
+    # явні TP-ознаки -> це не SL
+    if "take" in t or "profit" in t:
+        return False
+
+    if str(info.get("takeProfit") or "").strip():
+        return False
+
+    client_oid = str(
+        info.get("clientOrderId")
+        or info.get("clientOrderID")
+        or ""
+    ).lower()
+
+    if "tp" in client_oid or "take" in client_oid or "profit" in client_oid:
+        return False
+
+    # явні SL-ознаки
+    if "stop" in t and "take" not in t and "profit" not in t:
+        return True
+
+    if str(info.get("stopLoss") or "").strip():
+        return True
+
+    if "sl" in client_oid or "stop" in client_oid:
+        return True
+
+    return False
 
 
 def is_tp_order(o):
     t = (o.get("type") or "").lower()
     info = o.get("info") or {}
 
-    return (
-        "profit" in t
-        or "take" in t
-        or info.get("triggerPrice") is not None
-    )
+    if "take" in t or "profit" in t:
+        return True
+
+    if str(info.get("takeProfit") or "").strip():
+        return True
+
+    client_oid = str(
+        info.get("clientOrderId")
+        or info.get("clientOrderID")
+        or ""
+    ).lower()
+
+    if "tp" in client_oid or "take" in client_oid or "profit" in client_oid:
+        return True
+
+    return False
 
 def _img_to_data_url(path: str) -> str:
     with open(path, "rb") as f:

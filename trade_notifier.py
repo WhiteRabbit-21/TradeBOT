@@ -13,7 +13,7 @@ import requests
 # GLOBAL STATE
 # =========================
 LAST_POSITIONS: Dict[str, dict] = {}
-SENT_CLOSE_CACHE: Dict[str, int] = {}  # symbol -> last sent ts
+SENT_CLOSE_CACHE: Dict[str, int] = {}
 CACHE_TTL_SEC = 30
 
 weekly_pnl = 0.0
@@ -93,6 +93,17 @@ def _format_pnl_message(
     return "\n".join(lines)
 
 
+def _normalize_symbol_for_compare(symbol: str) -> str:
+    return (
+        str(symbol or "")
+        .upper()
+        .replace("/", "-")
+        .replace(":USDT", "")
+        .replace("_", "-")
+        .strip()
+    )
+
+
 # =========================
 # POSITIONS SNAPSHOT
 # =========================
@@ -145,21 +156,14 @@ def bingx_signed_get(path: str, params: dict, api_key: str, api_secret: str):
     return resp.json()
 
 
-def _bingx_income_symbol(symbol: str) -> str:
-    # "SOL/USDT:USDT" -> "SOL-USDT"
-    return symbol.replace("/", "-").replace(":USDT", "")
-
-
 def get_swap_income(
-    symbol: str,
     api_key: str,
     api_secret: str,
     start_ms: int | None = None,
     end_ms: int | None = None,
-    limit: int = 20,
+    limit: int = 50,
 ):
     params = {
-        "symbol": _bingx_income_symbol(symbol),
         "limit": limit,
     }
 
@@ -199,6 +203,7 @@ def _extract_income_symbol(row: dict) -> str:
         row.get("symbol")
         or row.get("market")
         or row.get("currency")
+        or row.get("asset")
         or ""
     )
 
@@ -241,17 +246,16 @@ async def _get_last_income_pnl(
     try:
         start_ms = None
         if close_ts_ms:
-            # беремо вікно перед закриттям, щоб не витягувати занадто старі записи
             start_ms = max(0, close_ts_ms - 10 * 60 * 1000)
 
+        # !!! WITHOUT symbol filter !!!
         resp = await asyncio.to_thread(
             get_swap_income,
-            symbol,
             api_key,
             api_secret,
             start_ms,
             None,
-            20,
+            50,
         )
     except Exception as e:
         log("ERROR", f"PNL DEBUG income request failed for {symbol}: {e}")
@@ -262,23 +266,23 @@ async def _get_last_income_pnl(
         log("INFO", f"PNL DEBUG income empty for {symbol}: {resp}")
         return None
 
-    target_symbol = _bingx_income_symbol(symbol).upper()
+    target_symbol = _normalize_symbol_for_compare(symbol)
 
-    # дебаг останніх рядків
-    for row in rows[:10]:
+    for row in rows[:15]:
         log("INFO", f"PNL DEBUG INCOME {symbol}: {json.dumps(row, ensure_ascii=False)}")
 
     rows = sorted(rows, key=_extract_income_time, reverse=True)
 
     for row in rows:
-        row_symbol = _extract_income_symbol(row).upper()
+        row_symbol_raw = _extract_income_symbol(row)
+        row_symbol = _normalize_symbol_for_compare(row_symbol_raw)
         pnl = _extract_income_value(row)
         income_type = _extract_income_type(row)
         ts = _extract_income_time(row)
 
         log(
             "INFO",
-            f"PNL DEBUG INCOME EXTRACT {symbol} row_symbol={row_symbol} type={income_type} pnl={pnl} ts={ts}",
+            f"PNL DEBUG INCOME EXTRACT target={target_symbol} row_symbol={row_symbol} type={income_type} pnl={pnl} ts={ts}",
         )
 
         if row_symbol and target_symbol not in row_symbol:
@@ -315,7 +319,6 @@ async def pnl_watcher(
         try:
             current_positions = await _fetch_positions_map(exchange)
 
-            # тільки повне закриття: було > 0, стало 0
             just_closed = []
             for symbol, prev in LAST_POSITIONS.items():
                 prev_size = float(prev.get("size", 0.0))
@@ -336,7 +339,7 @@ async def pnl_watcher(
                 income_info = None
                 close_ts_ms = int(time.time() * 1000)
 
-                # BingX може віддати income із затримкою
+                # give BingX time to write income rows
                 for _ in range(4):
                     await asyncio.sleep(1.5)
                     income_info = await _get_last_income_pnl(

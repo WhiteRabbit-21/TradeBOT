@@ -1288,7 +1288,6 @@ async def handle_ai_command(cmd: dict):
 
         try:
             resp = await open_market(symbol, side, qty)
-            log("INFO", f"OPEN RESPONSE: {resp}")
             log("INFO", f"SUCCESS OPEN placed id={resp.get('id')} {base_clean} side={side} qty={qty}")
 
             await asyncio.sleep(0.7)

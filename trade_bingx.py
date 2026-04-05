@@ -299,22 +299,57 @@ def resolve_symbol_sync(base: str) -> Optional[str]:
 async def resolve_symbol(base: str) -> Optional[str]:
     return await asyncio.to_thread(resolve_symbol_sync, base)
 
-def get_usdt_free_sync() -> float:
+def get_usdt_total_sync() -> float:
     ensure_markets_loaded_sync()
     for t in ("swap", "future", "futures", "contract"):
         try:
             bal = exchange.fetch_balance({"type": t})
-            usdt = (bal.get("free") or {}).get("USDT")
-            if usdt is not None:
-                return float(usdt)
+            usdt_total = (bal.get("total") or {}).get("USDT")
+            if usdt_total is not None:
+                return float(usdt_total)
+
+            usdt_free = (bal.get("free") or {}).get("USDT")
+            usdt_used = (bal.get("used") or {}).get("USDT")
+            if usdt_free is not None or usdt_used is not None:
+                return float(usdt_free or 0.0) + float(usdt_used or 0.0)
         except Exception:
             pass
-    bal = exchange.fetch_balance()
-    usdt = (bal.get("free") or {}).get("USDT")
-    return float(usdt or 0.0)
 
-async def get_usdt_free() -> float:
-    return await asyncio.to_thread(get_usdt_free_sync)
+    bal = exchange.fetch_balance()
+    usdt_total = (bal.get("total") or {}).get("USDT")
+    if usdt_total is not None:
+        return float(usdt_total)
+
+    usdt_free = (bal.get("free") or {}).get("USDT")
+    usdt_used = (bal.get("used") or {}).get("USDT")
+    return float(usdt_free or 0.0) + float(usdt_used or 0.0)
+
+async def get_usdt_total() -> float:
+    return await asyncio.to_thread(get_usdt_total_sync)
+
+def normalize_order_qty_sync(symbol: str, qty_raw: float) -> tuple[float, float | None]:
+    ensure_markets_loaded_sync()
+    market = exchange.market(symbol)
+    min_amount = (((market.get("limits") or {}).get("amount") or {}).get("min"))
+
+    try:
+        qty = float(exchange.amount_to_precision(symbol, qty_raw))
+    except Exception:
+        qty = float(qty_raw)
+
+    min_amount_f = None
+    if min_amount is not None:
+        try:
+            min_amount_f = float(min_amount)
+            if qty < min_amount_f:
+                qty = float(exchange.amount_to_precision(symbol, min_amount_f))
+        except Exception:
+            min_amount_f = None
+
+    return qty, min_amount_f
+
+async def normalize_order_qty(symbol: str, qty_raw: float) -> tuple[float, float | None]:
+    return await asyncio.to_thread(normalize_order_qty_sync, symbol, qty_raw)
 
 def set_leverage_sync(symbol: str, lev: int, side: str):
 
@@ -382,8 +417,10 @@ def place_dca_order_sync(symbol: str, side: str, qty: float, price: float):
 def fetch_position_oneway_sync(symbol: str):
 
     try:
-
         positions = exchange.fetch_positions([symbol])
+
+        best = None
+        best_size = 0.0
 
         for p in positions:
             side = (
@@ -393,7 +430,7 @@ def fetch_position_oneway_sync(symbol: str):
                 or ""
             ).lower()
 
-            if side in {"long","short"}:
+            if side in {"long", "short"}:
                 size = float(
                     p.get("contracts")
                     or p.get("size")
@@ -401,10 +438,11 @@ def fetch_position_oneway_sync(symbol: str):
                     or 0
                 )
 
-                if size > 0:
-                    return p
+                if size > best_size:
+                    best_size = size
+                    best = p
 
-        return None
+        return best if best_size > 0 else None
 
     except Exception:
         return None
@@ -827,8 +865,9 @@ async def add_position_oneway(base: str, add_pct: Optional[float]) -> str:
     return await asyncio.to_thread(add_position_oneway_sync, base, add_pct)
 
 
-async def wait_position_update(symbol: str, timeout: float = 5.0) -> bool:
+async def wait_position_update(symbol: str, old_size: float = 0.0, timeout: float = 5.0, min_target_size: Optional[float] = None):
     start = time.time()
+    last_pos = None
 
     while time.time() - start < timeout:
         pos = await fetch_position_oneway(symbol)
@@ -839,12 +878,17 @@ async def wait_position_update(symbol: str, timeout: float = 5.0) -> bool:
                 or pos.get("positionAmt")
                 or 0
             )
-            if abs(size) > 0:
-                return True
+            last_pos = pos
 
-        await asyncio.sleep(0.3)
+            if min_target_size is not None:
+                if size >= min_target_size:
+                    return pos
+            elif abs(size - old_size) > 1e-12:
+                return pos
 
-    return False
+        await asyncio.sleep(0.25)
+
+    return last_pos
 
 
 # =========================
@@ -951,23 +995,43 @@ def normalize_price_from_tail(raw: float, entry: float, side: str, kind: str) ->
 # CLOSE INTENT (safe gate)
 # =========================
 CLOSE_INTENT_PATTERNS = [
-    r"\btp\b",
-    r"\btp\d\b",
-    r"\btake\s+profit\b",
-    r"\btaking\s+profit\b",
-    r"\bclose\b",
-    r"\bclosing\b",
+    r"\bclose\s+now\b",
+    r"\bclose\s+all\b",
+    r"\bfully\s+close\b",
+    r"\bexit\s+now\b",
     r"\bclosed\b",
-    r"\bexit\b",
-    r"\bexiting\b",
-    r"\broe\b",
-    r"\broi\b",
+    r"\bclosing\s+now\b",
+    r"\btp\s*hit\b",
+    r"\btp\d+\s*hit\b",
+    r"\btake\s+profit\s+hit\b",
+    r"\btake\s+profits?\s+hit\b",
+    r"\bbook(?:ing)?\s+profit\b",
+    r"\bsecure(?:d|ing)?\s+profit\b",
+    r"\bclose\s+these\b",
     r"\btp\s+these\b",
 ]
 
+CLOSE_NEGATIVE_PATTERNS = [
+    r"\bexit\s+point\b",
+    r"\bthis\s+will\s+be\s+my\s+exit\b",
+    r"\bwill\s+be\s+my\s+exit\b",
+    r"\bin\s+coming\s+days\b",
+    r"\blikely\s+to\b",
+    r"\bif\s+.+\s+won[’']?t\s+hold\b",
+    r"\bsupport\s+level\b",
+    r"\bresistance\s+level\b",
+    r"\bmarket\s+ranges?\b",
+    r"\btarget\s+area\b",
+    r"\bvaluable\s+point\b",
+    r"\bwe\s+hold\b",
+    r"\bswing\s+shorts?\b",
+]
+
 def has_close_intent(text: str) -> bool:
-    t = (text or "").strip()
+    t = (text or "").strip().lower()
     if not t:
+        return False
+    if any(re.search(p, t, re.I | re.S) for p in CLOSE_NEGATIVE_PATTERNS):
         return False
     return any(re.search(p, t, re.I) for p in CLOSE_INTENT_PATTERNS)
 
@@ -979,7 +1043,12 @@ SET_SL_BLOCK_WORDS = [
     r"\bbe\b", r"\bbreak\s*even\b", r"\bbreakeven\b",
     r"\badd\b", r"\baverag", r"\bdca\b", r"\bscale\s*in\b",
 ]
-TOKEN_ALIASES = {"SOLANA": "SOL"}
+TOKEN_ALIASES = {"SOLANA": "SOL", "XBT": "BTC"}
+BAD_BASE_WORDS = {
+    "ALTCOINS", "ALTCOIN", "ALTS", "SHORTS", "LONGS", "SWINGS",
+    "POSITIONS", "POSITION", "COINS", "MARKET", "FUTURES", "USDT",
+    "TP", "SL", "ENTRY", "EXIT",
+}
 
 def _normalize_base_word(w: str) -> Optional[str]:
     if not w:
@@ -991,6 +1060,8 @@ def _normalize_base_word(w: str) -> Optional[str]:
     b = TOKEN_ALIASES.get(b, b)
     if b.endswith("USDT"):
         b = b[:-4]
+    if b in BAD_BASE_WORDS or len(b) > 12:
+        return None
     return b
 
 
@@ -1014,7 +1085,8 @@ ACTION RULES:
 - If signal contains stop loss / stoploss / SL -> action = SET_SL unless it is clearly a full OPEN signal
 - If signal contains take profit / TP / target update -> action = SET_TP unless it is clearly a full OPEN signal
 - If signal contains break even / breakeven / BE -> action = BE
-- If signal contains close / closing / closed / exit / take profit hit / TP hit -> action = CLOSE
+- Use action = CLOSE ONLY for direct execution commands such as: "close now", "close all", "fully close", "tp hit", "take profit hit", "exit now".
+- Do NOT use CLOSE for market commentary or future plans such as: "exit point", "this will be my exit", "in coming days", "if support won't hold", "we hold swing shorts".
 - Otherwise, if it is a full entry setup -> action = OPEN
 
 EXTRACTION RULES:
@@ -1047,6 +1119,7 @@ CONFIDENCE RULES:
 - Use low confidence only when fields are ambiguous or missing
 - RR may be used only as an extra hint for OPEN setups
 - Do not reduce confidence for ADD / SET_SL / SET_TP / CLOSE just because RR is unavailable
+- Do not treat generic words like altcoins, shorts, market, positions as ticker bases
 
 RR CALCULATION (ONLY when entry/sl/tp are available for OPEN):
 - LONG: RR = (TP - ENTRY) / (ENTRY - SL)
@@ -1281,10 +1354,15 @@ def extract_rr_from_text(text: str) -> Optional[float]:
 
 def _clean_base(x: str) -> str:
     b = str(x).upper().strip()
+    b = re.sub(r"[^A-Z0-9]", "", b)
     b = b.replace("USDT", "")
-    b = b.replace("/", "")
-    b = b.replace(":", "")
     b = TOKEN_ALIASES.get(b, b)
+    if not b:
+        return ""
+    if b in BAD_BASE_WORDS:
+        return ""
+    if len(b) > 12:
+        return ""
     return b
 
 async def handle_ai_command(cmd: dict):
@@ -1338,7 +1416,7 @@ async def handle_ai_command(cmd: dict):
     # -------------------------
     if action == "CLOSE":
         if not has_close_intent(tg_text):
-            log("INFO", "SAFE SKIP CLOSE: no close intent words in text")
+            log("INFO", "SAFE SKIP CLOSE: informational/analysis text, no direct close command")
             return
 
         cleaned: list[str] = []
@@ -1354,7 +1432,7 @@ async def handle_ai_command(cmd: dict):
                     cleaned.append(b2)
 
         if not cleaned:
-            log("INFO", "AI SKIP CLOSE: no bases found")
+            log("INFO", f"AI SKIP CLOSE: no valid bases after cleanup raw={bases if isinstance(bases, list) and bases else ([base] if base else [])}")
             return
 
         log("INFO", f"AI_CLOSE bases={cleaned}")
@@ -1451,10 +1529,12 @@ async def handle_ai_command(cmd: dict):
             return
 
         try:
-            usdt_free = await get_usdt_free()
-            qty_raw = calc_qty(usdt_free, float(risk_pct), int(lev), entry)
-            qty = float(await asyncio.to_thread(exchange.amount_to_precision, symbol, qty_raw))
-            log("INFO", f"QTY USDT free={usdt_free} qty_raw≈{qty_raw} qty_prec={qty}")
+            usdt_total = await get_usdt_total()
+            qty_raw = calc_qty(usdt_total, float(risk_pct), int(lev), entry)
+            qty, min_amount = await normalize_order_qty(symbol, qty_raw)
+            log("INFO", f"QTY USDT total={usdt_total} qty_raw≈{qty_raw} qty_prec={qty} min_amount={min_amount}")
+            if min_amount is not None and qty_raw < min_amount:
+                log("WARNING", f"QTY raised to exchange minimum for {symbol}: raw={qty_raw} -> min={min_amount}")
         except Exception as e:
             log("ERROR", f"balance/qty failed: {e}")
             return
@@ -1480,11 +1560,19 @@ async def handle_ai_command(cmd: dict):
         log("INFO", f"TRY OPEN {symbol} side={side} qty={qty}")
 
         try:
+            old_pos = await fetch_position_oneway(symbol)
+            old_size = float(
+                old_pos.get("contracts")
+                or old_pos.get("size")
+                or old_pos.get("positionAmt")
+                or 0
+            ) if old_pos else 0.0
+
             resp = await open_market(symbol, side, qty)
             log("INFO", f"SUCCESS OPEN placed id={resp.get('id')} {base_clean} side={side} qty={qty}")
 
-            pos_seen = await wait_position_update(symbol, timeout=5.0)
-            log("INFO", f"POSITION_VISIBLE_AFTER_OPEN {base_clean}={pos_seen}")
+            pos_seen = await wait_position_update(symbol, old_size=old_size, timeout=6.0, min_target_size=old_size + qty * 0.7)
+            log("INFO", f"POSITION_VISIBLE_AFTER_OPEN {base_clean}={bool(pos_seen)}")
             await asyncio.sleep(0.5)
 
             LAST_SLTP[base_clean] = {"sl": sl_prec, "tp": tp_prec}
@@ -1555,13 +1643,15 @@ async def handle_ai_command(cmd: dict):
             dca_price = float(dca_price)
 
             try:
-                usdt_free = await get_usdt_free()
+                usdt_total = await get_usdt_total()
                 entry = float((await asyncio.to_thread(exchange.fetch_ticker, symbol))["last"])
 
-                margin = usdt_free * (float(pct) / 100.0)
+                margin = usdt_total * (float(pct) / 100.0)
                 notional = margin * lev
                 qty_raw = notional / entry
-                qty = float(await asyncio.to_thread(exchange.amount_to_precision, symbol, qty_raw))
+                qty, min_amount = await normalize_order_qty(symbol, qty_raw)
+                if min_amount is not None and qty_raw < min_amount:
+                    log("WARNING", f"DCA qty raised to exchange minimum for {symbol}: raw={qty_raw} -> min={min_amount}")
 
                 if DRY_RUN:
                     log("INFO", f"DRY_RUN DCA {base_clean} at {dca_price} qty={qty}")
@@ -1574,31 +1664,35 @@ async def handle_ai_command(cmd: dict):
             return
 
         try:
-            usdt_free = await get_usdt_free()
+            usdt_total = await get_usdt_total()
             pct = float(pct)
-            margin = usdt_free * (pct / 100.0)
+            margin = usdt_total * (pct / 100.0)
             notional = margin * lev
 
             entry = float((await asyncio.to_thread(exchange.fetch_ticker, symbol))["last"])
             qty_raw = notional / entry
-            qty = float(await asyncio.to_thread(exchange.amount_to_precision, symbol, qty_raw))
-
-            market = exchange.market(symbol)
-            min_qty = market.get("limits", {}).get("amount", {}).get("min")
-            if min_qty and qty < min_qty:
-                qty = float(min_qty)
-                log("INFO", f"ADD qty adjusted to min: {qty}")
+            qty, min_amount = await normalize_order_qty(symbol, qty_raw)
+            if min_amount is not None and qty_raw < min_amount:
+                log("WARNING", f"ADD qty raised to exchange minimum for {symbol}: raw={qty_raw} -> min={min_amount}")
 
             if DRY_RUN:
                 log("INFO", f"DRY_RUN ADD {base_clean} qty={qty} (~{pct}% balance)")
                 return
 
+            old_pos = await fetch_position_oneway(symbol)
+            old_size = float(
+                old_pos.get("contracts")
+                or old_pos.get("size")
+                or old_pos.get("positionAmt")
+                or 0
+            ) if old_pos else 0.0
+
             resp = await open_market(symbol, side, qty)
             log("INFO", f"MARKET ADD {base_clean} qty={qty} (~{pct}% balance)")
             log("INFO", f"ADD RESPONSE: {resp}")
 
-            pos_seen = await wait_position_update(symbol, timeout=5.0)
-            log("INFO", f"POSITION_VISIBLE_AFTER_ADD {base_clean}={pos_seen}")
+            pos_seen = await wait_position_update(symbol, old_size=old_size, timeout=6.0, min_target_size=old_size + qty * 0.7)
+            log("INFO", f"POSITION_VISIBLE_AFTER_ADD {base_clean}={bool(pos_seen)}")
             await asyncio.sleep(0.5)
 
             sltp = LAST_SLTP.get(base_clean)
@@ -1762,12 +1856,14 @@ async def place_dca(symbol, side, pct, price, lev):
             log("WARNING", "DCA skipped: price below entry for SHORT")
             return
 
-        usdt_free = await get_usdt_free()
-        margin = usdt_free * (pct / 100)
+        usdt_total = await get_usdt_total()
+        margin = usdt_total * (pct / 100)
         notional = margin * lev
         qty_raw = notional / entry
 
-        qty = float(await asyncio.to_thread(exchange.amount_to_precision, symbol, qty_raw))
+        qty, min_amount = await normalize_order_qty(symbol, qty_raw)
+        if min_amount is not None and qty_raw < min_amount:
+            log("WARNING", f"DCA qty raised to exchange minimum for {symbol}: raw={qty_raw} -> min={min_amount}")
 
         # 🔥 защита от дубля
         orders = await asyncio.to_thread(exchange.fetch_open_orders, symbol)

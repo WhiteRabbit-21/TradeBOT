@@ -4,6 +4,8 @@ import hmac
 import hashlib
 import urllib.parse
 from typing import Any, Dict, Optional
+from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 
 import requests
 
@@ -14,6 +16,9 @@ CACHE_TTL_SEC = 90
 
 weekly_pnl = 0.0
 week_start = time.time()
+weekly_start_equity: Optional[float] = None
+last_weekly_report_key: Optional[str] = None
+KYIV_TZ = ZoneInfo("Europe/Kiev")
 
 
 def _to_float(value: Any, default: float = 0.0) -> float:
@@ -53,6 +58,66 @@ def _extract_entry(pos: dict) -> float:
         or 0
     )
 
+
+def _extract_total_usdt_balance(balance: dict) -> float:
+    if not isinstance(balance, dict):
+        return 0.0
+
+    total_usdt = _to_float((balance.get("total") or {}).get("USDT"), 0.0)
+    if total_usdt > 0:
+        return total_usdt
+
+    free_usdt = _to_float((balance.get("free") or {}).get("USDT"), 0.0)
+    used_usdt = _to_float((balance.get("used") or {}).get("USDT"), 0.0)
+    total = free_usdt + used_usdt
+    if total > 0:
+        return total
+
+    return 0.0
+
+
+async def _get_total_usdt_balance(exchange) -> float:
+    for account_type in ("swap", "future", "futures", "contract"):
+        try:
+            balance = await asyncio.to_thread(exchange.fetch_balance, {"type": account_type})
+            total = _extract_total_usdt_balance(balance)
+            if total > 0:
+                return total
+        except Exception:
+            pass
+
+    try:
+        balance = await asyncio.to_thread(exchange.fetch_balance)
+        return _extract_total_usdt_balance(balance)
+    except Exception:
+        return 0.0
+
+
+
+
+def _week_monday_date(dt: datetime):
+    return (dt - timedelta(days=dt.weekday())).date()
+
+
+def _current_week_key() -> str:
+    now_local = datetime.now(KYIV_TZ)
+    monday = _week_monday_date(now_local)
+    return monday.isoformat()
+
+
+def _should_send_weekly_report_now() -> tuple[bool, str]:
+    now_local = datetime.now(KYIV_TZ)
+    week_key = _current_week_key()
+
+    # Sunday 23:55+ Kyiv time, once per week
+    should_send = (
+        now_local.weekday() == 6
+        and (
+            now_local.hour > 23
+            or (now_local.hour == 23 and now_local.minute >= 55)
+        )
+    )
+    return should_send, week_key
 
 def _should_send(close_key: str) -> bool:
     now = int(time.time())
@@ -426,11 +491,18 @@ async def pnl_watcher(
     api_secret: str,
     interval: int = 3,
 ):
-    global LAST_POSITIONS, weekly_pnl, week_start
+    global LAST_POSITIONS, weekly_pnl, week_start, weekly_start_equity
 
     while True:
         try:
+            if weekly_start_equity is None:
+                weekly_start_equity = await _get_total_usdt_balance(exchange)
+                log("INFO", f"WEEKLY baseline equity set: {weekly_start_equity}")
+
             current_positions = await _fetch_positions_map(exchange)
+
+            if weekly_start_equity is None:
+                weekly_start_equity = await _get_total_usdt_balance(exchange)
 
             just_closed = []
             for symbol, prev in LAST_POSITIONS.items():
@@ -497,20 +569,34 @@ async def pnl_watcher(
 
             LAST_POSITIONS = current_positions
 
-            if time.time() - week_start >= 7 * 24 * 60 * 60:
+            should_send_weekly, week_key = _should_send_weekly_report_now()
+            if should_send_weekly and last_weekly_report_key != week_key:
                 status = "🟢 PROFIT" if weekly_pnl >= 0 else "🔴 LOSS"
+
+                pct_text = "n/a"
+                start_equity = float(weekly_start_equity or 0.0)
+                if start_equity > 0:
+                    weekly_pct = (weekly_pnl / start_equity) * 100.0
+                    pct_text = f"{round(weekly_pct, 2)}%"
+
+                week_end = (datetime.fromisoformat(week_key).date() + timedelta(days=6)).isoformat()
                 report = (
                     "📊 WEEKLY REPORT\n\n"
                     f"{status}\n"
-                    f"Total Net PnL: {round(weekly_pnl, 4)} USDT"
+                    f"Week: {week_key} → {week_end}\n"
+                    f"Total Net PnL: {round(weekly_pnl, 4)} USDT\n"
+                    f"Percent Growth: {pct_text}"
                 )
                 try:
                     await app.send_message(log_chat_id, report)
+                    last_weekly_report_key = week_key
                 except Exception as e:
                     log("ERROR", f"Weekly report send failed: {e}")
 
                 weekly_pnl = 0.0
                 week_start = time.time()
+                weekly_start_equity = await _get_total_usdt_balance(exchange)
+                log("INFO", f"NEW weekly baseline equity: {weekly_start_equity}")
 
         except Exception as e:
             log("ERROR", f"PNL watcher error: {e}")

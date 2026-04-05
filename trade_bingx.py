@@ -566,18 +566,18 @@ def _bingx_raw_request_sync(method: str, path: str, params: dict) -> dict:
         "Content-Type": "application/x-www-form-urlencoded",
     }
 
-    log("INFO", f"RAW HTTP {method.upper()} {path} payload={payload}")
+    log("DEBUG", f"RAW HTTP {method.upper()} {path} payload={payload}")
     resp = requests.request(method.upper(), url, headers=headers, timeout=5)
-    log("INFO", f"RAW HTTP DONE status={resp.status_code} path={path}")
+    log("DEBUG", f"RAW HTTP DONE status={resp.status_code} path={path}")
     body_text = resp.text
-    log("INFO", f"RAW HTTP RESPONSE TEXT: {body_text[:1000]}")
+    log("DEBUG", f"RAW HTTP RESPONSE TEXT: {body_text[:1000]}")
 
     try:
         data = resp.json()
     except Exception:
         raise RuntimeError(f"BingX RAW {method} {path} bad json: {body_text[:500]}")
 
-    log("INFO", f"RAW HTTP RESPONSE JSON: {data}")
+    log("DEBUG", f"RAW HTTP RESPONSE JSON: {data}")
 
     code = str(data.get("code", ""))
     success = data.get("success")
@@ -723,14 +723,14 @@ def set_sl_oneway_sync(base: str, sl_price: float) -> str:
         cancel_order_exact_sync(symbol, old_id)
 
     resp = _place_bingx_tpsl_raw_sync(symbol, pos_side, sl_prec, contracts, "sl")
-    log("INFO", f"SET_SL raw response={resp}")
+    log("DEBUG", f"SET_SL raw response={resp}")
 
     new_id = _extract_bingx_order_id(resp)
     LAST_ORDER_IDS.setdefault(key, {})
     LAST_ORDER_IDS[key]["sl_id"] = new_id
     save_order_ids()
 
-    log("INFO", f"SL_SET_RAW success symbol={symbol} pos_side={pos_side} sl={sl_prec} order_id={new_id} raw={resp}")
+    log("INFO", f"SL_SET_RAW success symbol={symbol} pos_side={pos_side} sl={sl_prec} order_id={new_id}")
     return f"SL_SET_RAW id={new_id} sl={sl_prec}"
 
 async def set_sl_oneway(base: str, sl_price: float) -> str:
@@ -777,14 +777,14 @@ def set_tp_oneway_sync(base: str, tp_price: float) -> str:
         cancel_order_exact_sync(symbol, old_id)
 
     resp = _place_bingx_tpsl_raw_sync(symbol, pos_side, tp_prec, contracts, "tp")
-    log("INFO", f"SET_TP raw response={resp}")
+    log("DEBUG", f"SET_TP raw response={resp}")
 
     new_id = _extract_bingx_order_id(resp)
     LAST_ORDER_IDS.setdefault(key, {})
     LAST_ORDER_IDS[key]["tp_id"] = new_id
     save_order_ids()
 
-    log("INFO", f"TP_SET_RAW success symbol={symbol} pos_side={pos_side} tp={tp_prec} order_id={new_id} raw={resp}")
+    log("INFO", f"TP_SET_RAW success symbol={symbol} pos_side={pos_side} tp={tp_prec} order_id={new_id}")
     return f"TP_SET_RAW id={new_id} tp={tp_prec}"
 
 async def set_tp_oneway(base: str, tp_price: float) -> str:
@@ -1585,14 +1585,14 @@ async def handle_ai_command(cmd: dict):
                 try:
                     log("INFO", f"REAPPLY SL start {base_clean} sl={sltp.get('sl')}")
                     sl_res = await set_sl_oneway(base_clean, sltp["sl"])
-                    log("INFO", f"REAPPLY SL done {base_clean}: {sl_res}")
+                    log("DEBUG", f"REAPPLY SL done {base_clean}: {sl_res}")
                 except Exception as e:
                     log("WARNING", f"SL reset failed: {e}")
 
                 try:
-                    log("INFO", f"REAPPLY TP start {base_clean} tp={sltp.get('tp')}")
+                    log("DEBUG", f"REAPPLY TP start {base_clean} tp={sltp.get('tp')}")
                     tp_res = await set_tp_oneway(base_clean, sltp["tp"])
-                    log("INFO", f"REAPPLY TP done {base_clean}: {tp_res}")
+                    log("DEBUG", f"REAPPLY TP done {base_clean}: {tp_res}")
                 except Exception as e:
                     log("WARNING", f"TP reset failed: {e}")
             else:
@@ -1702,14 +1702,14 @@ async def handle_ai_command(cmd: dict):
                 try:
                     log("INFO", f"REAPPLY SL start {base_clean} sl={sltp.get('sl')}")
                     sl_res = await set_sl_oneway(base_clean, sltp["sl"])
-                    log("INFO", f"REAPPLY SL done {base_clean}: {sl_res}")
+                    log("DEBUG", f"REAPPLY SL done {base_clean}: {sl_res}")
                 except Exception as e:
                     log("WARNING", f"SL reset failed: {e}")
 
                 try:
-                    log("INFO", f"REAPPLY TP start {base_clean} tp={sltp.get('tp')}")
+                    log("DEBUG", f"REAPPLY TP start {base_clean} tp={sltp.get('tp')}")
                     tp_res = await set_tp_oneway(base_clean, sltp["tp"])
-                    log("INFO", f"REAPPLY TP done {base_clean}: {tp_res}")
+                    log("DEBUG", f"REAPPLY TP done {base_clean}: {tp_res}")
                 except Exception as e:
                     log("WARNING", f"TP reset failed: {e}")
             return

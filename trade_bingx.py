@@ -1104,8 +1104,9 @@ EXTRACTION RULES:
   - TP at 3R -> rr=3
   - Target 2R -> rr=2
 - If TP is expressed only as RR, set "tp": null and fill "rr"
-- DCA_PRICE: if ADD includes a specific price/zone, extract it
-- PRICE: if signal explicitly provides an add/limit price, extract it
+- DCA_PRICE: extract only when the ADD message explicitly means a pending limit add, not informational fields
+- PRICE: extract only when the message explicitly provides a pending add/limit price
+- Ignore informational fields such as "new open", "new entry", "average entry", "avg entry", "current entry" for ADD
 - ENTRY may be missing and that is acceptable
 
 DCA RULES:
@@ -1631,7 +1632,8 @@ async def handle_ai_command(cmd: dict):
             log("INFO", "ADD skip: no pct")
             return
 
-        mode = detect_add_mode(cmd)
+        cmd = sanitize_add_prices(cmd, tg_text)
+        mode = detect_add_mode(cmd, tg_text)
         log("INFO", f"ADD MODE = {mode}")
 
         if mode == "DCA":
@@ -1643,22 +1645,21 @@ async def handle_ai_command(cmd: dict):
             dca_price = float(dca_price)
 
             try:
-                usdt_total = await get_usdt_total()
-                entry = float((await asyncio.to_thread(exchange.fetch_ticker, symbol))["last"])
-
-                margin = usdt_total * (float(pct) / 100.0)
-                notional = margin * lev
-                qty_raw = notional / entry
-                qty, min_amount = await normalize_order_qty(symbol, qty_raw)
-                if min_amount is not None and qty_raw < min_amount:
-                    log("WARNING", f"DCA qty raised to exchange minimum for {symbol}: raw={qty_raw} -> min={min_amount}")
-
                 if DRY_RUN:
+                    usdt_total = await get_usdt_total()
+                    entry = float((await asyncio.to_thread(exchange.fetch_ticker, symbol))["last"])
+                    margin = usdt_total * (float(pct) / 100.0)
+                    notional = margin * lev
+                    qty_raw = notional / entry
+                    qty, _ = await normalize_order_qty(symbol, qty_raw)
                     log("INFO", f"DRY_RUN DCA {base_clean} at {dca_price} qty={qty}")
                     return
 
-                await place_dca(symbol, side, float(pct), dca_price, lev)
-                log("INFO", f"DCA placed {base_clean} at {dca_price} qty={qty}")
+                dca_res = await place_dca(symbol, side, float(pct), dca_price, lev)
+                if dca_res.get("ok"):
+                    log("INFO", f"DCA placed {base_clean} at {dca_res['price']} qty={dca_res['qty']}")
+                else:
+                    log("INFO", f"DCA not placed {base_clean}: {dca_res.get('reason')}")
             except Exception as e:
                 log("ERROR", f"DCA failed: {e}")
             return
@@ -1826,67 +1827,81 @@ async def handle_ai_command(cmd: dict):
 
     log("INFO", f"Unknown/unsupported action: {action}")
 
-def detect_add_mode(cmd: dict) -> str:
+def detect_add_mode(cmd: dict, tg_text: str = "") -> str:
     """
     return:
-    - "DCA"
-    - "MARKET"
+    - "DCA"     -> only for explicit limit/pending add intent
+    - "MARKET"  -> default add by current market price
     """
+    t = (tg_text or "").strip().lower()
 
-    # 🔥 якщо є явний dca_price → це DCA
-    if cmd.get("dca_price"):
-        return "DCA"
-
-    # 🔥 якщо є price → теж DCA
-    if cmd.get("price"):
+    if re.search(r"\b(dca at|buy limit|sell limit|pending|set buy|set sell|limit add|limit dca)\b", t, re.I):
         return "DCA"
 
     return "MARKET"
 
+
+def sanitize_add_prices(cmd: dict, tg_text: str) -> dict:
+    """
+    'New Open', 'New Entry', 'Avg Entry' etc are informational only.
+    They must not turn a normal ADD into a DCA.
+    """
+    t = (tg_text or "").lower()
+
+    has_info_entry_text = re.search(
+        r"\b(new open|new entry|avg entry|average entry|current entry)\b",
+        t,
+        re.I,
+    )
+
+    has_real_dca_intent = re.search(
+        r"\b(dca at|buy limit|sell limit|pending|set buy|set sell|limit add|limit dca)\b",
+        t,
+        re.I,
+    )
+
+    if has_info_entry_text and not has_real_dca_intent:
+        cmd["price"] = None
+        cmd["dca_price"] = None
+
+    return cmd
+
+
 async def place_dca(symbol, side, pct, price, lev):
-
     try:
-        entry = float((await asyncio.to_thread(exchange.fetch_ticker, symbol))["last"])
-
-        if side == "long" and price >= entry:
-            log("WARNING", "DCA skipped: price above entry for LONG")
-            return
-
-        if side == "short" and price <= entry:
-            log("WARNING", "DCA skipped: price below entry for SHORT")
-            return
+        market_last = float((await asyncio.to_thread(exchange.fetch_ticker, symbol))["last"])
+        log("INFO", f"DCA CHECK {symbol} side={side} market_last={market_last} order_price={price}")
 
         usdt_total = await get_usdt_total()
         margin = usdt_total * (pct / 100)
         notional = margin * lev
-        qty_raw = notional / entry
+        qty_raw = notional / market_last
 
         qty, min_amount = await normalize_order_qty(symbol, qty_raw)
         if min_amount is not None and qty_raw < min_amount:
             log("WARNING", f"DCA qty raised to exchange minimum for {symbol}: raw={qty_raw} -> min={min_amount}")
 
-        # 🔥 защита от дубля
         orders = await asyncio.to_thread(exchange.fetch_open_orders, symbol)
-
         for o in orders:
             o_price = float(o.get("price") or 0)
-
-            if abs(o_price - float(price)) / float(price) < 0.001:
+            if float(price) > 0 and o_price > 0 and abs(o_price - float(price)) / float(price) < 0.001:
                 log("INFO", "DCA already exists (approx match)")
-                return
+                return {"ok": False, "reason": "already_exists"}
 
-        await asyncio.to_thread(
+        resp = await asyncio.to_thread(
             place_dca_order_sync,
             symbol,
             side,
             qty,
-            price
+            float(price)
         )
 
         log("INFO", f"DCA placed {symbol} {side} price={price} qty={qty}")
+        return {"ok": True, "qty": qty, "price": float(price), "order_id": resp.get("id")}
 
     except Exception as e:
         log("ERROR", f"DCA failed: {e}")
+        return {"ok": False, "reason": str(e)}
 
 # =========================
 # MEDIA GROUP / CLOSE BUNDLE (async)

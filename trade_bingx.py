@@ -454,6 +454,7 @@ async def fetch_position_oneway(symbol: str):
         symbol
     )    
 
+
 def close_position_full_sync(base: str):
     symbol = resolve_symbol_sync(base)
 
@@ -506,7 +507,19 @@ def close_position_full_sync(base: str):
     if not closed:
         return "NO_POSITION"
 
-    return f"CLOSED {'/'.join(closed)}"
+    time.sleep(0.8)
+
+    canceled_total = 0
+    for side in closed:
+        try:
+            canceled_total += cancel_all_open_orders_for_symbol_sync(symbol, side)
+        except Exception as e:
+            log("WARNING", f"cancel_all_open_orders after close failed for {symbol}/{side}: {e}")
+
+    _clear_symbol_state(base)
+
+    log("INFO", f"CLOSE cleanup done symbol={symbol} canceled_orders={canceled_total}")
+    return f"CLOSED {'/'.join(closed)} | canceled={canceled_total}"
 
 
 async def close_position_full(base: str):
@@ -626,6 +639,62 @@ def _extract_bingx_order_id(data: dict):
     except Exception:
         return None
 
+def _state_key(base: str, pos_side: str) -> str:
+    return f"{str(base).upper()}:{str(pos_side).lower()}"
+
+def _extract_position_side_sync(pos: dict) -> str:
+    return str(
+        pos.get("side")
+        or pos.get("positionSide")
+        or (pos.get("info") or {}).get("positionSide")
+        or ""
+    ).lower()
+
+def _extract_position_qty_sync(pos: dict, symbol: str) -> float:
+    qty = float(abs(
+        pos.get("contracts")
+        or pos.get("size")
+        or pos.get("positionAmt")
+        or 0
+    ))
+    return float(exchange.amount_to_precision(symbol, qty))
+
+def _load_saved_sltp_for_position(base: str, pos_side: str) -> dict:
+    return ((LAST_SLTP.get(str(base).upper()) or {}).get(pos_side) or {}).copy()
+
+def _store_sltp_state(base: str, pos_side: str, sl=None, tp=None, sl_id=None, tp_id=None):
+    base_u = str(base).upper()
+    key = _state_key(base_u, pos_side)
+
+    LAST_SLTP.setdefault(base_u, {})
+    LAST_SLTP[base_u].setdefault(pos_side, {"sl": None, "tp": None})
+
+    if sl is not None:
+        LAST_SLTP[base_u][pos_side]["sl"] = sl
+    if tp is not None:
+        LAST_SLTP[base_u][pos_side]["tp"] = tp
+
+    LAST_ORDER_IDS.setdefault(key, {})
+    if sl_id is not None:
+        LAST_ORDER_IDS[key]["sl_id"] = sl_id
+    if tp_id is not None:
+        LAST_ORDER_IDS[key]["tp_id"] = tp_id
+
+    save_sltp()
+    save_order_ids()
+
+def _clear_symbol_state(base: str):
+    base_u = str(base).upper()
+
+    if base_u in LAST_SLTP:
+        del LAST_SLTP[base_u]
+        save_sltp()
+
+    for k in list(LAST_ORDER_IDS.keys()):
+        if k.startswith(f"{base_u}:"):
+            del LAST_ORDER_IDS[k]
+    save_order_ids()
+
 def cancel_order_exact_sync(symbol: str, order_id: str) -> bool:
     if not order_id:
         return False
@@ -640,50 +709,80 @@ def cancel_order_exact_sync(symbol: str, order_id: str) -> bool:
 async def cancel_order_exact(symbol: str, order_id: str) -> bool:
     return await asyncio.to_thread(cancel_order_exact_sync, symbol, order_id)
 
-def cancel_order_safe_sync(symbol: str, order_id: str) -> bool:
-    try:
-        exchange.cancel_order(order_id, symbol)
-        return True
-    except Exception:
-        return False
+def cancel_all_open_orders_for_symbol_sync(symbol: str, pos_side: Optional[str] = None) -> int:
+    canceled = 0
 
-def find_and_cancel_existing_stop_sync(symbol: str, want_side: str) -> Optional[str]:
     try:
         orders = exchange.fetch_open_orders(symbol)
-    except Exception:
-        return None
-
-    best = None
-    best_score = -1
+    except Exception as e:
+        log("WARNING", f"fetch_open_orders failed for {symbol}: {e}")
+        return 0
 
     for o in orders:
         try:
-            o_side = (o.get("side") or "").lower()
-            if o_side != want_side:
-                continue
-            if not _looks_like_stop(o):
+            info = o.get("info") or {}
+            oid = o.get("id")
+            if not oid:
                 continue
 
+            if pos_side:
+                o_pos_side = str(info.get("positionSide") or "").lower()
+                if o_pos_side and o_pos_side != pos_side.lower():
+                    continue
+
+            exchange.cancel_order(str(oid), symbol)
+            canceled += 1
+            log("INFO", f"CANCEL OPEN ORDER symbol={symbol} id={oid} type={o.get('type')} side={o.get('side')}")
+        except Exception as e:
+            log("WARNING", f"CANCEL OPEN ORDER failed symbol={symbol} id={o.get('id')}: {e}")
+
+    return canceled
+
+async def cancel_all_open_orders_for_symbol(symbol: str, pos_side: Optional[str] = None) -> int:
+    return await asyncio.to_thread(cancel_all_open_orders_for_symbol_sync, symbol, pos_side)
+
+def _cancel_known_order_ids_sync(symbol: str, key: str):
+    saved = LAST_ORDER_IDS.get(key) or {}
+
+    sl_id = saved.get("sl_id")
+    tp_id = saved.get("tp_id")
+
+    if sl_id:
+        cancel_order_exact_sync(symbol, sl_id)
+    if tp_id:
+        cancel_order_exact_sync(symbol, tp_id)
+
+    LAST_ORDER_IDS[key] = {}
+    save_order_ids()
+
+def _cancel_existing_sltp_sync(symbol: str, pos_side: str):
+    try:
+        orders = exchange.fetch_open_orders(symbol)
+    except Exception as e:
+        log("WARNING", f"fetch_open_orders failed for cancel_existing_sltp: {e}")
+        return
+
+    for o in orders:
+        try:
             info = o.get("info") or {}
-            reduce_only = bool(o.get("reduceOnly") or info.get("reduceOnly") or False)
-            score = 2 if reduce_only else 1
-            if score > best_score:
-                best = o
-                best_score = score
+            o_pos_side = str(info.get("positionSide") or "").lower()
+            if o_pos_side and o_pos_side != pos_side.lower():
+                continue
+
+            if is_sl_order(o) or is_tp_order(o):
+                oid = o.get("id")
+                if oid:
+                    try:
+                        exchange.cancel_order(str(oid), symbol)
+                        log("INFO", f"CANCEL existing SLTP symbol={symbol} pos_side={pos_side} id={oid} type={o.get('type')}")
+                    except Exception as e:
+                        log("WARNING", f"CANCEL existing failed symbol={symbol} id={oid}: {e}")
         except Exception:
             continue
 
-    if not best or not best.get("id"):
-        return None
+def apply_sltp_sync(base: str, *, sl_price=None, tp_price=None, cancel_first: bool = True) -> str:
+    base = str(base).upper().strip()
 
-    oid = best["id"]
-    return oid if cancel_order_safe_sync(symbol, oid) else None
-
-async def find_and_cancel_existing_stop(symbol: str, want_side: str) -> Optional[str]:
-    return await asyncio.to_thread(find_and_cancel_existing_stop_sync, symbol, want_side)
-
-def set_sl_oneway_sync(base: str, sl_price: float) -> str:
-    log("INFO", f"SET_SL start base={base} sl={sl_price}")
     symbol = resolve_symbol_sync(base)
     if not symbol:
         raise RuntimeError(f"Symbol not found: {base}")
@@ -692,52 +791,107 @@ def set_sl_oneway_sync(base: str, sl_price: float) -> str:
     if not pos:
         return "NO_POSITION"
 
-    pos_side = (
-        pos.get("side")
-        or pos.get("positionSide")
-        or (pos.get("info") or {}).get("positionSide")
-        or ""
-    ).lower()
-
+    pos_side = _extract_position_side_sync(pos)
     if pos_side not in {"long", "short"}:
         return "NO_POSITION"
 
-    contracts = float(abs(pos.get("contracts") or pos.get("size") or pos.get("positionAmt") or 0))
-    contracts = float(exchange.amount_to_precision(symbol, contracts))
-    if contracts <= 0:
+    qty = _extract_position_qty_sync(pos, symbol)
+    if qty <= 0:
         return "NO_POSITION"
 
-    stop_side = "sell" if pos_side == "long" else "buy"
+    key = _state_key(base, pos_side)
 
-    try:
-        sl_prec = float(exchange.price_to_precision(symbol, float(sl_price)))
-    except Exception:
-        sl_prec = float(sl_price)
+    if cancel_first:
+        _cancel_known_order_ids_sync(symbol, key)
+        _cancel_existing_sltp_sync(symbol, pos_side)
+        time.sleep(0.25)
 
-    log("INFO", f"SET_SL prepared symbol={symbol} pos_side={pos_side} stop_side={stop_side} qty={contracts} sl_prec={sl_prec}")
+    result_parts = []
 
-    key = f"{str(base).upper()}:{pos_side}"
-    old_id = ((LAST_ORDER_IDS.get(key) or {}).get("sl_id"))
-    if old_id:
-        log("INFO", f"SET_SL cancel exact old sl id={old_id}")
-        cancel_order_exact_sync(symbol, old_id)
+    if sl_price is not None:
+        try:
+            sl_prec = float(exchange.price_to_precision(symbol, float(sl_price)))
+        except Exception:
+            sl_prec = float(sl_price)
 
-    resp = _place_bingx_tpsl_raw_sync(symbol, pos_side, sl_prec, contracts, "sl")
-    log("DEBUG", f"SET_SL raw response={resp}")
+        sl_resp = _place_bingx_tpsl_raw_sync(symbol, pos_side, sl_prec, qty, "sl")
+        sl_id = _extract_bingx_order_id(sl_resp)
+        _store_sltp_state(base, pos_side, sl=sl_prec, sl_id=sl_id)
+        result_parts.append(f"SL={sl_prec}")
+        log("INFO", f"SL APPLIED symbol={symbol} pos_side={pos_side} qty={qty} sl={sl_prec} id={sl_id}")
 
-    new_id = _extract_bingx_order_id(resp)
-    LAST_ORDER_IDS.setdefault(key, {})
-    LAST_ORDER_IDS[key]["sl_id"] = new_id
-    save_order_ids()
+    if tp_price is not None:
+        try:
+            tp_prec = float(exchange.price_to_precision(symbol, float(tp_price)))
+        except Exception:
+            tp_prec = float(tp_price)
 
-    log("INFO", f"SL_SET_RAW success symbol={symbol} pos_side={pos_side} sl={sl_prec} order_id={new_id}")
-    return f"SL_SET_RAW id={new_id} sl={sl_prec}"
+        tp_resp = _place_bingx_tpsl_raw_sync(symbol, pos_side, tp_prec, qty, "tp")
+        tp_id = _extract_bingx_order_id(tp_resp)
+        _store_sltp_state(base, pos_side, tp=tp_prec, tp_id=tp_id)
+        result_parts.append(f"TP={tp_prec}")
+        log("INFO", f"TP APPLIED symbol={symbol} pos_side={pos_side} qty={qty} tp={tp_prec} id={tp_id}")
+
+    if not result_parts:
+        return "NOTHING_TO_APPLY"
+
+    return " | ".join(result_parts)
+
+async def apply_sltp(base: str, *, sl_price=None, tp_price=None, cancel_first: bool = True) -> str:
+    return await asyncio.to_thread(
+        apply_sltp_sync,
+        base,
+        sl_price=sl_price,
+        tp_price=tp_price,
+        cancel_first=cancel_first,
+    )
+
+def reapply_saved_sltp_sync(base: str) -> str:
+    base = str(base).upper().strip()
+
+    symbol = resolve_symbol_sync(base)
+    if not symbol:
+        raise RuntimeError(f"Symbol not found: {base}")
+
+    pos = fetch_position_oneway_sync(symbol)
+    if not pos:
+        return "NO_POSITION"
+
+    pos_side = _extract_position_side_sync(pos)
+    if pos_side not in {"long", "short"}:
+        return "NO_POSITION"
+
+    saved = _load_saved_sltp_for_position(base, pos_side)
+    sl = saved.get("sl")
+    tp = saved.get("tp")
+
+    if sl is None and tp is None:
+        return "NO_SAVED_SLTP"
+
+    return apply_sltp_sync(base, sl_price=sl, tp_price=tp, cancel_first=True)
+
+async def reapply_saved_sltp(base: str) -> str:
+    return await asyncio.to_thread(reapply_saved_sltp_sync, base)
+
+def set_sl_oneway_sync(base: str, sl_price: float) -> str:
+    symbol = resolve_symbol_sync(base)
+    if not symbol:
+        raise RuntimeError(f"Symbol not found: {base}")
+
+    pos = fetch_position_oneway_sync(symbol)
+    if not pos:
+        return "NO_POSITION"
+
+    pos_side = _extract_position_side_sync(pos)
+    saved = _load_saved_sltp_for_position(str(base).upper(), pos_side)
+    tp_saved = saved.get("tp")
+
+    return apply_sltp_sync(base, sl_price=sl_price, tp_price=tp_saved, cancel_first=True)
 
 async def set_sl_oneway(base: str, sl_price: float) -> str:
     return await asyncio.to_thread(set_sl_oneway_sync, base, sl_price)
 
 def set_tp_oneway_sync(base: str, tp_price: float) -> str:
-    log("INFO", f"SET_TP start base={base} tp={tp_price}")
     symbol = resolve_symbol_sync(base)
     if not symbol:
         raise RuntimeError(f"Symbol not found: {base}")
@@ -746,46 +900,11 @@ def set_tp_oneway_sync(base: str, tp_price: float) -> str:
     if not pos:
         return "NO_POSITION"
 
-    pos_side = (
-        pos.get("side")
-        or pos.get("positionSide")
-        or (pos.get("info") or {}).get("positionSide")
-        or ""
-    ).lower()
+    pos_side = _extract_position_side_sync(pos)
+    saved = _load_saved_sltp_for_position(str(base).upper(), pos_side)
+    sl_saved = saved.get("sl")
 
-    if pos_side not in {"long", "short"}:
-        return "NO_POSITION"
-
-    contracts = float(abs(pos.get("contracts") or pos.get("size") or pos.get("positionAmt") or 0))
-    contracts = float(exchange.amount_to_precision(symbol, contracts))
-    if contracts <= 0:
-        return "NO_POSITION"
-
-    close_side = "sell" if pos_side == "long" else "buy"
-
-    try:
-        tp_prec = float(exchange.price_to_precision(symbol, float(tp_price)))
-    except Exception:
-        tp_prec = float(tp_price)
-
-    log("INFO", f"SET_TP prepared symbol={symbol} pos_side={pos_side} close_side={close_side} qty={contracts} tp_prec={tp_prec}")
-
-    key = f"{str(base).upper()}:{pos_side}"
-    old_id = ((LAST_ORDER_IDS.get(key) or {}).get("tp_id"))
-    if old_id:
-        log("INFO", f"SET_TP cancel exact old tp id={old_id}")
-        cancel_order_exact_sync(symbol, old_id)
-
-    resp = _place_bingx_tpsl_raw_sync(symbol, pos_side, tp_prec, contracts, "tp")
-    log("DEBUG", f"SET_TP raw response={resp}")
-
-    new_id = _extract_bingx_order_id(resp)
-    LAST_ORDER_IDS.setdefault(key, {})
-    LAST_ORDER_IDS[key]["tp_id"] = new_id
-    save_order_ids()
-
-    log("INFO", f"TP_SET_RAW success symbol={symbol} pos_side={pos_side} tp={tp_prec} order_id={new_id}")
-    return f"TP_SET_RAW id={new_id} tp={tp_prec}"
+    return apply_sltp_sync(base, sl_price=sl_saved, tp_price=tp_price, cancel_first=True)
 
 async def set_tp_oneway(base: str, tp_price: float) -> str:
     return await asyncio.to_thread(set_tp_oneway_sync, base, tp_price)
@@ -803,8 +922,11 @@ def breakeven_oneway_sync(base: str) -> str:
     if entry is None:
         return "NO_ENTRY_PRICE"
 
-    # set_sl_oneway скасує старий SL
-    return set_sl_oneway_sync(base, float(entry))
+    pos_side = _extract_position_side_sync(pos)
+    saved = _load_saved_sltp_for_position(str(base).upper(), pos_side)
+    tp_saved = saved.get("tp")
+
+    return apply_sltp_sync(base, sl_price=float(entry), tp_price=tp_saved, cancel_first=True)
 
 async def breakeven_oneway(base: str) -> str:
     return await asyncio.to_thread(breakeven_oneway_sync, base)
@@ -818,21 +940,11 @@ def add_position_oneway_sync(base: str, add_pct: Optional[float]) -> str:
     if not pos:
         return "NO_POSITION"
 
-    pos_side = (pos.get("side") or "").lower()
+    pos_side = _extract_position_side_sync(pos)
     if pos_side not in {"long", "short"}:
         return "NO_POSITION"
 
-    contracts = float(
-    abs(
-        pos.get("contracts")
-        or pos.get("size")
-        or pos.get("positionAmt")
-        or 0
-    )
-)
-
-    contracts = float(exchange.amount_to_precision(symbol, contracts))
-
+    contracts = _extract_position_qty_sync(pos, symbol)
     if contracts <= 0:
         return "NO_POSITION"
 
@@ -850,15 +962,15 @@ def add_position_oneway_sync(base: str, add_pct: Optional[float]) -> str:
         return "ADD_QTY_ZERO"
 
     resp = exchange.create_order(
-    symbol,
-    "market",
-    "buy" if pos_side == "long" else "sell",
-    add_qty,
-    None,
-    {
-        "positionSide": "LONG" if pos_side == "long" else "SHORT",
-    }
-)
+        symbol,
+        "market",
+        "buy" if pos_side == "long" else "sell",
+        add_qty,
+        None,
+        {
+            "positionSide": "LONG" if pos_side == "long" else "SHORT",
+        }
+    )
     return f"ADDED id={resp.get('id')} qty={add_qty} pct={pct}"
 
 async def add_position_oneway(base: str, add_pct: Optional[float]) -> str:
@@ -1366,6 +1478,7 @@ def _clean_base(x: str) -> str:
         return ""
     return b
 
+
 async def handle_ai_command(cmd: dict):
     action = (cmd.get("action") or "NONE").upper()
     conf = float(cmd.get("confidence") or 0.0)
@@ -1383,9 +1496,6 @@ async def handle_ai_command(cmd: dict):
 
     log("INFO", f"AI action={action} conf={conf} base={base} side={side} lev={lev} risk={risk_pct} sl={sl} tp={tp} add_pct={add_pct}")
 
-    # -------------------------
-    # TEXT-BASED FORCE FIXES
-    # -------------------------
     if action in {"NONE", "OPEN"} and _has_add_intent_text(tg_text):
         if base and (add_pct is not None or risk_pct is not None):
             log("WARNING", "FORCE FIX: OPEN/NONE -> ADD by text rule")
@@ -1397,10 +1507,6 @@ async def handle_ai_command(cmd: dict):
 
     min_conf = ACTION_MIN_CONF.get(action, 0.70)
 
-    # -------------------------
-    # CONFIDENCE GATE
-    # -------------------------
-    # Для ADD опираємось на структуру, а не на self-reported confidence.
     if action == "ADD":
         if not base:
             log("INFO", "AI SKIP ADD: base missing")
@@ -1412,9 +1518,6 @@ async def handle_ai_command(cmd: dict):
         log("INFO", f"AI SKIP: low confidence {conf} < {min_conf} for action={action}")
         return
 
-    # -------------------------
-    # CLOSE
-    # -------------------------
     if action == "CLOSE":
         if not has_close_intent(tg_text):
             log("INFO", "SAFE SKIP CLOSE: informational/analysis text, no direct close command")
@@ -1451,18 +1554,11 @@ async def handle_ai_command(cmd: dict):
 
             try:
                 res = await close_position_full(b)
-                if b in LAST_SLTP:
-                    del LAST_SLTP[b]
-                    save_sltp()
-                log("INFO", f"SLTP cleared for {b}")
                 log("INFO", f"SUCCESS CLOSE {b}: {res}")
             except Exception as e:
                 log("ERROR", f"CLOSE {b} failed: {e}")
         return
 
-    # -------------------------
-    # OPEN
-    # -------------------------
     if action == "OPEN":
         if not base:
             log("INFO", "AI SKIP OPEN: base missing")
@@ -1572,31 +1668,21 @@ async def handle_ai_command(cmd: dict):
             resp = await open_market(symbol, side, qty)
             log("INFO", f"SUCCESS OPEN placed id={resp.get('id')} {base_clean} side={side} qty={qty}")
 
-            pos_seen = await wait_position_update(symbol, old_size=old_size, timeout=6.0, min_target_size=old_size + qty * 0.7)
+            pos_seen = await wait_position_update(
+                symbol,
+                old_size=old_size,
+                timeout=6.0,
+                min_target_size=old_size + qty * 0.7,
+            )
             log("INFO", f"POSITION_VISIBLE_AFTER_OPEN {base_clean}={bool(pos_seen)}")
-            await asyncio.sleep(0.5)
+            await asyncio.sleep(0.7)
 
-            LAST_SLTP[base_clean] = {"sl": sl_prec, "tp": tp_prec}
+            LAST_SLTP.setdefault(base_clean, {})
+            LAST_SLTP[base_clean][side] = {"sl": sl_prec, "tp": tp_prec}
             save_sltp()
 
-            sltp = LAST_SLTP.get(base_clean)
-            if sltp:
-                log("INFO", f"Reapplying SL/TP for {base_clean}")
-                try:
-                    log("INFO", f"REAPPLY SL start {base_clean} sl={sltp.get('sl')}")
-                    sl_res = await set_sl_oneway(base_clean, sltp["sl"])
-                    log("DEBUG", f"REAPPLY SL done {base_clean}: {sl_res}")
-                except Exception as e:
-                    log("WARNING", f"SL reset failed: {e}")
-
-                try:
-                    log("DEBUG", f"REAPPLY TP start {base_clean} tp={sltp.get('tp')}")
-                    tp_res = await set_tp_oneway(base_clean, sltp["tp"])
-                    log("DEBUG", f"REAPPLY TP done {base_clean}: {tp_res}")
-                except Exception as e:
-                    log("WARNING", f"TP reset failed: {e}")
-            else:
-                log("WARNING", f"No SL/TP stored for {base_clean}")
+            res = await apply_sltp(base_clean, sl_price=sl_prec, tp_price=tp_prec, cancel_first=True)
+            log("INFO", f"APPLY SL/TP after OPEN done: {res}")
 
             dca_price = cmd.get("dca_price")
             dca_pct = cmd.get("dca_pct")
@@ -1608,9 +1694,6 @@ async def handle_ai_command(cmd: dict):
             return
         return
 
-    # -------------------------
-    # ADD
-    # -------------------------
     if action == "ADD":
         base_clean = _clean_base(base)
         symbol = await resolve_symbol(base_clean)
@@ -1624,7 +1707,7 @@ async def handle_ai_command(cmd: dict):
             log("ERROR", "ADD: no existing position")
             return
 
-        side = (pos.get("side") or "").lower()
+        side = (pos.get("side") or (pos.get("info") or {}).get("positionSide") or "").lower()
         lev = int(float(pos.get("leverage") or (pos.get("info") or {}).get("leverage") or 1))
 
         pct = add_pct if add_pct is not None else risk_pct
@@ -1692,34 +1775,22 @@ async def handle_ai_command(cmd: dict):
             log("INFO", f"MARKET ADD {base_clean} qty={qty} (~{pct}% balance)")
             log("INFO", f"ADD RESPONSE: {resp}")
 
-            pos_seen = await wait_position_update(symbol, old_size=old_size, timeout=6.0, min_target_size=old_size + qty * 0.7)
+            pos_seen = await wait_position_update(
+                symbol,
+                old_size=old_size,
+                timeout=6.0,
+                min_target_size=old_size + qty * 0.7,
+            )
             log("INFO", f"POSITION_VISIBLE_AFTER_ADD {base_clean}={bool(pos_seen)}")
-            await asyncio.sleep(0.5)
+            await asyncio.sleep(0.7)
 
-            sltp = LAST_SLTP.get(base_clean)
-            if sltp:
-                log("INFO", f"Reapplying SL/TP for {base_clean}")
-                try:
-                    log("INFO", f"REAPPLY SL start {base_clean} sl={sltp.get('sl')}")
-                    sl_res = await set_sl_oneway(base_clean, sltp["sl"])
-                    log("DEBUG", f"REAPPLY SL done {base_clean}: {sl_res}")
-                except Exception as e:
-                    log("WARNING", f"SL reset failed: {e}")
-
-                try:
-                    log("DEBUG", f"REAPPLY TP start {base_clean} tp={sltp.get('tp')}")
-                    tp_res = await set_tp_oneway(base_clean, sltp["tp"])
-                    log("DEBUG", f"REAPPLY TP done {base_clean}: {tp_res}")
-                except Exception as e:
-                    log("WARNING", f"TP reset failed: {e}")
+            reapply_res = await reapply_saved_sltp(base_clean)
+            log("INFO", f"REAPPLY after ADD done: {reapply_res}")
             return
         except Exception as e:
             log("ERROR", f"ADD failed: {e}")
             return
 
-    # -------------------------
-    # SET_SL
-    # -------------------------
     if action == "SET_SL":
         if not base or sl is None:
             log("INFO", "AI SKIP SET_SL: base or sl missing")
@@ -1733,7 +1804,13 @@ async def handle_ai_command(cmd: dict):
 
         new_sl = float(sl)
         pos = await fetch_position_oneway(symbol)
-        pos_side = (pos.get("side") or "").lower() if pos else None
+        pos_side = (
+            pos.get("side")
+            or pos.get("positionSide")
+            or (pos.get("info") or {}).get("positionSide")
+            or ""
+        ).lower() if pos else None
+
         if pos_side in {"long", "short"}:
             try:
                 last = float((await asyncio.to_thread(exchange.fetch_ticker, symbol))["last"])
@@ -1748,19 +1825,11 @@ async def handle_ai_command(cmd: dict):
 
         try:
             res = await set_sl_oneway(base_clean, new_sl)
-            if base_clean in LAST_SLTP:
-                LAST_SLTP[base_clean]["sl"] = new_sl
-            else:
-                LAST_SLTP[base_clean] = {"sl": new_sl, "tp": None}
-            save_sltp()
             log("INFO", f"SUCCESS SET_SL {base_clean}: {res}")
         except Exception as e:
             log("ERROR", f"SET_SL failed: {e}")
         return
 
-    # -------------------------
-    # SET_TP
-    # -------------------------
     if action == "SET_TP":
         if not base or tp is None:
             log("INFO", "AI SKIP SET_TP: base or tp missing")
@@ -1774,7 +1843,13 @@ async def handle_ai_command(cmd: dict):
 
         new_tp = float(tp)
         pos = await fetch_position_oneway(symbol)
-        pos_side = (pos.get("side") or "").lower() if pos else None
+        pos_side = (
+            pos.get("side")
+            or pos.get("positionSide")
+            or (pos.get("info") or {}).get("positionSide")
+            or ""
+        ).lower() if pos else None
+
         if pos_side in {"long", "short"}:
             try:
                 last = float((await asyncio.to_thread(exchange.fetch_ticker, symbol))["last"])
@@ -1789,19 +1864,11 @@ async def handle_ai_command(cmd: dict):
 
         try:
             res = await set_tp_oneway(base_clean, new_tp)
-            if base_clean in LAST_SLTP:
-                LAST_SLTP[base_clean]["tp"] = new_tp
-            else:
-                LAST_SLTP[base_clean] = {"sl": None, "tp": new_tp}
-            save_sltp()
             log("INFO", f"SUCCESS SET_TP {base_clean}: {res}")
         except Exception as e:
             log("ERROR", f"SET_TP failed: {e}")
         return
 
-    # -------------------------
-    # BE
-    # -------------------------
     if action == "BE":
         if not base:
             log("INFO", "AI SKIP BE: base missing")
@@ -1818,7 +1885,7 @@ async def handle_ai_command(cmd: dict):
             return
 
         try:
-            log("INFO", f"BE {base_clean}: cancel old SL and set SL=entry")
+            log("INFO", f"BE {base_clean}: move SL to entry and keep TP")
             res = await breakeven_oneway(base_clean)
             log("INFO", f"SUCCESS BE {base_clean}: {res}")
         except Exception as e:

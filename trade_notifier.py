@@ -107,16 +107,15 @@ def _current_week_key() -> str:
 
 def _should_send_weekly_report_now() -> tuple[bool, str]:
     now_local = datetime.now(KYIV_TZ)
-    week_key = _current_week_key()
 
-    # Sunday 23:55+ Kyiv time, once per week
-    should_send = (
-        now_local.weekday() == 6
-        and (
-            now_local.hour > 23
-            or (now_local.hour == 23 and now_local.minute >= 55)
-        )
-    )
+    # Надсилаємо звіт у понеділок вночі, щоб не залежати від вузького
+    # вікна Sunday 23:55-23:59. Так бот не пропустить звіт через рестарт.
+    should_send = now_local.weekday() == 0 and 0 <= now_local.hour < 3
+
+    # Формуємо ключ попереднього тижня, за який і шлемо звіт.
+    prev_week_monday = _week_monday_date(now_local - timedelta(days=7))
+    week_key = prev_week_monday.isoformat()
+
     return should_send, week_key
 
 def _should_send(close_key: str) -> bool:
@@ -491,7 +490,7 @@ async def pnl_watcher(
     api_secret: str,
     interval: int = 3,
 ):
-    global LAST_POSITIONS, weekly_pnl, week_start, weekly_start_equity
+    global LAST_POSITIONS, weekly_pnl, week_start, weekly_start_equity, last_weekly_report_key
 
     while True:
         try:
@@ -579,24 +578,26 @@ async def pnl_watcher(
                     weekly_pct = (weekly_pnl / start_equity) * 100.0
                     pct_text = f"{round(weekly_pct, 2)}%"
 
-                week_end = (datetime.fromisoformat(week_key).date() + timedelta(days=6)).isoformat()
+                week_start_date = datetime.fromisoformat(week_key).date()
+                week_end_date = week_start_date + timedelta(days=6)
                 report = (
                     "📊 WEEKLY REPORT\n\n"
                     f"{status}\n"
-                    f"Week: {week_key} → {week_end}\n"
+                    f"Week: {week_start_date.isoformat()} → {week_end_date.isoformat()}\n"
                     f"Total Net PnL: {round(weekly_pnl, 4)} USDT\n"
                     f"Percent Growth: {pct_text}"
                 )
                 try:
                     await app.send_message(log_chat_id, report)
                     last_weekly_report_key = week_key
+                    log("INFO", f"Weekly report sent for week={week_key}")
                 except Exception as e:
                     log("ERROR", f"Weekly report send failed: {e}")
-
-                weekly_pnl = 0.0
-                week_start = time.time()
-                weekly_start_equity = await _get_total_usdt_balance(exchange)
-                log("INFO", f"NEW weekly baseline equity: {weekly_start_equity}")
+                else:
+                    weekly_pnl = 0.0
+                    week_start = time.time()
+                    weekly_start_equity = await _get_total_usdt_balance(exchange)
+                    log("INFO", f"NEW weekly baseline equity: {weekly_start_equity}")
 
         except Exception as e:
             log("ERROR", f"PNL watcher error: {e}")

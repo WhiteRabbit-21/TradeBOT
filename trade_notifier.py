@@ -356,8 +356,13 @@ async def _get_position_income_summary(
             100,
         )
     except Exception as e:
-        log("ERROR", f"PNL income request failed for {symbol}: {e}")
-        return None
+        log("WARNING", f"PNL income request failed for {symbol}: {e}")
+        return {
+            "pnl": 0.0,
+            "count": 0,
+            "rows": [],
+            "has_real_pnl_signal": False,
+        }
 
     rows = _extract_income_rows(resp)
     if not rows:
@@ -445,8 +450,10 @@ async def _wait_final_income_summary(
     stable_rounds = 0
     last_signature = None
 
-    for _ in range(15):
-        await asyncio.sleep(2)
+    # BingX income rows can appear late, especially after volatile moves or API lag.
+    # Wait up to ~2 minutes before giving up.
+    for _ in range(30):
+        await asyncio.sleep(4)
 
         income_info = await _get_position_income_summary(
             symbol=symbol,

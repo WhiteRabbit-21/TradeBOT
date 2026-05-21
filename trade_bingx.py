@@ -279,21 +279,33 @@ async def ensure_markets_loaded():
 
 def resolve_symbol_sync(base: str) -> Optional[str]:
     ensure_markets_loaded_sync()
-    base = (base or "").upper().replace("USDT", "").strip()
+
+    raw_base = str(base or "").upper().strip()
+    raw_base = re.sub(r"[^A-Z0-9]", "", raw_base)
+    if raw_base.endswith("USDT"):
+        raw_base = raw_base[:-4]
+
+    base = SPECIAL_BASES.get(raw_base, raw_base)
     if not base:
         return None
 
-    for c in (f"{base}/USDT:USDT", f"{base}/USDT"):
-        if c in exchange.markets:
-            return c
+    preferred = f"{base}/USDT:USDT"
+    m = exchange.markets.get(preferred)
+    if m and (m.get("swap") or m.get("contract")):
+        return preferred
 
     for sym, m in exchange.markets.items():
         try:
-            if m.get("base", "").upper() == base and m.get("quote", "").upper() == "USDT":
-                if ":USDT" in sym or m.get("swap") or m.get("contract"):
-                    return sym
+            if not (m.get("swap") or m.get("contract")):
+                continue
+            if m.get("base", "").upper() != base:
+                continue
+            if m.get("quote", "").upper() != "USDT":
+                continue
+            return sym
         except Exception:
             continue
+
     return None
 
 async def resolve_symbol(base: str) -> Optional[str]:
@@ -1162,6 +1174,19 @@ BAD_BASE_WORDS = {
     "TP", "SL", "ENTRY", "EXIT",
 }
 
+SPECIAL_BASES = {
+    "1000PEPE": "1000PEPE",
+    "1000BONK": "1000BONK",
+    "1000SHIB": "1000SHIB",
+    "1000FLOKI": "1000FLOKI",
+}
+
+KNOWN_BASES = [
+    "1000PEPE", "1000BONK", "1000SHIB", "1000FLOKI",
+    "BTC", "ETH", "SOL", "XRP", "DOGE", "ADA", "BNB",
+    "HYPE", "ONDO", "LINK", "AVAX", "PARTI", "PEPE",
+]
+
 def _normalize_base_word(w: str) -> Optional[str]:
     if not w:
         return None
@@ -1202,7 +1227,7 @@ ACTION RULES:
 - Otherwise, if it is a full entry setup -> action = OPEN
 
 EXTRACTION RULES:
-- BASE: extract ticker and remove USDT. Example: #ETHUSDT -> ETH
+- BASE: extract ticker and remove USDT, but preserve indexed token prefixes such as 1000PEPE, 1000BONK, 1000SHIB, 1000FLOKI. Example: #ETHUSDT -> ETH; 1000PEPEUSDT -> 1000PEPE
 - SIDE: long or short
 - LEVERAGE: parse X10 / 10x / leverage 10
 - RISK_PCT: parse phrases like "1.5% balance", "risk 2%", "margin 0.75%"
@@ -1466,10 +1491,12 @@ def extract_rr_from_text(text: str) -> Optional[float]:
 
 
 def _clean_base(x: str) -> str:
-    b = str(x).upper().strip()
+    b = str(x or "").upper().strip()
     b = re.sub(r"[^A-Z0-9]", "", b)
-    b = b.replace("USDT", "")
+    if b.endswith("USDT"):
+        b = b[:-4]
     b = TOKEN_ALIASES.get(b, b)
+    b = SPECIAL_BASES.get(b, b)
     if not b:
         return ""
     if b in BAD_BASE_WORDS:
@@ -1477,6 +1504,40 @@ def _clean_base(x: str) -> str:
     if len(b) > 12:
         return ""
     return b
+
+
+def extract_multiple_bases(text: str) -> list[str]:
+    t = str(text or "").upper()
+    found: list[str] = []
+
+    for b in KNOWN_BASES:
+        pattern = rf"(?<![A-Z0-9]){re.escape(b)}(?:USDT)?(?![A-Z0-9])"
+        if re.search(pattern, t):
+            clean = _clean_base(b)
+            if clean and clean not in found:
+                found.append(clean)
+
+    return found
+
+
+def _clean_base_from_context(base_value: str, text: str = "") -> str:
+    t = str(text or "").upper()
+    for special in SPECIAL_BASES:
+        pattern = rf"(?<![A-Z0-9]){re.escape(special)}(?:USDT)?(?![A-Z0-9])"
+        if re.search(pattern, t):
+            return SPECIAL_BASES[special]
+    return _clean_base(base_value)
+
+
+def _log_action_result(action_name: str, base: str, res: str) -> bool:
+    if res == "NO_POSITION":
+        log("WARNING", f"SKIP {action_name} {base}: NO_POSITION")
+        return False
+    if res in {"NO_ENTRY_PRICE", "NOTHING_TO_APPLY", "NO_SAVED_SLTP"}:
+        log("WARNING", f"SKIP {action_name} {base}: {res}")
+        return False
+    log("INFO", f"SUCCESS {action_name} {base}: {res}")
+    return True
 
 
 async def handle_ai_command(cmd: dict):
@@ -1496,10 +1557,19 @@ async def handle_ai_command(cmd: dict):
 
     log("INFO", f"AI action={action} conf={conf} base={base} side={side} lev={lev} risk={risk_pct} sl={sl} tp={tp} add_pct={add_pct}")
 
-    if action in {"NONE", "OPEN"} and _has_add_intent_text(tg_text):
-        if base and (add_pct is not None or risk_pct is not None):
-            log("WARNING", "FORCE FIX: OPEN/NONE -> ADD by text rule")
-            action = "ADD"
+    # Safety: never convert a clear OPEN signal to ADD.
+    # DCA inside an OPEN setup means "open now + place pending DCA order", not market ADD.
+    # We only rescue NONE -> ADD when there is already an open position.
+    if action == "NONE" and base and _has_add_intent_text(tg_text):
+        try:
+            base_for_add = _clean_base_from_context(base, tg_text)
+            symbol_for_add = await resolve_symbol(base_for_add)
+            pos_for_add = await fetch_position_oneway(symbol_for_add) if symbol_for_add else None
+            if pos_for_add and (add_pct is not None or risk_pct is not None):
+                log("WARNING", "FORCE FIX: NONE -> ADD by text rule")
+                action = "ADD"
+        except Exception as e:
+            log("WARNING", f"FORCE ADD CHECK failed: {e}")
 
     if action == "NONE":
         log("DEBUG", "AI SKIP: action=NONE")
@@ -1554,7 +1624,7 @@ async def handle_ai_command(cmd: dict):
 
             try:
                 res = await close_position_full(b)
-                log("INFO", f"SUCCESS CLOSE {b}: {res}")
+                _log_action_result("CLOSE", b, res)
             except Exception as e:
                 log("ERROR", f"CLOSE {b} failed: {e}")
         return
@@ -1584,7 +1654,7 @@ async def handle_ai_command(cmd: dict):
             log("INFO", "AI SKIP OPEN: tp/rr missing")
             return
 
-        base_clean = _clean_base(base)
+        base_clean = _clean_base_from_context(base, tg_text)
         symbol = await resolve_symbol(base_clean)
 
         if not symbol:
@@ -1684,10 +1754,14 @@ async def handle_ai_command(cmd: dict):
             res = await apply_sltp(base_clean, sl_price=sl_prec, tp_price=tp_prec, cancel_first=True)
             log("INFO", f"APPLY SL/TP after OPEN done: {res}")
 
-            dca_price = cmd.get("dca_price")
+            dca_price = cmd.get("dca_price") or cmd.get("price")
             dca_pct = cmd.get("dca_pct")
             if dca_price and dca_pct:
-                await place_dca(symbol, side, float(dca_pct), float(dca_price), lev)
+                dca_res = await place_dca(symbol, side, float(dca_pct), float(dca_price), int(lev))
+                if dca_res.get("ok"):
+                    log("INFO", f"DCA after OPEN placed {base_clean} at {dca_res['price']} qty={dca_res['qty']}")
+                else:
+                    log("WARNING", f"DCA after OPEN not placed {base_clean}: {dca_res.get('reason')}")
 
         except Exception as e:
             log("ERROR", f"OPEN FAILED: {e}")
@@ -1695,7 +1769,7 @@ async def handle_ai_command(cmd: dict):
         return
 
     if action == "ADD":
-        base_clean = _clean_base(base)
+        base_clean = _clean_base_from_context(base, tg_text)
         symbol = await resolve_symbol(base_clean)
 
         if not symbol:
@@ -1704,7 +1778,7 @@ async def handle_ai_command(cmd: dict):
 
         pos = await fetch_position_oneway(symbol)
         if not pos:
-            log("ERROR", "ADD: no existing position")
+            log("WARNING", f"SKIP ADD {base_clean}: NO_POSITION")
             return
 
         side = (pos.get("side") or (pos.get("info") or {}).get("positionSide") or "").lower()
@@ -1796,7 +1870,7 @@ async def handle_ai_command(cmd: dict):
             log("INFO", "AI SKIP SET_SL: base or sl missing")
             return
 
-        base_clean = _clean_base(base)
+        base_clean = _clean_base_from_context(base, tg_text)
         symbol = await resolve_symbol(base_clean)
         if not symbol:
             log("ERROR", f"SET_SL skip: symbol not listed: {base_clean}/USDT")
@@ -1825,7 +1899,7 @@ async def handle_ai_command(cmd: dict):
 
         try:
             res = await set_sl_oneway(base_clean, new_sl)
-            log("INFO", f"SUCCESS SET_SL {base_clean}: {res}")
+            _log_action_result("SET_SL", base_clean, res)
         except Exception as e:
             log("ERROR", f"SET_SL failed: {e}")
         return
@@ -1835,7 +1909,7 @@ async def handle_ai_command(cmd: dict):
             log("INFO", "AI SKIP SET_TP: base or tp missing")
             return
 
-        base_clean = _clean_base(base)
+        base_clean = _clean_base_from_context(base, tg_text)
         symbol = await resolve_symbol(base_clean)
         if not symbol:
             log("ERROR", f"SET_TP skip: symbol not listed: {base_clean}/USDT")
@@ -1864,32 +1938,42 @@ async def handle_ai_command(cmd: dict):
 
         try:
             res = await set_tp_oneway(base_clean, new_tp)
-            log("INFO", f"SUCCESS SET_TP {base_clean}: {res}")
+            _log_action_result("SET_TP", base_clean, res)
         except Exception as e:
             log("ERROR", f"SET_TP failed: {e}")
         return
 
     if action == "BE":
-        if not base:
+        target_bases: list[str] = []
+
+        if base:
+            base_clean = _clean_base_from_context(base, tg_text)
+            if base_clean:
+                target_bases.append(base_clean)
+
+        if not target_bases:
+            target_bases = extract_multiple_bases(tg_text)
+
+        if not target_bases:
             log("INFO", "AI SKIP BE: base missing")
             return
 
-        base_clean = _clean_base(base)
-        symbol = await resolve_symbol(base_clean)
-        if not symbol:
-            log("ERROR", f"BE skip: symbol not listed: {base_clean}/USDT")
-            return
+        for base_clean in target_bases:
+            symbol = await resolve_symbol(base_clean)
+            if not symbol:
+                log("ERROR", f"BE skip: symbol not listed: {base_clean}/USDT")
+                continue
 
-        if DRY_RUN:
-            log("INFO", f"DRY_RUN BE {base_clean} skipped (test mode)")
-            return
+            if DRY_RUN:
+                log("INFO", f"DRY_RUN BE {base_clean} skipped (test mode)")
+                continue
 
-        try:
-            log("INFO", f"BE {base_clean}: move SL to entry and keep TP")
-            res = await breakeven_oneway(base_clean)
-            log("INFO", f"SUCCESS BE {base_clean}: {res}")
-        except Exception as e:
-            log("ERROR", f"BE failed: {e}")
+            try:
+                log("INFO", f"BE {base_clean}: move SL to entry and keep TP")
+                res = await breakeven_oneway(base_clean)
+                _log_action_result("BE", base_clean, res)
+            except Exception as e:
+                log("ERROR", f"BE {base_clean} failed: {e}")
         return
 
     log("INFO", f"Unknown/unsupported action: {action}")

@@ -295,40 +295,131 @@ def ensure_markets_loaded_sync():
 async def ensure_markets_loaded():
     await asyncio.to_thread(ensure_markets_loaded_sync)
 
+def _clean_base_name(base: str) -> str:
+    b = str(base or "").upper().strip()
+    b = re.sub(r"[^A-Z0-9]", "", b)
+    if b.endswith("USDT"):
+        b = b[:-4]
+    return TOKEN_ALIASES.get(b, b)
+
+
+def _is_swap_usdt_market(m: dict) -> bool:
+    try:
+        if not (m.get("swap") or m.get("contract") or m.get("linear")):
+            return False
+        if m.get("spot") is True:
+            return False
+        if m.get("type") and str(m.get("type")).lower() not in {"swap", "future"}:
+            return False
+        if str(m.get("quote", "")).upper() != "USDT":
+            return False
+        return True
+    except Exception:
+        return False
+
+
+def _market_base(m: dict) -> str:
+    return str(m.get("base") or "").upper().strip()
+
+
+def _base_aliases_for_lookup(base: str) -> list[str]:
+    """
+    Produces safe futures aliases for Telegram tickers that may be written in UI form.
+    Examples:
+      PEPE -> PEPE, 1000PEPE, 10000PEPE, 1MPEPE
+      PEPE1000 -> 1000PEPE, PEPE1000
+      kPEPE/mPEPE in text -> KPEPE/MPEPE plus suffix match fallback
+    Exact market matches are always preferred before aliases.
+    """
+    b = _clean_base_name(base)
+    if not b:
+        return []
+
+    aliases = []
+
+    def add(x: str):
+        x = _clean_base_name(x)
+        if x and x not in aliases:
+            aliases.append(x)
+
+    add(b)
+    add(SPECIAL_BASES.get(b, b))
+
+    # Telegram users sometimes write PEPE1000, BONK1000, etc.
+    m = re.match(r"^([A-Z]+)(1000|10000|100000|1M|10M)$", b)
+    if m:
+        token, mult = m.groups()
+        add(mult + token)
+
+    # Common exchange multiplier prefixes.
+    stripped = re.sub(r"^(1000|10000|100000|1000000|1M|10M)", "", b)
+    if stripped and stripped != b:
+        add(stripped)
+    else:
+        for pref in ("1000", "10000", "100000", "1000000", "1M", "10M"):
+            add(pref + b)
+
+    return aliases
+
+
 def resolve_symbol_sync(base: str) -> Optional[str]:
     ensure_markets_loaded_sync()
 
-    raw_base = str(base or "").upper().strip()
-    raw_base = re.sub(r"[^A-Z0-9]", "", raw_base)
-    if raw_base.endswith("USDT"):
-        raw_base = raw_base[:-4]
-
-    base = SPECIAL_BASES.get(raw_base, raw_base)
-    if not base:
+    aliases = _base_aliases_for_lookup(base)
+    if not aliases:
         return None
 
-    preferred = f"{base}/USDT:USDT"
-    m = exchange.markets.get(preferred)
-    if m and (m.get("swap") or m.get("contract")):
-        return preferred
+    # 1) Exact swap/futures market match first. Never return spot by accident.
+    for b in aliases:
+        preferred = f"{b}/USDT:USDT"
+        m = exchange.markets.get(preferred)
+        if m and _is_swap_usdt_market(m):
+            if b != _clean_base_name(base):
+                log("INFO", f"SYMBOL ALIAS {base} -> {b} -> {preferred}")
+            return preferred
 
-    for sym, m in exchange.markets.items():
-        try:
-            if not (m.get("swap") or m.get("contract")):
+    # 2) Exact base match anywhere in ccxt markets.
+    for b in aliases:
+        for sym, m in exchange.markets.items():
+            if not _is_swap_usdt_market(m):
                 continue
-            if m.get("type") and str(m.get("type")).lower() not in {"swap", "future"}:
+            if _market_base(m) != b:
                 continue
-            if m.get("spot") is True:
-                continue
-            if m.get("base", "").upper() != base:
-                continue
-            if m.get("quote", "").upper() != "USDT":
-                continue
-            # Prefer ccxt swap notation and never accidentally return spot PEPE/USDT.
             if ":USDT" in sym or m.get("swap") or m.get("linear"):
+                if b != _clean_base_name(base):
+                    log("INFO", f"SYMBOL ALIAS {base} -> {b} -> {sym}")
                 return sym
-        except Exception:
+
+    # 3) Conservative suffix fallback: if Telegram says PEPE and only 1000PEPE exists, use it.
+    #    If multiple contracts exist, prefer smaller multiplier first, exact-looking ccxt symbols first.
+    raw = _clean_base_name(base)
+    if not raw:
+        return None
+
+    candidates = []
+    for sym, m in exchange.markets.items():
+        if not _is_swap_usdt_market(m):
             continue
+        mb = _market_base(m)
+        if not mb or mb == raw:
+            continue
+        if mb.endswith(raw) and re.match(r"^(1000|10000|100000|1000000|1M|10M)[A-Z0-9]+$", mb):
+            candidates.append((mb, sym, m))
+
+    if candidates:
+        def score(item):
+            mb, sym, _ = item
+            pref_score = 99
+            for i, pref in enumerate(("1000", "10000", "100000", "1000000", "1M", "10M")):
+                if mb.startswith(pref):
+                    pref_score = i
+                    break
+            ccxt_score = 0 if ":USDT" in sym else 1
+            return (pref_score, ccxt_score, len(mb))
+
+        mb, sym, _ = sorted(candidates, key=score)[0]
+        log("INFO", f"SYMBOL FUZZY {base} -> {mb} -> {sym}")
+        return sym
 
     return None
 
@@ -1254,7 +1345,7 @@ ACTION RULES:
 - Otherwise, if it is a full entry setup -> action = OPEN
 
 EXTRACTION RULES:
-- BASE: extract ticker and remove USDT, but preserve indexed token prefixes such as 1000PEPE, 1000BONK, 1000SHIB, 1000FLOKI. Example: #ETHUSDT -> ETH; 1000PEPEUSDT -> 1000PEPE
+- BASE: extract ticker and remove USDT, but preserve exchange multiplier prefixes/suffixes such as 1000PEPE, PEPE1000, 1000BONK, 1MBABYDOGE, 10000SATS. Example: #ETHUSDT -> ETH; 1000PEPEUSDT -> 1000PEPE; PEPE1000 -> PEPE1000.
 - SIDE: long or short
 - LEVERAGE: parse X10 / 10x / leverage 10
 - RISK_PCT: parse phrases like "1.5% balance", "risk 2%", "margin 0.75%"

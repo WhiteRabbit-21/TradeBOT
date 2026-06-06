@@ -54,6 +54,11 @@ LAST_SLTP = {}
 ORDER_IDS_FILE = "/data/order_ids.json"
 LAST_ORDER_IDS = {}
 
+# Prevent duplicate Telegram processing / duplicate log spam.
+PROCESSED_MESSAGES: dict[str, float] = {}
+LOG_LINE_CACHE: dict[str, float] = {}
+DEDUP_TTL_SEC = 300
+
 # =========================
 # PYROGRAM CLIENT (USER)
 # =========================
@@ -169,6 +174,19 @@ def log(level: str, msg: str):
         return
 
     line = f"[{_ts()}] [{lvl_name}] {msg}"
+
+    # Deduplicate identical Telegram log lines for a short window.
+    # Keeps console prints useful but avoids the log chat being flooded by repeats.
+    now_ts = time.time()
+    cache_key = hashlib.sha1(f"{lvl_name}|{msg}".encode("utf-8", "ignore")).hexdigest()
+    last_seen = LOG_LINE_CACHE.get(cache_key, 0)
+    if now_ts - last_seen < 2.0:
+        return
+    LOG_LINE_CACHE[cache_key] = now_ts
+    for k, ts in list(LOG_LINE_CACHE.items()):
+        if now_ts - ts > DEDUP_TTL_SEC:
+            LOG_LINE_CACHE.pop(k, None)
+
     print(line)
 
     # ERROR -> immediately
@@ -298,11 +316,17 @@ def resolve_symbol_sync(base: str) -> Optional[str]:
         try:
             if not (m.get("swap") or m.get("contract")):
                 continue
+            if m.get("type") and str(m.get("type")).lower() not in {"swap", "future"}:
+                continue
+            if m.get("spot") is True:
+                continue
             if m.get("base", "").upper() != base:
                 continue
             if m.get("quote", "").upper() != "USDT":
                 continue
-            return sym
+            # Prefer ccxt swap notation and never accidentally return spot PEPE/USDT.
+            if ":USDT" in sym or m.get("swap") or m.get("linear"):
+                return sym
         except Exception:
             continue
 
@@ -367,8 +391,11 @@ def set_leverage_sync(symbol: str, lev: int, side: str):
 
     pos_side = "LONG" if side == "long" else "SHORT"
 
-    # 🔥 важливо
-    exchange.set_margin_mode("cross", symbol)
+    # Best effort only. Some BingX/ccxt market ids reject setMarginMode even for valid swap markets.
+    try:
+        exchange.set_margin_mode("cross", symbol)
+    except Exception as e:
+        log("WARNING", f"SET_MARGIN_MODE skipped {symbol}: {e}")
 
     # 🔥 пробуємо різні варіанти (бо BingX кривий)
     variants = [
@@ -1152,7 +1179,7 @@ CLOSE_NEGATIVE_PATTERNS = [
 ]
 
 def has_close_intent(text: str) -> bool:
-    t = (text or "").strip().lower()
+    t = (text or "").strip().lower().replace("ę", "e")
     if not t:
         return False
     if any(re.search(p, t, re.I | re.S) for p in CLOSE_NEGATIVE_PATTERNS):
@@ -1932,6 +1959,7 @@ async def handle_ai_command(cmd: dict):
 
     log("INFO", f"Unknown/unsupported action: {action}")
 
+
 def detect_add_mode(cmd: dict, tg_text: str = "") -> str:
     """
     return:
@@ -2137,9 +2165,21 @@ _last_hb = 0.0
 )
 
 async def on_signal(_, message):
-    log("INFO", f"MSG RECEIVED chat={message.chat.id} text={bool(message.text)} photo={bool(message.photo)}")
-
     global _last_hb
+
+    # Pyrogram/user sessions can occasionally deliver the same update twice after reconnects.
+    # Dedupe by chat/message id before any AI parsing or order execution.
+    msg_key = f"{getattr(message.chat, 'id', '')}:{getattr(message, 'id', getattr(message, 'message_id', ''))}"
+    now_seen = time.time()
+    if msg_key in PROCESSED_MESSAGES and now_seen - PROCESSED_MESSAGES[msg_key] < DEDUP_TTL_SEC:
+        log("INFO", f"SKIP duplicate TG message {msg_key}")
+        return
+    PROCESSED_MESSAGES[msg_key] = now_seen
+    for k, ts in list(PROCESSED_MESSAGES.items()):
+        if now_seen - ts > DEDUP_TTL_SEC:
+            PROCESSED_MESSAGES.pop(k, None)
+
+    log("INFO", f"MSG RECEIVED chat={message.chat.id} msg_id={getattr(message, 'id', None)} text={bool(message.text)} photo={bool(message.photo)}")
 
     # не логимо власний лог-чат, якщо раптом він = target
     if message.chat and int(message.chat.id) == int(LOG_CHAT_ID):

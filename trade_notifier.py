@@ -18,7 +18,7 @@ weekly_pnl = 0.0
 week_start = time.time()
 weekly_start_equity: Optional[float] = None
 last_weekly_report_key: Optional[str] = None
-KYIV_TZ = ZoneInfo("Europe/Kiev")
+KYIV_TZ = ZoneInfo("Europe/Kyiv")
 
 
 def _to_float(value: Any, default: float = 0.0) -> float:

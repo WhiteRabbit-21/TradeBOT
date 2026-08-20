@@ -18,7 +18,7 @@ weekly_pnl = 0.0
 week_start = time.time()
 weekly_start_equity: Optional[float] = None
 last_weekly_report_key: Optional[str] = None
-KYIV_TZ = ZoneInfo("Europe/Kyiv")
+KYIV_TZ = ZoneInfo("Europe/Kiev")
 
 
 def _to_float(value: Any, default: float = 0.0) -> float:
@@ -55,6 +55,16 @@ def _extract_entry(pos: dict) -> float:
         pos.get("entryPrice")
         or pos.get("average")
         or pos.get("avgPrice")
+        or 0
+    )
+
+def _extract_liquidation(pos: dict) -> float:
+    info = pos.get("info") or {}
+    return _to_float(
+        pos.get("liquidationPrice")
+        or pos.get("liquidation_price")
+        or info.get("liquidationPrice")
+        or info.get("liqPrice")
         or 0
     )
 
@@ -133,6 +143,7 @@ def _format_pnl_message(
     pnl: float,
     qty: float,
     entry_price: float = 0.0,
+    liquidation_price: float = 0.0,
 ) -> str:
     status = "🟢 PROFIT" if pnl > 0 else "🔴 LOSS"
     side_text = side.upper() if side else "UNKNOWN"
@@ -146,6 +157,8 @@ def _format_pnl_message(
 
     if entry_price > 0:
         lines.append(f"Entry: {round(entry_price, 6)}")
+    if liquidation_price > 0:
+        lines.append(f"Liquidation: {round(liquidation_price, 6)}")
 
     return "\n".join(lines)
 
@@ -181,11 +194,14 @@ async def _fetch_positions_map(exchange) -> Dict[str, dict]:
         size = _extract_pos_size(pos)
 
         if side in {"long", "short"} and size > 0:
-            prev = LAST_POSITIONS.get(symbol) or {}
-            result[symbol] = {
+            position_key = f"{symbol}:{side}"
+            prev = LAST_POSITIONS.get(position_key) or {}
+            result[position_key] = {
+                "symbol": symbol,
                 "side": side,
                 "size": size,
                 "entry": _extract_entry(pos),
+                "liquidation": _extract_liquidation(pos),
                 "opened_at": prev.get("opened_at", now_ms),
                 "raw": pos,
             }
@@ -289,6 +305,14 @@ def _extract_income_type(row: dict) -> str:
         or ""
     ).upper()
 
+def _extract_income_side(row: dict) -> str:
+    return str(
+        row.get("positionSide")
+        or row.get("side")
+        or row.get("posSide")
+        or ""
+    ).lower()
+
 
 def _extract_income_info_text(row: dict) -> str:
     return str(row.get("info") or "").lower()
@@ -342,6 +366,7 @@ async def _get_position_income_summary(
     log,
     opened_at_ms: int,
     close_ts_ms: int,
+    position_side: str = "",
 ) -> Optional[dict]:
     try:
         start_ms = max(0, opened_at_ms - 300_000)
@@ -381,6 +406,7 @@ async def _get_position_income_summary(
         income_value = _extract_income_value(row)
         income_type = _extract_income_type(row)
         info_text = _extract_income_info_text(row)
+        row_side = _extract_income_side(row)
         ts = _extract_income_time(row)
 
         if ts and (ts < start_ms or ts > end_ms):
@@ -393,6 +419,8 @@ async def _get_position_income_summary(
             continue
 
         if row_symbol and row_symbol != target_symbol:
+            continue
+        if row_side and position_side and row_side != position_side.lower():
             continue
 
         matched_rows.append(row)
@@ -445,6 +473,7 @@ async def _wait_final_income_summary(
     log,
     opened_at_ms: int,
     close_ts_ms: int,
+    position_side: str = "",
 ) -> Optional[dict]:
     best_income_info = None
     stable_rounds = 0
@@ -462,6 +491,7 @@ async def _wait_final_income_summary(
             log=log,
             opened_at_ms=opened_at_ms,
             close_ts_ms=close_ts_ms,
+            position_side=position_side,
         )
 
         if not income_info:
@@ -511,24 +541,26 @@ async def pnl_watcher(
                 weekly_start_equity = await _get_total_usdt_balance(exchange)
 
             just_closed = []
-            for symbol, prev in LAST_POSITIONS.items():
+            for position_key, prev in LAST_POSITIONS.items():
                 prev_size = float(prev.get("size", 0.0))
-                current = current_positions.get(symbol)
+                current = current_positions.get(position_key)
                 curr_size = float(current.get("size", 0.0)) if current else 0.0
 
                 if prev_size > 0 and curr_size == 0:
-                    just_closed.append((symbol, prev))
+                    just_closed.append((position_key, prev))
 
-            for symbol, prev in just_closed:
+            for position_key, prev in just_closed:
+                symbol = str(prev.get("symbol") or position_key.rsplit(":", 1)[0])
                 close_ts_ms = int(time.time() * 1000)
-                close_key = f"{symbol}:{close_ts_ms // 60000}"
+                side = str(prev.get("side", ""))
+                close_key = f"{symbol}:{side}:{close_ts_ms // 60000}"
 
                 if not _should_send(close_key):
                     continue
 
-                side = str(prev.get("side", ""))
                 qty = float(prev.get("size", 0.0))
                 entry_price = float(prev.get("entry", 0.0))
+                liquidation_price = float(prev.get("liquidation", 0.0))
                 opened_at_ms = int(
                     prev.get("opened_at", int(time.time() * 1000) - 10 * 60 * 1000)
                 )
@@ -542,6 +574,7 @@ async def pnl_watcher(
                     log=log,
                     opened_at_ms=opened_at_ms,
                     close_ts_ms=close_ts_ms,
+                    position_side=side,
                 )
 
                 if income_info is None:
@@ -564,6 +597,7 @@ async def pnl_watcher(
                     pnl=pnl,
                     qty=qty,
                     entry_price=entry_price,
+                    liquidation_price=liquidation_price,
                 )
 
                 try:

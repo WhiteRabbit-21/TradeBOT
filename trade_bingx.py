@@ -6,6 +6,7 @@ import base64
 import asyncio
 import hashlib
 import hmac
+import math
 from urllib.parse import urlencode
 from datetime import datetime
 
@@ -42,6 +43,15 @@ OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4.1")
 
 DRY_RUN = os.getenv("DRY_RUN", "1").strip() == "1"
 HEARTBEAT_SEC = int(os.getenv("HEARTBEAT_SEC", "300"))  # 5 хв
+ALLOWED_SIGNAL_STYLES = {
+    style.strip().upper()
+    for style in os.getenv("ALLOWED_SIGNAL_STYLES", "SCALP").split(",")
+    if style.strip()
+}
+FIXED_RISK_PCT = float(os.getenv("FIXED_RISK_PCT", "0.5"))
+MAX_AUTO_LEVERAGE = int(os.getenv("MAX_AUTO_LEVERAGE", "20"))
+LEVERAGE_DISTANCE_BUFFER = float(os.getenv("LEVERAGE_DISTANCE_BUFFER", "3.0"))
+MAX_MARGIN_USAGE_PCT = float(os.getenv("MAX_MARGIN_USAGE_PCT", "95"))
 
 MEDIA_DELAY_SEC = float(os.getenv("MEDIA_DELAY_SEC", "5"))  # wait for album completion
 CLOSE_BUNDLE_WINDOW_SEC = float(os.getenv("CLOSE_BUNDLE_WINDOW_SEC", "15"))  # attach orphan photos
@@ -426,11 +436,12 @@ def place_dca_order_sync(symbol: str, side: str, qty: float, price: float):
         }
     )
 
-def fetch_position_oneway_sync(symbol: str):
+def fetch_position_oneway_sync(symbol: str, position_side: Optional[str] = None):
 
     try:
         positions = exchange.fetch_positions([symbol])
 
+        wanted_side = str(position_side or "").lower()
         best = None
         best_size = 0.0
 
@@ -443,6 +454,8 @@ def fetch_position_oneway_sync(symbol: str):
             ).lower()
 
             if side in {"long", "short"}:
+                if wanted_side and side != wanted_side:
+                    continue
                 size = float(
                     p.get("contracts")
                     or p.get("size")
@@ -459,15 +472,16 @@ def fetch_position_oneway_sync(symbol: str):
     except Exception:
         return None
         
-async def fetch_position_oneway(symbol: str):
+async def fetch_position_oneway(symbol: str, position_side: Optional[str] = None):
 
     return await asyncio.to_thread(
         fetch_position_oneway_sync,
-        symbol
+        symbol,
+        position_side,
     )    
 
 
-def close_position_full_sync(base: str):
+def close_position_full_sync(base: str, position_side: Optional[str] = None):
     symbol = resolve_symbol_sync(base)
 
     if not symbol:
@@ -475,6 +489,8 @@ def close_position_full_sync(base: str):
 
     positions = exchange.fetch_positions([symbol])
     closed = []
+
+    wanted_side = str(position_side or "").lower()
 
     for pos in positions:
         side = (
@@ -485,6 +501,8 @@ def close_position_full_sync(base: str):
         ).lower()
 
         if side not in {"long", "short"}:
+            continue
+        if wanted_side and side != wanted_side:
             continue
 
         contracts = float(
@@ -528,14 +546,15 @@ def close_position_full_sync(base: str):
         except Exception as e:
             log("WARNING", f"cancel_all_open_orders after close failed for {symbol}/{side}: {e}")
 
-    _clear_symbol_state(base)
+    for side in closed:
+        _clear_position_state(base, side)
 
     log("INFO", f"CLOSE cleanup done symbol={symbol} canceled_orders={canceled_total}")
     return f"CLOSED {'/'.join(closed)} | canceled={canceled_total}"
 
 
-async def close_position_full(base: str):
-    return await asyncio.to_thread(close_position_full_sync, base)
+async def close_position_full(base: str, position_side: Optional[str] = None):
+    return await asyncio.to_thread(close_position_full_sync, base, position_side)
 
 def set_margin_mode_sync(symbol: str):
     try:
@@ -671,6 +690,38 @@ def _extract_position_qty_sync(pos: dict, symbol: str) -> float:
     ))
     return float(exchange.amount_to_precision(symbol, qty))
 
+def _extract_position_liquidation(pos: Optional[dict]) -> Optional[float]:
+    if not pos:
+        return None
+    info = pos.get("info") or {}
+    value = (
+        pos.get("liquidationPrice")
+        or pos.get("liquidation_price")
+        or info.get("liquidationPrice")
+        or info.get("liquidation_price")
+        or info.get("liqPrice")
+    )
+    try:
+        value_f = float(value)
+        return value_f if value_f > 0 else None
+    except (TypeError, ValueError):
+        return None
+
+def estimate_liquidation_price(entry: float, side: str, leverage: int) -> Optional[float]:
+    """Fallback estimate; the exchange value is preferred in cross-margin mode."""
+    try:
+        entry_f = float(entry)
+        leverage_i = int(leverage)
+        if entry_f <= 0 or leverage_i <= 0:
+            return None
+        if side == "long":
+            return max(0.0, entry_f * (1.0 - 1.0 / leverage_i))
+        if side == "short":
+            return entry_f * (1.0 + 1.0 / leverage_i)
+    except (TypeError, ValueError):
+        pass
+    return None
+
 def _load_saved_sltp_for_position(base: str, pos_side: str) -> dict:
     return ((LAST_SLTP.get(str(base).upper()) or {}).get(pos_side) or {}).copy()
 
@@ -707,6 +758,22 @@ def _clear_symbol_state(base: str):
             del LAST_ORDER_IDS[k]
     save_order_ids()
 
+def _clear_position_state(base: str, pos_side: str):
+    """Clear only one hedge leg, preserving the opposite side's protection."""
+    base_u = str(base).upper()
+    side = str(pos_side).lower()
+
+    saved_by_side = LAST_SLTP.get(base_u) or {}
+    saved_by_side.pop(side, None)
+    if saved_by_side:
+        LAST_SLTP[base_u] = saved_by_side
+    else:
+        LAST_SLTP.pop(base_u, None)
+
+    LAST_ORDER_IDS.pop(_state_key(base_u, side), None)
+    save_sltp()
+    save_order_ids()
+
 def cancel_order_exact_sync(symbol: str, order_id: str) -> bool:
     if not order_id:
         return False
@@ -739,7 +806,7 @@ def cancel_all_open_orders_for_symbol_sync(symbol: str, pos_side: Optional[str] 
 
             if pos_side:
                 o_pos_side = str(info.get("positionSide") or "").lower()
-                if o_pos_side and o_pos_side != pos_side.lower():
+                if o_pos_side != pos_side.lower():
                     continue
 
             exchange.cancel_order(str(oid), symbol)
@@ -778,7 +845,9 @@ def _cancel_existing_sltp_sync(symbol: str, pos_side: str):
         try:
             info = o.get("info") or {}
             o_pos_side = str(info.get("positionSide") or "").lower()
-            if o_pos_side and o_pos_side != pos_side.lower():
+            # In hedge mode an order without positionSide cannot be safely
+            # attributed. Never cancel it merely because the symbol matches.
+            if o_pos_side != pos_side.lower():
                 continue
 
             if is_sl_order(o) or is_tp_order(o):
@@ -792,14 +861,21 @@ def _cancel_existing_sltp_sync(symbol: str, pos_side: str):
         except Exception:
             continue
 
-def apply_sltp_sync(base: str, *, sl_price=None, tp_price=None, cancel_first: bool = True) -> str:
+def apply_sltp_sync(
+    base: str,
+    *,
+    sl_price=None,
+    tp_price=None,
+    cancel_first: bool = True,
+    position_side: Optional[str] = None,
+) -> str:
     base = str(base).upper().strip()
 
     symbol = resolve_symbol_sync(base)
     if not symbol:
         raise RuntimeError(f"Symbol not found: {base}")
 
-    pos = fetch_position_oneway_sync(symbol)
+    pos = fetch_position_oneway_sync(symbol, position_side)
     if not pos:
         return "NO_POSITION"
 
@@ -849,23 +925,31 @@ def apply_sltp_sync(base: str, *, sl_price=None, tp_price=None, cancel_first: bo
 
     return " | ".join(result_parts)
 
-async def apply_sltp(base: str, *, sl_price=None, tp_price=None, cancel_first: bool = True) -> str:
+async def apply_sltp(
+    base: str,
+    *,
+    sl_price=None,
+    tp_price=None,
+    cancel_first: bool = True,
+    position_side: Optional[str] = None,
+) -> str:
     return await asyncio.to_thread(
         apply_sltp_sync,
         base,
         sl_price=sl_price,
         tp_price=tp_price,
         cancel_first=cancel_first,
+        position_side=position_side,
     )
 
-def reapply_saved_sltp_sync(base: str) -> str:
+def reapply_saved_sltp_sync(base: str, position_side: Optional[str] = None) -> str:
     base = str(base).upper().strip()
 
     symbol = resolve_symbol_sync(base)
     if not symbol:
         raise RuntimeError(f"Symbol not found: {base}")
 
-    pos = fetch_position_oneway_sync(symbol)
+    pos = fetch_position_oneway_sync(symbol, position_side)
     if not pos:
         return "NO_POSITION"
 
@@ -880,17 +964,17 @@ def reapply_saved_sltp_sync(base: str) -> str:
     if sl is None and tp is None:
         return "NO_SAVED_SLTP"
 
-    return apply_sltp_sync(base, sl_price=sl, tp_price=tp, cancel_first=True)
+    return apply_sltp_sync(base, sl_price=sl, tp_price=tp, cancel_first=True, position_side=pos_side)
 
-async def reapply_saved_sltp(base: str) -> str:
-    return await asyncio.to_thread(reapply_saved_sltp_sync, base)
+async def reapply_saved_sltp(base: str, position_side: Optional[str] = None) -> str:
+    return await asyncio.to_thread(reapply_saved_sltp_sync, base, position_side)
 
-def set_sl_oneway_sync(base: str, sl_price: float) -> str:
+def set_sl_oneway_sync(base: str, sl_price: float, position_side: Optional[str] = None) -> str:
     symbol = resolve_symbol_sync(base)
     if not symbol:
         raise RuntimeError(f"Symbol not found: {base}")
 
-    pos = fetch_position_oneway_sync(symbol)
+    pos = fetch_position_oneway_sync(symbol, position_side)
     if not pos:
         return "NO_POSITION"
 
@@ -898,17 +982,17 @@ def set_sl_oneway_sync(base: str, sl_price: float) -> str:
     saved = _load_saved_sltp_for_position(str(base).upper(), pos_side)
     tp_saved = saved.get("tp")
 
-    return apply_sltp_sync(base, sl_price=sl_price, tp_price=tp_saved, cancel_first=True)
+    return apply_sltp_sync(base, sl_price=sl_price, tp_price=tp_saved, cancel_first=True, position_side=pos_side)
 
-async def set_sl_oneway(base: str, sl_price: float) -> str:
-    return await asyncio.to_thread(set_sl_oneway_sync, base, sl_price)
+async def set_sl_oneway(base: str, sl_price: float, position_side: Optional[str] = None) -> str:
+    return await asyncio.to_thread(set_sl_oneway_sync, base, sl_price, position_side)
 
-def set_tp_oneway_sync(base: str, tp_price: float) -> str:
+def set_tp_oneway_sync(base: str, tp_price: float, position_side: Optional[str] = None) -> str:
     symbol = resolve_symbol_sync(base)
     if not symbol:
         raise RuntimeError(f"Symbol not found: {base}")
 
-    pos = fetch_position_oneway_sync(symbol)
+    pos = fetch_position_oneway_sync(symbol, position_side)
     if not pos:
         return "NO_POSITION"
 
@@ -916,17 +1000,17 @@ def set_tp_oneway_sync(base: str, tp_price: float) -> str:
     saved = _load_saved_sltp_for_position(str(base).upper(), pos_side)
     sl_saved = saved.get("sl")
 
-    return apply_sltp_sync(base, sl_price=sl_saved, tp_price=tp_price, cancel_first=True)
+    return apply_sltp_sync(base, sl_price=sl_saved, tp_price=tp_price, cancel_first=True, position_side=pos_side)
 
-async def set_tp_oneway(base: str, tp_price: float) -> str:
-    return await asyncio.to_thread(set_tp_oneway_sync, base, tp_price)
+async def set_tp_oneway(base: str, tp_price: float, position_side: Optional[str] = None) -> str:
+    return await asyncio.to_thread(set_tp_oneway_sync, base, tp_price, position_side)
 
-def breakeven_oneway_sync(base: str) -> str:
+def breakeven_oneway_sync(base: str, position_side: Optional[str] = None) -> str:
     symbol = resolve_symbol_sync(base)
     if not symbol:
         raise RuntimeError(f"Symbol not found: {base}")
 
-    pos = fetch_position_oneway_sync(symbol)
+    pos = fetch_position_oneway_sync(symbol, position_side)
     if not pos:
         return "NO_POSITION"
 
@@ -938,17 +1022,17 @@ def breakeven_oneway_sync(base: str) -> str:
     saved = _load_saved_sltp_for_position(str(base).upper(), pos_side)
     tp_saved = saved.get("tp")
 
-    return apply_sltp_sync(base, sl_price=float(entry), tp_price=tp_saved, cancel_first=True)
+    return apply_sltp_sync(base, sl_price=float(entry), tp_price=tp_saved, cancel_first=True, position_side=pos_side)
 
-async def breakeven_oneway(base: str) -> str:
-    return await asyncio.to_thread(breakeven_oneway_sync, base)
+async def breakeven_oneway(base: str, position_side: Optional[str] = None) -> str:
+    return await asyncio.to_thread(breakeven_oneway_sync, base, position_side)
 
-def add_position_oneway_sync(base: str, add_pct: Optional[float]) -> str:
+def add_position_oneway_sync(base: str, add_pct: Optional[float], position_side: Optional[str] = None) -> str:
     symbol = resolve_symbol_sync(base)
     if not symbol:
         raise RuntimeError(f"Symbol not found: {base}")
 
-    pos = fetch_position_oneway_sync(symbol)
+    pos = fetch_position_oneway_sync(symbol, position_side)
     if not pos:
         return "NO_POSITION"
 
@@ -985,16 +1069,22 @@ def add_position_oneway_sync(base: str, add_pct: Optional[float]) -> str:
     )
     return f"ADDED id={resp.get('id')} qty={add_qty} pct={pct}"
 
-async def add_position_oneway(base: str, add_pct: Optional[float]) -> str:
-    return await asyncio.to_thread(add_position_oneway_sync, base, add_pct)
+async def add_position_oneway(base: str, add_pct: Optional[float], position_side: Optional[str] = None) -> str:
+    return await asyncio.to_thread(add_position_oneway_sync, base, add_pct, position_side)
 
 
-async def wait_position_update(symbol: str, old_size: float = 0.0, timeout: float = 5.0, min_target_size: Optional[float] = None):
+async def wait_position_update(
+    symbol: str,
+    old_size: float = 0.0,
+    timeout: float = 5.0,
+    min_target_size: Optional[float] = None,
+    position_side: Optional[str] = None,
+):
     start = time.time()
     last_pos = None
 
     while time.time() - start < timeout:
-        pos = await fetch_position_oneway(symbol)
+        pos = await fetch_position_oneway(symbol, position_side)
         if pos:
             size = float(
                 pos.get("contracts")
@@ -1027,6 +1117,53 @@ def calc_qty(usdt_free: float, risk_pct: float, lev: int, entry_price: float) ->
     margin = usdt_free * (risk_pct / 100.0)
     notional = margin * lev
     return 0.0 if entry_price <= 0 else notional / entry_price
+
+def calculate_auto_trade_plan(
+    capital_usdt: float,
+    entry: float,
+    sl: float,
+    tp: float,
+    *,
+    risk_pct: float = FIXED_RISK_PCT,
+    max_leverage: int = MAX_AUTO_LEVERAGE,
+    distance_buffer: float = LEVERAGE_DISTANCE_BUFFER,
+    max_margin_usage_pct: float = MAX_MARGIN_USAGE_PCT,
+) -> dict:
+    """Size by loss at SL and choose conservative leverage from SL/TP span."""
+    capital = float(capital_usdt)
+    entry = float(entry)
+    sl = float(sl)
+    tp = float(tp)
+    if capital <= 0 or entry <= 0 or risk_pct <= 0:
+        raise ValueError("capital, entry and risk_pct must be positive")
+
+    stop_distance_pct = abs(entry - sl) / entry
+    tp_distance_pct = abs(tp - entry) / entry
+    if stop_distance_pct <= 0 or tp_distance_pct <= 0:
+        raise ValueError("SL and TP1 must differ from entry")
+
+    protected_distance = max(stop_distance_pct, tp_distance_pct)
+    raw_leverage = math.floor(1.0 / (protected_distance * max(distance_buffer, 1.0)))
+    leverage = max(1, min(int(max_leverage), raw_leverage))
+
+    risk_budget = capital * (float(risk_pct) / 100.0)
+    risk_sized_notional = risk_budget / stop_distance_pct
+    max_margin = capital * (float(max_margin_usage_pct) / 100.0)
+    margin_capped_notional = max_margin * leverage
+    notional = min(risk_sized_notional, margin_capped_notional)
+
+    return {
+        "risk_pct": float(risk_pct),
+        "risk_budget": risk_budget,
+        "stop_distance_pct": stop_distance_pct * 100.0,
+        "tp_distance_pct": tp_distance_pct * 100.0,
+        "leverage": leverage,
+        "notional": notional,
+        "margin": notional / leverage,
+        "expected_loss_at_sl": notional * stop_distance_pct,
+        "expected_profit_at_tp1": notional * tp_distance_pct,
+        "margin_limited": notional < risk_sized_notional,
+    }
 
 
 def calc_tp_from_rr(entry: float, sl: float, rr: float, side: str) -> float:
@@ -1159,6 +1296,86 @@ def has_close_intent(text: str) -> bool:
         return False
     return any(re.search(p, t, re.I) for p in CLOSE_INTENT_PATTERNS)
 
+def extract_signal_style(text: str) -> Optional[str]:
+    """Return a style only for an actual signal header, not a stats mention."""
+    header = "\n".join((text or "").splitlines()[:3])
+    match = re.search(r"\b(SCALP|INTRADAY|SWING)\b[^\n]*\b(LONG|SHORT)\b", header, re.I)
+    return match.group(1).upper() if match else None
+
+def is_allowed_signal_style(text: str) -> bool:
+    style = extract_signal_style(text)
+    return style is None or style in ALLOWED_SIGNAL_STYLES
+
+def extract_liquidation_from_text(text: str) -> Optional[float]:
+    match = re.search(
+        r"(?:liquidation(?:\s+price)?|liq(?:uid)?|ліквід\w*|ликвид\w*)\s*[:=]\s*([0-9]+(?:[.,][0-9]+)?)",
+        text or "",
+        re.I,
+    )
+    if not match:
+        return None
+    try:
+        value = float(match.group(1).replace(",", "."))
+        return value if value > 0 else None
+    except ValueError:
+        return None
+
+def _extract_message_number(text: str, pattern: str) -> Optional[float]:
+    match = re.search(pattern, text or "", re.I | re.M)
+    if not match:
+        return None
+    try:
+        return float(match.group(1).replace(",", "."))
+    except (TypeError, ValueError):
+        return None
+
+def parse_structured_scalp_signal(text: str) -> Optional[dict]:
+    """Deterministic parser for the generated SCALP messages used by this feed."""
+    if extract_signal_style(text) != "SCALP":
+        return None
+
+    header = re.search(
+        r"\bSCALP\s+(LONG|SHORT)\b[^\n]*?([A-Z0-9]{1,15})\s*/\s*USDT(?::USDT)?",
+        text or "",
+        re.I,
+    )
+    if not header:
+        return None
+
+    entry = _extract_message_number(text, r"^\s*[^\n]*\bEntry\s*:\s*([0-9]+(?:[.,][0-9]+)?)")
+    sl = _extract_message_number(text, r"^\s*[^\n]*\bSL\s*:\s*([0-9]+(?:[.,][0-9]+)?)")
+    # Deliberately read TP1 only. TP2 and TP3 are never returned to execution.
+    tp1 = _extract_message_number(text, r"^\s*[^\n]*\bTP1\s*:\s*([0-9]+(?:[.,][0-9]+)?)")
+    leverage = _extract_message_number(text, r"(?:Плече|Leverage)\s*:\s*([0-9]+(?:[.,][0-9]+)?)\s*x")
+    position_usdt = _extract_message_number(text, r"(?:Позиція|Позиция|Position)\s*:\s*([0-9]+(?:[.,][0-9]+)?)\s*USDT")
+    margin_usdt = _extract_message_number(text, r"(?:маржа|margin)\s*:\s*([0-9]+(?:[.,][0-9]+)?)\s*USDT")
+    balance_usdt = _extract_message_number(text, r"(?:Баланс|Balance)\s*:\s*([0-9]+(?:[.,][0-9]+)?)\s*USDT")
+    risk_pct = _extract_message_number(
+        text,
+        r"(?:ризик|риск|risk)\s*:\s*[0-9]+(?:[.,][0-9]+)?\s*USDT\s*\(([0-9]+(?:[.,][0-9]+)?)\s*%\)",
+    )
+
+    if sl is None or tp1 is None:
+        return None
+
+    return {
+        "action": "OPEN",
+        "base": header.group(2).upper(),
+        "bases": None,
+        "side": header.group(1).lower(),
+        "leverage": int(leverage) if leverage is not None else None,
+        "risk_pct": risk_pct,
+        "entry": entry,
+        "sl": sl,
+        "tp": tp1,
+        "position_usdt": position_usdt,
+        "margin_usdt": margin_usdt,
+        "balance_usdt": balance_usdt,
+        "liquidation": extract_liquidation_from_text(text),
+        "confidence": 1.0,
+        "raw_text": (text or "")[:500],
+    }
+
 
 # =========================
 # LOCAL SET_SL PARSER (без AI)
@@ -1233,7 +1450,7 @@ EXTRACTION RULES:
 - RISK_PCT: parse phrases like "1.5% balance", "risk 2%", "margin 0.75%"
 - ADD_PCT: for ADD signals parse the percentage being added now
 - SL: number after SL / stop loss
-- TP: first target PRICE number if a real target price is present
+- TP: use TP1 only. Ignore TP2, TP3 and every later target
 - RR: if take profit is expressed as RR instead of a price, extract rr as a positive number
 - Examples of RR targets:
   - RR2 -> rr=2
@@ -1245,6 +1462,7 @@ EXTRACTION RULES:
 - PRICE: extract only when the message explicitly provides a pending add/limit price
 - Ignore informational fields such as "new open", "new entry", "average entry", "avg entry", "current entry" for ADD
 - ENTRY may be missing and that is acceptable
+- LIQUIDATION: extract the estimated liquidation price from fields such as "Liquidation", "Liq" or "Орієнт. ліквід"
 
 DCA RULES:
 - If ADD has a specific price -> treat it as DCA
@@ -1279,7 +1497,11 @@ OUTPUT FORMAT:
   "rr": 2.5,
   "dca_price": 123.0,
   "dca_pct": 0.75,
-  "price": 123.0
+  "price": 123.0,
+  "liquidation": 100.0,
+  "position_usdt": 250.0,
+  "margin_usdt": 50.0,
+  "balance_usdt": 1000.0
 }
 """
 
@@ -1299,6 +1521,10 @@ AI_JSON_SHAPE = {
     "dca_price": "number|null",
     "dca_pct": "number|null",
     "price": "number|null", 
+    "liquidation": "number|null",
+    "position_usdt": "number|null",
+    "margin_usdt": "number|null",
+    "balance_usdt": "number|null",
 }
 
 def is_sl_order(o):
@@ -1420,6 +1646,13 @@ def ai_parse_trade_multi(text: Optional[str], image_paths: Optional[list[str]]) 
             "raw_text": out[:800]
         }
 
+def parse_trade_multi(text: Optional[str], image_paths: Optional[list[str]]) -> dict:
+    structured = parse_structured_scalp_signal(text or "")
+    if structured:
+        log("INFO", "STRUCTURED SCALP parsed locally; execution target=TP1 only")
+        return structured
+    return ai_parse_trade_multi(text, image_paths)
+
 # =========================
 # ACTION MIN CONF
 # =========================
@@ -1539,6 +1772,39 @@ def _log_action_result(action_name: str, base: str, res: str) -> bool:
     log("INFO", f"SUCCESS {action_name} {base}: {res}")
     return True
 
+def _format_open_notification(
+    *,
+    base: str,
+    side: str,
+    style: Optional[str],
+    entry: float,
+    sl: float,
+    tp: float,
+    qty: float,
+    leverage: int,
+    liquidation: Optional[float],
+    risk_usdt: Optional[float] = None,
+    expected_tp1_profit: Optional[float] = None,
+    margin_usdt: Optional[float] = None,
+) -> str:
+    lines = [
+        f"✅ OPENED {style or 'SIGNAL'} · {base}/USDT",
+        f"Side: {side.upper()}",
+        f"Entry: {entry}",
+        f"SL: {sl}",
+        f"TP1 (100% position): {tp}",
+        f"Qty: {qty}",
+        f"Leverage: {leverage}x",
+        f"Liquidation: {liquidation if liquidation is not None else 'n/a'}",
+    ]
+    if risk_usdt is not None:
+        lines.append(f"Risk to SL: {risk_usdt:.4f} USDT ({FIXED_RISK_PCT}%)")
+    if expected_tp1_profit is not None:
+        lines.append(f"Expected TP1 profit: {expected_tp1_profit:.4f} USDT")
+    if margin_usdt is not None:
+        lines.append(f"Estimated margin: {margin_usdt:.4f} USDT")
+    return "\n".join(lines)
+
 
 async def handle_ai_command(cmd: dict):
     action = (cmd.get("action") or "NONE").upper()
@@ -1552,10 +1818,16 @@ async def handle_ai_command(cmd: dict):
     sl = cmd.get("sl")
     tp = cmd.get("tp")
     add_pct = cmd.get("add_pct")
+    position_usdt = cmd.get("position_usdt")
+    margin_usdt = cmd.get("margin_usdt")
+    signal_balance_usdt = cmd.get("balance_usdt")
+    liquidation = cmd.get("liquidation")
+    if liquidation is None:
+        liquidation = extract_liquidation_from_text(cmd.get("_tg_text", ""))
 
     tg_text = cmd.get("_tg_text", "")
 
-    log("INFO", f"AI action={action} conf={conf} base={base} side={side} lev={lev} risk={risk_pct} sl={sl} tp={tp} add_pct={add_pct}")
+    log("INFO", f"AI action={action} conf={conf} base={base} side={side} lev={lev} risk={risk_pct} signal_balance={signal_balance_usdt} position_usdt={position_usdt} margin_usdt={margin_usdt} sl={sl} tp={tp} liq={liquidation} add_pct={add_pct}")
 
     # Safety: never convert a clear OPEN signal to ADD.
     # DCA inside an OPEN setup means "open now + place pending DCA order", not market ADD.
@@ -1623,7 +1895,7 @@ async def handle_ai_command(cmd: dict):
                 continue
 
             try:
-                res = await close_position_full(b)
+                res = await close_position_full(b, side if side in {"long", "short"} else None)
                 _log_action_result("CLOSE", b, res)
             except Exception as e:
                 log("ERROR", f"CLOSE {b} failed: {e}")
@@ -1636,10 +1908,6 @@ async def handle_ai_command(cmd: dict):
 
         if side not in {"long", "short"}:
             log("INFO", "AI SKIP OPEN: side missing/invalid")
-            return
-
-        if not lev or not risk_pct:
-            log("INFO", "AI SKIP OPEN: leverage or risk_pct missing")
             return
 
         rr_value = cmd.get("rr")
@@ -1697,11 +1965,22 @@ async def handle_ai_command(cmd: dict):
 
         try:
             usdt_total = await get_usdt_total()
-            qty_raw = calc_qty(usdt_total, float(risk_pct), int(lev), entry)
+            trade_plan = calculate_auto_trade_plan(usdt_total, entry, sl_prec, tp_prec)
+            lev = int(trade_plan["leverage"])
+            target_notional = float(trade_plan["notional"])
+            qty_raw = target_notional / entry
             qty, min_amount = await normalize_order_qty(symbol, qty_raw)
-            log("INFO", f"QTY USDT total={usdt_total} qty_raw≈{qty_raw} qty_prec={qty} min_amount={min_amount}")
+            log(
+                "INFO",
+                f"AUTO PLAN capital={usdt_total} risk={trade_plan['risk_pct']}% "
+                f"risk_budget={trade_plan['risk_budget']} leverage={lev}x "
+                f"SL_distance={trade_plan['stop_distance_pct']:.4f}% "
+                f"TP1_distance={trade_plan['tp_distance_pct']:.4f}% "
+                f"notional={target_notional} margin={trade_plan['margin']} qty={qty}",
+            )
             if min_amount is not None and qty_raw < min_amount:
-                log("WARNING", f"QTY raised to exchange minimum for {symbol}: raw={qty_raw} -> min={min_amount}")
+                log("WARNING", f"SKIP {symbol}: exchange minimum qty={min_amount} would exceed the {FIXED_RISK_PCT}% risk limit")
+                return
         except Exception as e:
             log("ERROR", f"balance/qty failed: {e}")
             return
@@ -1727,7 +2006,7 @@ async def handle_ai_command(cmd: dict):
         log("INFO", f"TRY OPEN {symbol} side={side} qty={qty}")
 
         try:
-            old_pos = await fetch_position_oneway(symbol)
+            old_pos = await fetch_position_oneway(symbol, side)
             old_size = float(
                 old_pos.get("contracts")
                 or old_pos.get("size")
@@ -1743,6 +2022,7 @@ async def handle_ai_command(cmd: dict):
                 old_size=old_size,
                 timeout=6.0,
                 min_target_size=old_size + qty * 0.7,
+                position_side=side,
             )
             log("INFO", f"POSITION_VISIBLE_AFTER_OPEN {base_clean}={bool(pos_seen)}")
             await asyncio.sleep(0.7)
@@ -1751,8 +2031,33 @@ async def handle_ai_command(cmd: dict):
             LAST_SLTP[base_clean][side] = {"sl": sl_prec, "tp": tp_prec}
             save_sltp()
 
-            res = await apply_sltp(base_clean, sl_price=sl_prec, tp_price=tp_prec, cancel_first=True)
+            res = await apply_sltp(
+                base_clean,
+                sl_price=sl_prec,
+                tp_price=tp_prec,
+                cancel_first=True,
+                position_side=side,
+            )
             log("INFO", f"APPLY SL/TP after OPEN done: {res}")
+
+            actual_liquidation = _extract_position_liquidation(pos_seen)
+            shown_liquidation = actual_liquidation or estimate_liquidation_price(entry, side, int(lev))
+            await _send_to_tg(
+                _format_open_notification(
+                    base=base_clean,
+                    side=side,
+                    style=cmd.get("_signal_style"),
+                    entry=entry,
+                    sl=sl_prec,
+                    tp=tp_prec,
+                    qty=qty,
+                    leverage=int(lev),
+                    liquidation=shown_liquidation,
+                    risk_usdt=float(trade_plan["expected_loss_at_sl"]),
+                    expected_tp1_profit=float(trade_plan["expected_profit_at_tp1"]),
+                    margin_usdt=float(trade_plan["margin"]),
+                )
+            )
 
             dca_price = cmd.get("dca_price") or cmd.get("price")
             dca_pct = cmd.get("dca_pct")
@@ -1776,7 +2081,7 @@ async def handle_ai_command(cmd: dict):
             log("ERROR", f"symbol not listed: {base_clean}")
             return
 
-        pos = await fetch_position_oneway(symbol)
+        pos = await fetch_position_oneway(symbol, side if side in {"long", "short"} else None)
         if not pos:
             log("WARNING", f"SKIP ADD {base_clean}: NO_POSITION")
             return
@@ -1837,7 +2142,7 @@ async def handle_ai_command(cmd: dict):
                 log("INFO", f"DRY_RUN ADD {base_clean} qty={qty} (~{pct}% balance)")
                 return
 
-            old_pos = await fetch_position_oneway(symbol)
+            old_pos = await fetch_position_oneway(symbol, side)
             old_size = float(
                 old_pos.get("contracts")
                 or old_pos.get("size")
@@ -1854,11 +2159,12 @@ async def handle_ai_command(cmd: dict):
                 old_size=old_size,
                 timeout=6.0,
                 min_target_size=old_size + qty * 0.7,
+                position_side=side,
             )
             log("INFO", f"POSITION_VISIBLE_AFTER_ADD {base_clean}={bool(pos_seen)}")
             await asyncio.sleep(0.7)
 
-            reapply_res = await reapply_saved_sltp(base_clean)
+            reapply_res = await reapply_saved_sltp(base_clean, side)
             log("INFO", f"REAPPLY after ADD done: {reapply_res}")
             return
         except Exception as e:
@@ -1877,7 +2183,7 @@ async def handle_ai_command(cmd: dict):
             return
 
         new_sl = float(sl)
-        pos = await fetch_position_oneway(symbol)
+        pos = await fetch_position_oneway(symbol, side if side in {"long", "short"} else None)
         pos_side = (
             pos.get("side")
             or pos.get("positionSide")
@@ -1898,7 +2204,7 @@ async def handle_ai_command(cmd: dict):
             return
 
         try:
-            res = await set_sl_oneway(base_clean, new_sl)
+            res = await set_sl_oneway(base_clean, new_sl, pos_side)
             _log_action_result("SET_SL", base_clean, res)
         except Exception as e:
             log("ERROR", f"SET_SL failed: {e}")
@@ -1916,7 +2222,7 @@ async def handle_ai_command(cmd: dict):
             return
 
         new_tp = float(tp)
-        pos = await fetch_position_oneway(symbol)
+        pos = await fetch_position_oneway(symbol, side if side in {"long", "short"} else None)
         pos_side = (
             pos.get("side")
             or pos.get("positionSide")
@@ -1937,7 +2243,7 @@ async def handle_ai_command(cmd: dict):
             return
 
         try:
-            res = await set_tp_oneway(base_clean, new_tp)
+            res = await set_tp_oneway(base_clean, new_tp, pos_side)
             _log_action_result("SET_TP", base_clean, res)
         except Exception as e:
             log("ERROR", f"SET_TP failed: {e}")
@@ -1970,7 +2276,7 @@ async def handle_ai_command(cmd: dict):
 
             try:
                 log("INFO", f"BE {base_clean}: move SL to entry and keep TP")
-                res = await breakeven_oneway(base_clean)
+                res = await breakeven_oneway(base_clean, side if side in {"long", "short"} else None)
                 _log_action_result("BE", base_clean, res)
             except Exception as e:
                 log("ERROR", f"BE {base_clean} failed: {e}")
@@ -2100,6 +2406,10 @@ async def album_flush(gid: str):
     text = (payload.get("text") or "").strip()
     images = (payload.get("images") or [])[:4]
 
+    if text and not is_allowed_signal_style(text):
+        log("INFO", f"STYLE SKIP album={gid} style={extract_signal_style(text)} allowed={sorted(ALLOWED_SIGNAL_STYLES)}")
+        return
+
     log("INFO", f"ALBUM media_group={gid} images={len(images)}")
     log("INFO", f"AI_RAW {text[:400] if text else '<no text>'}")
 
@@ -2110,8 +2420,10 @@ async def album_flush(gid: str):
         await close_bundle_start_or_update(text=text, images=images)
         return
 
-    cmd = await asyncio.to_thread(ai_parse_trade_multi, text if text else None, images)
+    cmd = await asyncio.to_thread(parse_trade_multi, text if text else None, images)
     cmd["_tg_text"] = text
+    cmd["_signal_style"] = extract_signal_style(text)
+    cmd["liquidation"] = cmd.get("liquidation") or extract_liquidation_from_text(text)
     await handle_ai_command(cmd)
 
 async def close_bundle_start_or_update(text: str, images: list[str]):
@@ -2167,8 +2479,9 @@ async def close_bundle_flush():
     log("INFO", f"BUNDLE close_bundle images={len(images)}")
     log("INFO", f"AI_RAW {text[:400]}")
 
-    cmd = await asyncio.to_thread(ai_parse_trade_multi, text, images)
+    cmd = await asyncio.to_thread(parse_trade_multi, text, images)
     cmd["_tg_text"] = text
+    cmd["_signal_style"] = extract_signal_style(text)
     await handle_ai_command(cmd)
 
 
@@ -2198,6 +2511,10 @@ async def on_signal(_, message):
 
     text = (message.text or message.caption or "").strip()
 
+    if text and not message.media_group_id and not is_allowed_signal_style(text):
+        log("INFO", f"STYLE SKIP style={extract_signal_style(text)} allowed={sorted(ALLOWED_SIGNAL_STYLES)}")
+        return
+
     img_path = None
     if message.photo:
         try:
@@ -2219,8 +2536,9 @@ async def on_signal(_, message):
             log("INFO", "BUNDLE orphan photo attached to last CLOSE text")
             return
         log("INFO", "AI_RAW <no text> (single image)")
-        cmd = await asyncio.to_thread(ai_parse_trade_multi, None, [img_path])
+        cmd = await asyncio.to_thread(parse_trade_multi, None, [img_path])
         cmd["_tg_text"] = ""
+        cmd["_signal_style"] = None
         await handle_ai_command(cmd)
         return
         
@@ -2233,8 +2551,10 @@ async def on_signal(_, message):
         return
 
     log("INFO", f"AI_RAW {text[:400] if text else '<no text>'}")
-    cmd = await asyncio.to_thread(ai_parse_trade_multi, text if text else None, [img_path] if img_path else [])
+    cmd = await asyncio.to_thread(parse_trade_multi, text if text else None, [img_path] if img_path else [])
     cmd["_tg_text"] = text
+    cmd["_signal_style"] = extract_signal_style(text)
+    cmd["liquidation"] = cmd.get("liquidation") or extract_liquidation_from_text(text)
     await handle_ai_command(cmd)
 
 

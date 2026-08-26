@@ -2,5 +2,6 @@ pyrogram==2.0.106
 tgcrypto==1.2.5
 ccxt==4.5.38
 python-dotenv==1.0.1
+requests>=2.32.0,<3.0.0
 tzdata>=2025.2
 openai>=1.0.0,<3.0.0

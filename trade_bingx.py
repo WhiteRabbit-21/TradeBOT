@@ -9,10 +9,13 @@ import hmac
 import math
 from urllib.parse import urlencode
 from datetime import datetime
+from zoneinfo import ZoneInfo
 
 import requests
 from typing import Optional, Any
 from trade_notifier import pnl_watcher
+from asset_universe import classify_non_crypto_asset
+from trade_rules import SWING_RULES, risk_pct_for_style
 import ccxt
 from pyrogram import Client, filters, idle
 from pyrogram.errors import PeerIdInvalid, FloodWait, RPCError
@@ -26,11 +29,28 @@ except Exception:
 # =========================
 # ENV / CONFIG
 # =========================
+_REQUIRED_LIVE_ENV = (
+    "TG_API_ID",
+    "TG_API_HASH",
+    "TG_SESSION_STRING",
+    "BINGX_API_KEY",
+    "BINGX_API_SECRET",
+)
+_missing_live_env = [name for name in _REQUIRED_LIVE_ENV if not os.getenv(name)]
+if _missing_live_env and os.getenv("WAIT_FOR_CONFIG", "0").strip() == "1":
+    print(
+        "TradeBOT is waiting for required configuration: "
+        + ", ".join(_missing_live_env),
+        flush=True,
+    )
+    while True:
+        time.sleep(300)
+
 API_ID = int(os.environ["TG_API_ID"])
 API_HASH = os.environ["TG_API_HASH"]
 SESSION_STRING = os.environ["TG_SESSION_STRING"]
 
-TARGET_CHAT_ID = int(os.getenv("TARGET_CHAT_ID", "-5486330898"))   # де читаємо сигнали
+TARGET_CHAT_ID = int(os.getenv("TARGET_CHAT_ID", "-1002598403649"))   # де читаємо сигнали
 LOG_CHAT_ID = int(os.getenv("TG_LOG_CHAT_ID", "-1003828203122"))      # куди шлемо логи
 PNL_CHAT_ID = int(os.getenv("PNL_CHAT_ID", "-1003332013833")) # куди шлемо профіт/лос
 
@@ -43,11 +63,41 @@ OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4.1")
 
 DRY_RUN = os.getenv("DRY_RUN", "1").strip() == "1"
 HEARTBEAT_SEC = int(os.getenv("HEARTBEAT_SEC", "300"))  # 5 хв
-ALLOWED_SIGNAL_STYLES = {
-    style.strip().upper()
-    for style in os.getenv("ALLOWED_SIGNAL_STYLES", "SCALP").split(",")
-    if style.strip()
-}
+SWING_EXIT_WATCH_SEC = float(os.getenv("SWING_EXIT_WATCH_SEC", "4"))
+# Trading policy v2:
+# - execute every generated LONG style (SCALP / INTRADAY / SWING);
+# - never open SHORT;
+# - block SCALP/INTRADAY entries from 00:00 through 05:59 Kyiv time;
+# - allow SWING LONG entries around the clock.
+# - Full TP1 SCALP/INTRADAY: reject every setup with effective RR1 >= 3.0;
+# - Full TP1 SCALP: reject RR1 >= 2.5 (there is deliberately no minimum RR).
+# SWING uses the three-target partial model declared in trade_rules.py.
+# Existing position management (SL/TP/BE/CLOSE) remains active around the clock.
+TRADE_LONG_ALL_STYLES = os.getenv("TRADE_LONG_ALL_STYLES", "1").strip() == "1"
+TRADE_LONG_ONLY = os.getenv("TRADE_LONG_ONLY", "1").strip() == "1"
+# Signals remain in the generator database for future TradFi research.  This
+# flag only prevents a new exchange order for stocks, ETFs and other non-crypto
+# underlyings; management of positions that already exist remains enabled.
+TRADE_CRYPTO_ONLY = os.getenv("TRADE_CRYPTO_ONLY", "1").strip() == "1"
+ALLOW_SWING_LONG_DURING_BLOCKED_HOURS = (
+    os.getenv("ALLOW_SWING_LONG_DURING_BLOCKED_HOURS", "1").strip() == "1"
+)
+ENTRY_BLOCK_START_HOUR_KYIV = int(os.getenv("ENTRY_BLOCK_START_HOUR_KYIV", "0"))
+ENTRY_BLOCK_END_HOUR_KYIV = int(os.getenv("ENTRY_BLOCK_END_HOUR_KYIV", "6"))
+FULL_TP1_MAX_RR_EXCLUSIVE = float(os.getenv("FULL_TP1_MAX_RR_EXCLUSIVE", "3.0"))
+SCALP_FULL_TP1_MAX_RR_EXCLUSIVE = float(
+    os.getenv("SCALP_FULL_TP1_MAX_RR_EXCLUSIVE", "2.5")
+)
+KYIV_TZ = ZoneInfo("Europe/Kyiv")
+
+if TRADE_LONG_ALL_STYLES:
+    ALLOWED_SIGNAL_STYLES = {"SCALP", "INTRADAY", "SWING"}
+else:
+    ALLOWED_SIGNAL_STYLES = {
+        style.strip().upper()
+        for style in os.getenv("ALLOWED_SIGNAL_STYLES", "SCALP").split(",")
+        if style.strip()
+    }
 FIXED_RISK_PCT = float(os.getenv("FIXED_RISK_PCT", "0.5"))
 MAX_AUTO_LEVERAGE = int(os.getenv("MAX_AUTO_LEVERAGE", "20"))
 LEVERAGE_DISTANCE_BUFFER = float(os.getenv("LEVERAGE_DISTANCE_BUFFER", "3.0"))
@@ -59,9 +109,14 @@ CLOSE_BUNDLE_WINDOW_SEC = float(os.getenv("CLOSE_BUNDLE_WINDOW_SEC", "15"))  # a
 # --- TG logging config (hardcoded) ---
 LOG_LEVEL = "INFO"   # DEBUG / INFO / WARNING / ERROR
 LOG_FLUSH_SEC = 20   # INFO пачкою раз на N секунд
-SLTP_FILE = "/data/sltp.json"
+STATE_DIR = (
+    os.getenv("DATA_DIR")
+    or os.getenv("RAILWAY_VOLUME_MOUNT_PATH")
+    or "/data"
+).rstrip("/\\")
+SLTP_FILE = os.path.join(STATE_DIR, "sltp.json")
 LAST_SLTP = {}
-ORDER_IDS_FILE = "/data/order_ids.json"
+ORDER_IDS_FILE = os.path.join(STATE_DIR, "order_ids.json")
 LAST_ORDER_IDS = {}
 
 # =========================
@@ -287,9 +342,13 @@ def ensure_markets_loaded_sync():
 async def ensure_markets_loaded():
     await asyncio.to_thread(ensure_markets_loaded_sync)
 
-def resolve_symbol_sync(base: str) -> Optional[str]:
-    ensure_markets_loaded_sync()
+def _normalized_contract_base(value: Any) -> str:
+    value = str(value or "").upper().strip()
+    value = re.sub(r"(?:/|-|_)USDT(?::USDT)?$", "", value)
+    return re.sub(r"[^A-Z0-9]", "", value)
 
+def _find_swap_symbol(markets: dict[str, Any], base: str) -> Optional[str]:
+    """Find USDT perpetuals whose BingX API asset differs from displayName."""
     raw_base = str(base or "").upper().strip()
     raw_base = re.sub(r"[^A-Z0-9]", "", raw_base)
     if raw_base.endswith("USDT"):
@@ -300,22 +359,101 @@ def resolve_symbol_sync(base: str) -> Optional[str]:
         return None
 
     preferred = f"{base}/USDT:USDT"
-    m = exchange.markets.get(preferred)
+    m = markets.get(preferred)
     if m and (m.get("swap") or m.get("contract")):
         return preferred
 
-    for sym, m in exchange.markets.items():
+    for sym, m in markets.items():
         try:
             if not (m.get("swap") or m.get("contract")):
                 continue
-            if m.get("base", "").upper() != base:
-                continue
             if m.get("quote", "").upper() != "USDT":
                 continue
-            return sym
+
+            info = m.get("info") or {}
+            candidates = (
+                m.get("base"),
+                info.get("displayName"),
+                info.get("symbol"),
+            )
+            if any(_normalized_contract_base(candidate) == base for candidate in candidates):
+                return sym
         except Exception:
             continue
 
+    return None
+
+def resolve_symbol_sync(base: str) -> Optional[str]:
+    ensure_markets_loaded_sync()
+
+    symbol = _find_swap_symbol(exchange.markets, base)
+    if symbol:
+        return symbol
+
+    # A long-running worker can retain CCXT's market cache across new listings.
+    try:
+        refreshed = exchange.load_markets(True)
+        markets = refreshed if isinstance(refreshed, dict) else exchange.markets
+        symbol = _find_swap_symbol(markets, base)
+        if symbol:
+            log("INFO", f"MARKET RESOLVED AFTER REFRESH {base} -> {symbol}")
+            return symbol
+    except Exception as e:
+        log("WARNING", f"BINGX market refresh failed for {base}: {e}")
+
+    return None
+
+def market_api_open_disabled_sync(symbol: str) -> Optional[str]:
+    """Return a diagnostic when BingX lists a contract but blocks API opens."""
+    try:
+        market = exchange.market(symbol)
+    except Exception:
+        market = (getattr(exchange, "markets", {}) or {}).get(symbol) or {}
+
+    info = market.get("info") or {}
+    state = info.get("apiStateOpen")
+    if isinstance(state, bool):
+        disabled = not state
+    else:
+        disabled = str(state).strip().lower() in {"false", "0", "no", "off"}
+
+    if not disabled:
+        return None
+
+    display_name = info.get("displayName") or symbol
+    internal_symbol = info.get("symbol") or market.get("id") or symbol
+    return (
+        f"BingX lists {display_name}, but opening this contract via API is disabled "
+        f"(apiStateOpen=false, internal symbol={internal_symbol})"
+    )
+
+
+def non_crypto_open_block_reason(
+    base: str,
+    signal_text: str = "",
+    symbol: Optional[str] = None,
+) -> Optional[str]:
+    """Block only new non-crypto orders while preserving their source signal."""
+    if not TRADE_CRYPTO_ONLY:
+        return None
+
+    market = None
+    if symbol:
+        try:
+            market = exchange.market(symbol)
+        except Exception:
+            market = (getattr(exchange, "markets", {}) or {}).get(symbol)
+
+    asset_class = classify_non_crypto_asset(
+        base,
+        market=market,
+        signal_text=signal_text,
+    )
+    if asset_class:
+        return (
+            f"asset={str(base).upper()} classified as {asset_class}; "
+            "execution policy allows ordinary crypto assets only"
+        )
     return None
 
 async def resolve_symbol(base: str) -> Optional[str]:
@@ -823,13 +961,9 @@ async def cancel_all_open_orders_for_symbol(symbol: str, pos_side: Optional[str]
 def _cancel_known_order_ids_sync(symbol: str, key: str):
     saved = LAST_ORDER_IDS.get(key) or {}
 
-    sl_id = saved.get("sl_id")
-    tp_id = saved.get("tp_id")
-
-    if sl_id:
-        cancel_order_exact_sync(symbol, sl_id)
-    if tp_id:
-        cancel_order_exact_sync(symbol, tp_id)
+    for name, order_id in list(saved.items()):
+        if name.endswith("_id") and order_id:
+            cancel_order_exact_sync(symbol, order_id)
 
     LAST_ORDER_IDS[key] = {}
     save_order_ids()
@@ -860,6 +994,87 @@ def _cancel_existing_sltp_sync(symbol: str, pos_side: str):
                         log("WARNING", f"CANCEL existing failed symbol={symbol} id={oid}: {e}")
         except Exception:
             continue
+
+
+def _position_entry_price(pos: Optional[dict], fallback: Optional[float] = None) -> Optional[float]:
+    if pos:
+        info = pos.get("info") or {}
+        value = (
+            pos.get("entryPrice")
+            or pos.get("average")
+            or pos.get("avgPrice")
+            or info.get("avgPrice")
+            or info.get("averagePrice")
+        )
+        try:
+            value_f = float(value)
+            if value_f > 0:
+                return value_f
+        except (TypeError, ValueError):
+            pass
+    try:
+        fallback_f = float(fallback)
+        return fallback_f if fallback_f > 0 else None
+    except (TypeError, ValueError):
+        return None
+
+
+def calculate_swing_breakeven_price(
+    entry: float,
+    initial_sl: float,
+    side: str = "long",
+    buffer_r: float = SWING_RULES.breakeven_buffer_r,
+) -> float:
+    """Return Entry minus/plus the configured fraction of the original 1R."""
+    entry_f = float(entry)
+    initial_sl_f = float(initial_sl)
+    buffer_f = float(buffer_r)
+    normalized_side = str(side or "").lower()
+    if normalized_side == "long":
+        risk = entry_f - initial_sl_f
+        if risk <= 0:
+            raise ValueError("LONG SWING requires SL below entry")
+        return entry_f - risk * buffer_f
+    if normalized_side == "short":
+        risk = initial_sl_f - entry_f
+        if risk <= 0:
+            raise ValueError("SHORT SWING requires SL above entry")
+        return entry_f + risk * buffer_f
+    raise ValueError(f"unsupported side={normalized_side or 'missing'}")
+
+
+def _split_swing_target_quantities(symbol: str, total_qty: float) -> tuple[float, float, float]:
+    """Split an exchange-precision position without exceeding its total size."""
+    total = float(total_qty)
+    if total <= 0:
+        raise ValueError("SWING position quantity must be positive")
+
+    def precise(value: float) -> float:
+        return float(exchange.amount_to_precision(symbol, max(0.0, value)))
+
+    split = SWING_RULES.target_split
+    qty1 = precise(total * split[0])
+    qty2 = precise(total * split[1])
+    qty3 = precise(total - qty1 - qty2)
+
+    # Defensive correction for exchanges whose formatter rounds instead of
+    # truncating. TP quantities must never sum above the current position.
+    if qty1 + qty2 + qty3 > total + max(1e-12, total * 1e-10):
+        qty3 = precise(max(0.0, total - qty1 - qty2))
+
+    market = exchange.market(symbol)
+    min_amount = (((market.get("limits") or {}).get("amount") or {}).get("min"))
+    min_amount_f = float(min_amount) if min_amount is not None else 0.0
+    quantities = (qty1, qty2, qty3)
+    if any(q <= 0 for q in quantities):
+        raise ValueError(f"position {total} is too small for three SWING targets")
+    if min_amount_f > 0 and any(q < min_amount_f for q in quantities):
+        raise ValueError(
+            f"one of SWING target quantities {quantities} is below exchange minimum {min_amount_f}"
+        )
+    if sum(quantities) > total + max(1e-12, total * 1e-10):
+        raise ValueError(f"SWING target quantities {quantities} exceed position {total}")
+    return quantities
 
 def apply_sltp_sync(
     base: str,
@@ -942,6 +1157,347 @@ async def apply_sltp(
         position_side=position_side,
     )
 
+
+def apply_swing_sltp_sync(
+    base: str,
+    *,
+    entry_price: float,
+    sl_price: float,
+    tp1_price: float,
+    tp2_price: float,
+    tp3_price: float,
+    position_side: str = "long",
+) -> str:
+    """Arm one full SL plus 40/30/30 SWING take-profit orders.
+
+    BingX hedge mode rejects ``reduceOnly``. Closing semantics are provided by
+    the opposite order side together with the explicit LONG/SHORT
+    ``positionSide`` and the partial quantities.
+    """
+    base_u = str(base).upper().strip()
+    symbol = resolve_symbol_sync(base_u)
+    if not symbol:
+        raise RuntimeError(f"Symbol not found: {base_u}")
+
+    pos = fetch_position_oneway_sync(symbol, position_side)
+    if not pos:
+        return "NO_POSITION"
+    pos_side = _extract_position_side_sync(pos)
+    if pos_side != "long":
+        raise RuntimeError("Live SWING partial-exit model is LONG-only")
+
+    qty = _extract_position_qty_sync(pos, symbol)
+    if qty <= 0:
+        return "NO_POSITION"
+    qty1, qty2, qty3 = _split_swing_target_quantities(symbol, qty)
+
+    actual_entry = _position_entry_price(pos, entry_price)
+    if actual_entry is None:
+        raise RuntimeError("Cannot determine SWING entry price")
+
+    prices = []
+    for value in (sl_price, tp1_price, tp2_price, tp3_price):
+        try:
+            prices.append(float(exchange.price_to_precision(symbol, float(value))))
+        except Exception:
+            prices.append(float(value))
+    sl_prec, tp1_prec, tp2_prec, tp3_prec = prices
+    if not (sl_prec < actual_entry < tp1_prec < tp2_prec < tp3_prec):
+        raise ValueError(
+            "SWING prices must be ordered SL < entry < TP1 < TP2 < TP3; "
+            f"got {sl_prec}, {actual_entry}, {tp1_prec}, {tp2_prec}, {tp3_prec}"
+        )
+
+    be_prec = calculate_swing_breakeven_price(actual_entry, sl_prec, pos_side)
+    try:
+        be_prec = float(exchange.price_to_precision(symbol, be_prec))
+    except Exception:
+        pass
+
+    key = _state_key(base_u, pos_side)
+    _cancel_known_order_ids_sync(symbol, key)
+    _cancel_existing_sltp_sync(symbol, pos_side)
+    time.sleep(0.25)
+
+    placed_ids: dict[str, Any] = {}
+    try:
+        sl_resp = _place_bingx_tpsl_raw_sync(symbol, pos_side, sl_prec, qty, "sl")
+        placed_ids["sl_id"] = _extract_bingx_order_id(sl_resp)
+        for label, target_price, target_qty in (
+            ("tp1", tp1_prec, qty1),
+            ("tp2", tp2_prec, qty2),
+            ("tp3", tp3_prec, qty3),
+        ):
+            response = _place_bingx_tpsl_raw_sync(
+                symbol, pos_side, target_price, target_qty, "tp"
+            )
+            placed_ids[f"{label}_id"] = _extract_bingx_order_id(response)
+
+        LAST_SLTP.setdefault(base_u, {})
+        LAST_SLTP[base_u][pos_side] = {
+            "sl": sl_prec,
+            "tp": tp1_prec,
+            "tp1": tp1_prec,
+            "tp2": tp2_prec,
+            "tp3": tp3_prec,
+            "swing_plan": {
+                "version": SWING_RULES.version,
+                "stage": "armed",
+                "entry": actual_entry,
+                "initial_sl": sl_prec,
+                "be_sl": be_prec,
+                "initial_qty": qty,
+                "tp1_qty": qty1,
+                "tp2_qty": qty2,
+                "tp3_qty": qty3,
+                "buffer_r": SWING_RULES.breakeven_buffer_r,
+            },
+        }
+        LAST_ORDER_IDS[key] = placed_ids
+        save_sltp()
+        save_order_ids()
+        log(
+            "INFO",
+            f"SWING EXIT ARMED symbol={symbol} qty={qty} SL={sl_prec} "
+            f"TP1={tp1_prec}/{qty1} TP2={tp2_prec}/{qty2} "
+            f"TP3={tp3_prec}/{qty3} AFTER_TP1_SL={be_prec}",
+        )
+        return (
+            f"SL={sl_prec}/{qty} | TP1={tp1_prec}/{qty1} | "
+            f"TP2={tp2_prec}/{qty2} | TP3={tp3_prec}/{qty3} | "
+            f"after TP1 SL={be_prec}"
+        )
+    except Exception as partial_error:
+        for order_id in placed_ids.values():
+            if order_id:
+                cancel_order_exact_sync(symbol, str(order_id))
+        _cancel_existing_sltp_sync(symbol, pos_side)
+        _clear_position_state(base_u, pos_side)
+        log(
+            "ERROR",
+            f"SWING partial protection failed for {symbol}: {partial_error}; "
+            "arming full-size SL + TP1 fallback",
+        )
+        fallback = apply_sltp_sync(
+            base_u,
+            sl_price=sl_prec,
+            tp_price=tp1_prec,
+            cancel_first=True,
+            position_side=pos_side,
+        )
+        return f"FALLBACK_FULL_TP1 after partial error={partial_error} | {fallback}"
+
+
+async def apply_swing_sltp(
+    base: str,
+    *,
+    entry_price: float,
+    sl_price: float,
+    tp1_price: float,
+    tp2_price: float,
+    tp3_price: float,
+    position_side: str = "long",
+) -> str:
+    return await asyncio.to_thread(
+        apply_swing_sltp_sync,
+        base,
+        entry_price=entry_price,
+        sl_price=sl_price,
+        tp1_price=tp1_price,
+        tp2_price=tp2_price,
+        tp3_price=tp3_price,
+        position_side=position_side,
+    )
+
+
+def _replace_swing_sl_sync(
+    base: str,
+    position_side: str,
+    new_sl_price: float,
+    next_stage: str,
+) -> str:
+    """Replace only the SWING SL; all three target orders stay untouched."""
+    base_u = str(base).upper().strip()
+    pos_side = str(position_side).lower()
+    symbol = resolve_symbol_sync(base_u)
+    if not symbol:
+        raise RuntimeError(f"Symbol not found: {base_u}")
+    pos = fetch_position_oneway_sync(symbol, pos_side)
+    if not pos:
+        return "NO_POSITION"
+    qty = _extract_position_qty_sync(pos, symbol)
+    if qty <= 0:
+        return "NO_POSITION"
+
+    state = (LAST_SLTP.get(base_u) or {}).get(pos_side) or {}
+    plan = state.get("swing_plan")
+    if not isinstance(plan, dict):
+        return "NO_SWING_PLAN"
+
+    key = _state_key(base_u, pos_side)
+    saved_ids = LAST_ORDER_IDS.get(key) or {}
+    old_sl = state.get("sl") or plan.get("initial_sl")
+    known_sl_id = saved_ids.get("sl_id")
+    if known_sl_id:
+        cancel_order_exact_sync(symbol, str(known_sl_id))
+
+    # Confirm that no stale SL remains before creating its replacement. This
+    # avoids two full-quantity stops competing for one hedge leg.
+    try:
+        orders = exchange.fetch_open_orders(symbol)
+    except Exception as e:
+        raise RuntimeError(f"cannot verify old SWING SL cancellation: {e}") from e
+    for order in orders:
+        info = order.get("info") or {}
+        order_pos_side = str(info.get("positionSide") or "").lower()
+        if order_pos_side == pos_side and is_sl_order(order):
+            order_id = order.get("id")
+            if order_id:
+                cancel_order_exact_sync(symbol, str(order_id))
+
+    try:
+        try:
+            sl_prec = float(exchange.price_to_precision(symbol, float(new_sl_price)))
+        except Exception:
+            sl_prec = float(new_sl_price)
+        response = _place_bingx_tpsl_raw_sync(symbol, pos_side, sl_prec, qty, "sl")
+        sl_id = _extract_bingx_order_id(response)
+    except Exception as replace_error:
+        # Best-effort rollback to the previous protective price.
+        try:
+            rollback = _place_bingx_tpsl_raw_sync(
+                symbol, pos_side, float(old_sl), qty, "sl"
+            )
+            saved_ids["sl_id"] = _extract_bingx_order_id(rollback)
+            LAST_ORDER_IDS[key] = saved_ids
+            save_order_ids()
+        except Exception as rollback_error:
+            raise RuntimeError(
+                f"SWING SL replacement failed ({replace_error}); rollback also failed ({rollback_error})"
+            ) from replace_error
+        raise RuntimeError(
+            f"SWING SL replacement failed ({replace_error}); old SL restored"
+        ) from replace_error
+
+    state["sl"] = sl_prec
+    plan["stage"] = next_stage
+    plan["current_qty"] = qty
+    plan["sl_updated_at"] = int(time.time())
+    state["swing_plan"] = plan
+    LAST_SLTP[base_u][pos_side] = state
+    saved_ids["sl_id"] = sl_id
+    LAST_ORDER_IDS[key] = saved_ids
+    save_sltp()
+    save_order_ids()
+    log(
+        "INFO",
+        f"SWING SL REPLACED symbol={symbol} stage={next_stage} qty={qty} sl={sl_prec} id={sl_id}",
+    )
+    return f"SL={sl_prec}/{qty} stage={next_stage}"
+
+
+def _swing_qty_reached(current_qty: float, initial_qty: float, closed_qty: float) -> bool:
+    tolerance = max(1e-12, float(initial_qty) * 1e-6, float(closed_qty) * 0.02)
+    return float(current_qty) <= float(initial_qty) - float(closed_qty) + tolerance
+
+
+def advance_swing_exit_state_sync(base: str, position_side: str = "long") -> str:
+    """Observe actual position reductions and advance the live SWING stop."""
+    base_u = str(base).upper().strip()
+    pos_side = str(position_side).lower()
+    state = (LAST_SLTP.get(base_u) or {}).get(pos_side) or {}
+    plan = state.get("swing_plan")
+    if not isinstance(plan, dict):
+        return "NO_SWING_PLAN"
+    symbol = resolve_symbol_sync(base_u)
+    if not symbol:
+        return "NO_SYMBOL"
+    pos = fetch_position_oneway_sync(symbol, pos_side)
+    if not pos:
+        cancel_all_open_orders_for_symbol_sync(symbol, pos_side)
+        _clear_position_state(base_u, pos_side)
+        return "POSITION_CLOSED"
+
+    current_qty = _extract_position_qty_sync(pos, symbol)
+    initial_qty = float(plan["initial_qty"])
+    tp1_qty = float(plan["tp1_qty"])
+    tp2_qty = float(plan["tp2_qty"])
+    stage = str(plan.get("stage") or "armed")
+    messages = []
+
+    if stage == "armed" and _swing_qty_reached(current_qty, initial_qty, tp1_qty):
+        next_stage = (
+            "tp2_done"
+            if _swing_qty_reached(current_qty, initial_qty, tp1_qty + tp2_qty)
+            else "tp1_done"
+        )
+        target_floor = float(plan["be_sl"])
+        target_sl = max(target_floor, float(state.get("sl") or target_floor))
+        messages.append(
+            _replace_swing_sl_sync(
+                base_u,
+                pos_side,
+                target_sl,
+                next_stage,
+            )
+        )
+        state = (LAST_SLTP.get(base_u) or {}).get(pos_side) or {}
+        plan = state.get("swing_plan") or plan
+        stage = str(plan.get("stage") or next_stage)
+        pos = fetch_position_oneway_sync(symbol, pos_side)
+        if not pos:
+            return " | ".join(messages + ["POSITION_CLOSED"])
+        current_qty = _extract_position_qty_sync(pos, symbol)
+
+    if stage == "tp1_done" and _swing_qty_reached(
+        current_qty, initial_qty, tp1_qty + tp2_qty
+    ):
+        # Keep the same Entry - 0.08R price; only resize the protective
+        # quantity to the final 30% after TP2.
+        messages.append(
+            _replace_swing_sl_sync(
+                base_u,
+                pos_side,
+                max(
+                    float(plan["be_sl"]),
+                    float(state.get("sl") or plan["be_sl"]),
+                ),
+                "tp2_done",
+            )
+        )
+
+    return " | ".join(messages) if messages else "NO_CHANGE"
+
+
+async def swing_exit_watcher_loop():
+    while True:
+        await asyncio.sleep(max(1.0, SWING_EXIT_WATCH_SEC))
+        plans = [
+            (base, side)
+            for base, sides in list(LAST_SLTP.items())
+            for side, state in list((sides or {}).items())
+            if isinstance((state or {}).get("swing_plan"), dict)
+        ]
+        for base, side in plans:
+            try:
+                result = await asyncio.to_thread(
+                    advance_swing_exit_state_sync, base, side
+                )
+                if result not in {"NO_CHANGE", "NO_SWING_PLAN"}:
+                    log("INFO", f"SWING WATCH {base}/{side}: {result}")
+                    if "stage=tp2_done" in result:
+                        await _send_to_tg(
+                            f"🎯 {base}/USDT TP2 виконано. "
+                            f"SL останніх 30% залишається на Entry − {SWING_RULES.breakeven_buffer_r:.2f}R."
+                        )
+                    elif "stage=tp1_done" in result:
+                        await _send_to_tg(
+                            f"🎯 {base}/USDT TP1 виконано. "
+                            f"SL залишку перенесено на Entry − {SWING_RULES.breakeven_buffer_r:.2f}R."
+                        )
+            except Exception as e:
+                log("ERROR", f"SWING WATCH {base}/{side} failed: {e}")
+
 def reapply_saved_sltp_sync(base: str, position_side: Optional[str] = None) -> str:
     base = str(base).upper().strip()
 
@@ -964,6 +1520,20 @@ def reapply_saved_sltp_sync(base: str, position_side: Optional[str] = None) -> s
     if sl is None and tp is None:
         return "NO_SAVED_SLTP"
 
+    swing_plan = saved.get("swing_plan")
+    if isinstance(swing_plan, dict):
+        if str(swing_plan.get("stage") or "armed") != "armed":
+            return "SWING_REAPPLY_BLOCKED_AFTER_TP1"
+        return apply_swing_sltp_sync(
+            base,
+            entry_price=float(swing_plan["entry"]),
+            sl_price=float(swing_plan["initial_sl"]),
+            tp1_price=float(saved["tp1"]),
+            tp2_price=float(saved["tp2"]),
+            tp3_price=float(saved["tp3"]),
+            position_side=pos_side,
+        )
+
     return apply_sltp_sync(base, sl_price=sl, tp_price=tp, cancel_first=True, position_side=pos_side)
 
 async def reapply_saved_sltp(base: str, position_side: Optional[str] = None) -> str:
@@ -980,6 +1550,14 @@ def set_sl_oneway_sync(base: str, sl_price: float, position_side: Optional[str] 
 
     pos_side = _extract_position_side_sync(pos)
     saved = _load_saved_sltp_for_position(str(base).upper(), pos_side)
+    swing_plan = saved.get("swing_plan")
+    if isinstance(swing_plan, dict):
+        return _replace_swing_sl_sync(
+            base,
+            pos_side,
+            sl_price,
+            str(swing_plan.get("stage") or "armed"),
+        )
     tp_saved = saved.get("tp")
 
     return apply_sltp_sync(base, sl_price=sl_price, tp_price=tp_saved, cancel_first=True, position_side=pos_side)
@@ -998,6 +1576,8 @@ def set_tp_oneway_sync(base: str, tp_price: float, position_side: Optional[str] 
 
     pos_side = _extract_position_side_sync(pos)
     saved = _load_saved_sltp_for_position(str(base).upper(), pos_side)
+    if isinstance(saved.get("swing_plan"), dict):
+        return "SWING_TP_EDIT_REQUIRES_TP1_TP2_TP3"
     sl_saved = saved.get("sl")
 
     return apply_sltp_sync(base, sl_price=sl_saved, tp_price=tp_price, cancel_first=True, position_side=pos_side)
@@ -1020,6 +1600,14 @@ def breakeven_oneway_sync(base: str, position_side: Optional[str] = None) -> str
 
     pos_side = _extract_position_side_sync(pos)
     saved = _load_saved_sltp_for_position(str(base).upper(), pos_side)
+    swing_plan = saved.get("swing_plan")
+    if isinstance(swing_plan, dict):
+        return _replace_swing_sl_sync(
+            base,
+            pos_side,
+            float(entry),
+            str(swing_plan.get("stage") or "armed"),
+        )
     tp_saved = saved.get("tp")
 
     return apply_sltp_sync(base, sl_price=float(entry), tp_price=tp_saved, cancel_first=True, position_side=pos_side)
@@ -1180,6 +1768,27 @@ def calc_tp_from_rr(entry: float, sl: float, rr: float, side: str) -> float:
     return entry + risk * rr
 
 
+def calculate_rr_from_prices(entry: float, sl: float, tp: float, side: str) -> float:
+    """Calculate the effective RR that will actually be sent to the exchange."""
+    entry = float(entry)
+    sl = float(sl)
+    tp = float(tp)
+    normalized_side = str(side or "").strip().lower()
+
+    if normalized_side == "long":
+        risk = entry - sl
+        reward = tp - entry
+    elif normalized_side == "short":
+        risk = sl - entry
+        reward = entry - tp
+    else:
+        raise ValueError(f"unsupported side={normalized_side or 'missing'}")
+
+    if risk <= 0 or reward <= 0:
+        raise ValueError("entry/SL/TP1 do not form a valid positive-RR setup")
+    return reward / risk
+
+
 def extract_rr_from_text(text: str) -> Optional[float]:
     t = (text or "").strip()
     if not t:
@@ -1306,6 +1915,78 @@ def is_allowed_signal_style(text: str) -> bool:
     style = extract_signal_style(text)
     return style is None or style in ALLOWED_SIGNAL_STYLES
 
+
+def is_entry_time_allowed(now: Optional[datetime] = None) -> bool:
+    """Return whether a new entry may be opened under the Kyiv-time sleep rule."""
+    current = now or datetime.now(KYIV_TZ)
+    if current.tzinfo is None:
+        current = current.replace(tzinfo=KYIV_TZ)
+    else:
+        current = current.astimezone(KYIV_TZ)
+
+    start = ENTRY_BLOCK_START_HOUR_KYIV % 24
+    end = ENTRY_BLOCK_END_HOUR_KYIV % 24
+    hour = current.hour
+
+    if start == end:
+        return True
+    if start < end:
+        return not (start <= hour < end)
+    return not (hour >= start or hour < end)
+
+
+def open_policy_block_reason(
+    side: Optional[str],
+    now: Optional[datetime] = None,
+    style: Optional[str] = None,
+    rr1: Optional[float] = None,
+) -> Optional[str]:
+    normalized_side = str(side or "").strip().lower()
+    normalized_style = str(style or "").strip().upper()
+    if TRADE_LONG_ONLY and normalized_side != "long":
+        return f"side={normalized_side or 'missing'}; policy allows LONG only"
+    if not is_entry_time_allowed(now):
+        swing_long_exception = (
+            ALLOW_SWING_LONG_DURING_BLOCKED_HOURS
+            and normalized_side == "long"
+            and normalized_style == "SWING"
+        )
+        if not swing_long_exception:
+            current = (now or datetime.now(KYIV_TZ))
+            if current.tzinfo is None:
+                current = current.replace(tzinfo=KYIV_TZ)
+            else:
+                current = current.astimezone(KYIV_TZ)
+            return (
+                f"Kyiv time {current:%Y-%m-%d %H:%M:%S}; entries are blocked "
+                f"{ENTRY_BLOCK_START_HOUR_KYIV:02d}:00-{ENTRY_BLOCK_END_HOUR_KYIV:02d}:00"
+            )
+
+    if rr1 is not None:
+        try:
+            effective_rr1 = float(rr1)
+        except (TypeError, ValueError):
+            return f"invalid effective TP1 RR={rr1!r}"
+        if not math.isfinite(effective_rr1) or effective_rr1 <= 0:
+            return f"invalid effective TP1 RR={effective_rr1}"
+        if (
+            normalized_style != "SWING"
+            and effective_rr1 >= FULL_TP1_MAX_RR_EXCLUSIVE
+        ):
+            return (
+                f"effective TP1 RR={effective_rr1:.4f} is blocked; "
+                f"Full TP1 requires RR < {FULL_TP1_MAX_RR_EXCLUSIVE:g}"
+            )
+        if (
+            normalized_style == "SCALP"
+            and effective_rr1 >= SCALP_FULL_TP1_MAX_RR_EXCLUSIVE
+        ):
+            return (
+                f"effective TP1 RR={effective_rr1:.4f} is blocked for SCALP; "
+                f"Full TP1 SCALP requires RR < {SCALP_FULL_TP1_MAX_RR_EXCLUSIVE:g}"
+            )
+    return None
+
 def extract_liquidation_from_text(text: str) -> Optional[float]:
     match = re.search(
         r"(?:liquidation(?:\s+price)?|liq(?:uid)?|ліквід\w*|ликвид\w*)\s*[:=]\s*([0-9]+(?:[.,][0-9]+)?)",
@@ -1329,13 +2010,14 @@ def _extract_message_number(text: str, pattern: str) -> Optional[float]:
     except (TypeError, ValueError):
         return None
 
-def parse_structured_scalp_signal(text: str) -> Optional[dict]:
-    """Deterministic parser for the generated SCALP messages used by this feed."""
-    if extract_signal_style(text) != "SCALP":
+def parse_structured_signal(text: str) -> Optional[dict]:
+    """Deterministic parser for generated SCALP/INTRADAY/SWING messages."""
+    style = extract_signal_style(text)
+    if style not in {"SCALP", "INTRADAY", "SWING"}:
         return None
 
     header = re.search(
-        r"\bSCALP\s+(LONG|SHORT)\b[^\n]*?([A-Z0-9]{1,15})\s*/\s*USDT(?::USDT)?",
+        rf"\b{style}\s+(LONG|SHORT)\b[^\n]*?([A-Z0-9]{{1,15}})\s*/\s*USDT(?::USDT)?",
         text or "",
         re.I,
     )
@@ -1344,8 +2026,9 @@ def parse_structured_scalp_signal(text: str) -> Optional[dict]:
 
     entry = _extract_message_number(text, r"^\s*[^\n]*\bEntry\s*:\s*([0-9]+(?:[.,][0-9]+)?)")
     sl = _extract_message_number(text, r"^\s*[^\n]*\bSL\s*:\s*([0-9]+(?:[.,][0-9]+)?)")
-    # Deliberately read TP1 only. TP2 and TP3 are never returned to execution.
     tp1 = _extract_message_number(text, r"^\s*[^\n]*\bTP1\s*:\s*([0-9]+(?:[.,][0-9]+)?)")
+    tp2 = _extract_message_number(text, r"^\s*[^\n]*\bTP2\s*:\s*([0-9]+(?:[.,][0-9]+)?)")
+    tp3 = _extract_message_number(text, r"^\s*[^\n]*\bTP3\s*:\s*([0-9]+(?:[.,][0-9]+)?)")
     leverage = _extract_message_number(text, r"(?:Плече|Leverage)\s*:\s*([0-9]+(?:[.,][0-9]+)?)\s*x")
     position_usdt = _extract_message_number(text, r"(?:Позиція|Позиция|Position)\s*:\s*([0-9]+(?:[.,][0-9]+)?)\s*USDT")
     margin_usdt = _extract_message_number(text, r"(?:маржа|margin)\s*:\s*([0-9]+(?:[.,][0-9]+)?)\s*USDT")
@@ -1368,6 +2051,10 @@ def parse_structured_scalp_signal(text: str) -> Optional[dict]:
         "entry": entry,
         "sl": sl,
         "tp": tp1,
+        # Only SWING may send later targets to live execution. SCALP and
+        # INTRADAY deliberately keep the full-TP1 model.
+        "tp2": tp2 if style == "SWING" else None,
+        "tp3": tp3 if style == "SWING" else None,
         "position_usdt": position_usdt,
         "margin_usdt": margin_usdt,
         "balance_usdt": balance_usdt,
@@ -1375,6 +2062,13 @@ def parse_structured_scalp_signal(text: str) -> Optional[dict]:
         "confidence": 1.0,
         "raw_text": (text or "")[:500],
     }
+
+
+def parse_structured_scalp_signal(text: str) -> Optional[dict]:
+    """Backward-compatible alias retained for older tests and callers."""
+    if extract_signal_style(text) != "SCALP":
+        return None
+    return parse_structured_signal(text)
 
 
 # =========================
@@ -1450,7 +2144,9 @@ EXTRACTION RULES:
 - RISK_PCT: parse phrases like "1.5% balance", "risk 2%", "margin 0.75%"
 - ADD_PCT: for ADD signals parse the percentage being added now
 - SL: number after SL / stop loss
-- TP: use TP1 only. Ignore TP2, TP3 and every later target
+- TP: always put TP1 in "tp"
+- For SWING OPEN signals, also extract TP2 into "tp2" and TP3 into "tp3"
+- For SCALP/INTRADAY, set "tp2" and "tp3" to null
 - RR: if take profit is expressed as RR instead of a price, extract rr as a positive number
 - Examples of RR targets:
   - RR2 -> rr=2
@@ -1491,6 +2187,8 @@ OUTPUT FORMAT:
   "risk_pct": 1.5,
   "sl": 123.45,
   "tp": 120.00,
+  "tp2": null,
+  "tp3": null,
   "add_pct": 0.75,
   "confidence": 0.92,
   "raw_text": "string|null",
@@ -1514,6 +2212,8 @@ AI_JSON_SHAPE = {
     "risk_pct": "number|null",
     "sl": "number|null",
     "tp": "number|null",
+    "tp2": "number|null",
+    "tp3": "number|null",
     "add_pct": "number|null",
     "confidence": "0..1",
     "raw_text": "string|null",
@@ -1647,9 +2347,14 @@ def ai_parse_trade_multi(text: Optional[str], image_paths: Optional[list[str]]) 
         }
 
 def parse_trade_multi(text: Optional[str], image_paths: Optional[list[str]]) -> dict:
-    structured = parse_structured_scalp_signal(text or "")
+    structured = parse_structured_signal(text or "")
     if structured:
-        log("INFO", "STRUCTURED SCALP parsed locally; execution target=TP1 only")
+        style = extract_signal_style(text or "")
+        target_mode = "TP1/TP2/TP3 partial" if style == "SWING" else "TP1 only"
+        log(
+            "INFO",
+            f"STRUCTURED {style} parsed locally; execution target={target_mode}",
+        )
         return structured
     return ai_parse_trade_multi(text, image_paths)
 
@@ -1780,6 +2485,9 @@ def _format_open_notification(
     entry: float,
     sl: float,
     tp: float,
+    tp2: Optional[float] = None,
+    tp3: Optional[float] = None,
+    swing_partial: bool = False,
     qty: float,
     leverage: int,
     liquidation: Optional[float],
@@ -1792,11 +2500,18 @@ def _format_open_notification(
         f"Side: {side.upper()}",
         f"Entry: {entry}",
         f"SL: {sl}",
-        f"TP1 (100% position): {tp}",
+        f"TP1 ({'40%' if swing_partial else '100%'} position): {tp}",
         f"Qty: {qty}",
         f"Leverage: {leverage}x",
         f"Liquidation: {liquidation if liquidation is not None else 'n/a'}",
     ]
+    if swing_partial:
+        lines.insert(5, f"TP2 (30% position): {tp2}")
+        lines.insert(6, f"TP3 (30% position): {tp3}")
+        lines.insert(
+            7,
+            f"After TP1: SL → Entry − {SWING_RULES.breakeven_buffer_r:.2f}R",
+        )
     if risk_usdt is not None:
         lines.append(f"Risk to SL: {risk_usdt:.4f} USDT ({FIXED_RISK_PCT}%)")
     if expected_tp1_profit is not None:
@@ -1817,6 +2532,8 @@ async def handle_ai_command(cmd: dict):
     risk_pct = cmd.get("risk_pct")
     sl = cmd.get("sl")
     tp = cmd.get("tp")
+    tp2 = cmd.get("tp2")
+    tp3 = cmd.get("tp3")
     add_pct = cmd.get("add_pct")
     position_usdt = cmd.get("position_usdt")
     margin_usdt = cmd.get("margin_usdt")
@@ -1827,7 +2544,7 @@ async def handle_ai_command(cmd: dict):
 
     tg_text = cmd.get("_tg_text", "")
 
-    log("INFO", f"AI action={action} conf={conf} base={base} side={side} lev={lev} risk={risk_pct} signal_balance={signal_balance_usdt} position_usdt={position_usdt} margin_usdt={margin_usdt} sl={sl} tp={tp} liq={liquidation} add_pct={add_pct}")
+    log("INFO", f"AI action={action} conf={conf} base={base} side={side} lev={lev} risk={risk_pct} signal_balance={signal_balance_usdt} position_usdt={position_usdt} margin_usdt={margin_usdt} sl={sl} tp={tp} tp2={tp2} tp3={tp3} liq={liquidation} add_pct={add_pct}")
 
     # Safety: never convert a clear OPEN signal to ADD.
     # DCA inside an OPEN setup means "open now + place pending DCA order", not market ADD.
@@ -1910,6 +2627,11 @@ async def handle_ai_command(cmd: dict):
             log("INFO", "AI SKIP OPEN: side missing/invalid")
             return
 
+        policy_block = open_policy_block_reason(side, style=cmd.get("_signal_style"))
+        if policy_block:
+            log("WARNING", f"POLICY SKIP OPEN {base}: {policy_block}")
+            return
+
         rr_value = cmd.get("rr")
         if rr_value is None:
             rr_value = extract_rr_from_text(tg_text)
@@ -1922,11 +2644,36 @@ async def handle_ai_command(cmd: dict):
             log("INFO", "AI SKIP OPEN: tp/rr missing")
             return
 
+        signal_style = str(cmd.get("_signal_style") or "").upper()
+        use_swing_partial = (
+            signal_style == "SWING" and SWING_RULES.live_partial_exit_ready
+        )
+        if use_swing_partial and (tp2 is None or tp3 is None):
+            log(
+                "ERROR",
+                f"SAFE SKIP OPEN {base}: live SWING model requires TP1, TP2 and TP3",
+            )
+            return
+
         base_clean = _clean_base_from_context(base, tg_text)
         symbol = await resolve_symbol(base_clean)
 
         if not symbol:
             log("ERROR", f"Symbol not listed on BingX: {base_clean}/USDT")
+            return
+
+        asset_policy_block = non_crypto_open_block_reason(
+            base_clean,
+            signal_text=tg_text,
+            symbol=symbol,
+        )
+        if asset_policy_block:
+            log("WARNING", f"POLICY SKIP OPEN {base_clean}: {asset_policy_block}")
+            return
+
+        api_open_issue = await asyncio.to_thread(market_api_open_disabled_sync, symbol)
+        if api_open_issue:
+            log("ERROR", api_open_issue)
             return
 
         try:
@@ -1947,7 +2694,13 @@ async def handle_ai_command(cmd: dict):
 
         tp_fixed = normalize_price_from_tail(float(tp), entry, side, "tp")
 
-        log("INFO", f"FIX {base_clean} entry={entry} rawSL={sl} -> {sl_fixed} | rawTP={tp} -> {tp_fixed} | rr={rr_value}")
+        tp2_fixed = None
+        tp3_fixed = None
+        if use_swing_partial:
+            tp2_fixed = normalize_price_from_tail(float(tp2), entry, side, "tp")
+            tp3_fixed = normalize_price_from_tail(float(tp3), entry, side, "tp")
+
+        log("INFO", f"FIX {base_clean} entry={entry} rawSL={sl} -> {sl_fixed} | rawTP={tp} -> {tp_fixed} | TP2={tp2_fixed} | TP3={tp3_fixed} | rr={rr_value}")
 
         try:
             sl_prec = float(await asyncio.to_thread(exchange.price_to_precision, symbol, sl_fixed))
@@ -1959,13 +2712,66 @@ async def handle_ai_command(cmd: dict):
         except Exception:
             tp_prec = float(tp_fixed)
 
+        tp2_prec = None
+        tp3_prec = None
+        if use_swing_partial:
+            try:
+                tp2_prec = float(
+                    await asyncio.to_thread(exchange.price_to_precision, symbol, tp2_fixed)
+                )
+            except Exception:
+                tp2_prec = float(tp2_fixed)
+            try:
+                tp3_prec = float(
+                    await asyncio.to_thread(exchange.price_to_precision, symbol, tp3_fixed)
+                )
+            except Exception:
+                tp3_prec = float(tp3_fixed)
+
         if not validate_sl_tp(side, entry, sl_prec, tp_prec):
             log("INFO", f"SKIP Bad SL/TP vs entry. entry={entry} SL={sl_prec} TP={tp_prec}")
             return
+        if use_swing_partial and not (tp_prec < tp2_prec < tp3_prec):
+            log(
+                "INFO",
+                f"SKIP Bad SWING target order: TP1={tp_prec} TP2={tp2_prec} TP3={tp3_prec}",
+            )
+            return
+
+        try:
+            effective_rr1 = calculate_rr_from_prices(entry, sl_prec, tp_prec, side)
+        except (TypeError, ValueError) as e:
+            log("WARNING", f"POLICY SKIP OPEN {base_clean}: RR1 calculation failed: {e}")
+            return
+
+        rr_policy_block = open_policy_block_reason(
+            side,
+            style=cmd.get("_signal_style"),
+            rr1=effective_rr1,
+        )
+        if rr_policy_block:
+            log("WARNING", f"POLICY SKIP OPEN {base_clean}: {rr_policy_block}")
+            return
+
+        log(
+            "INFO",
+            f"RR1 POLICY PASS {base_clean} style={cmd.get('_signal_style')} "
+            f"effective_rr1={effective_rr1:.4f}",
+        )
 
         try:
             usdt_total = await get_usdt_total()
-            trade_plan = calculate_auto_trade_plan(usdt_total, entry, sl_prec, tp_prec)
+            applied_risk_pct = risk_pct_for_style(
+                cmd.get("_signal_style"),
+                FIXED_RISK_PCT,
+            )
+            trade_plan = calculate_auto_trade_plan(
+                usdt_total,
+                entry,
+                sl_prec,
+                tp_prec,
+                risk_pct=applied_risk_pct,
+            )
             lev = int(trade_plan["leverage"])
             target_notional = float(trade_plan["notional"])
             qty_raw = target_notional / entry
@@ -2027,18 +2833,52 @@ async def handle_ai_command(cmd: dict):
             log("INFO", f"POSITION_VISIBLE_AFTER_OPEN {base_clean}={bool(pos_seen)}")
             await asyncio.sleep(0.7)
 
-            LAST_SLTP.setdefault(base_clean, {})
-            LAST_SLTP[base_clean][side] = {"sl": sl_prec, "tp": tp_prec}
-            save_sltp()
-
-            res = await apply_sltp(
-                base_clean,
-                sl_price=sl_prec,
-                tp_price=tp_prec,
-                cancel_first=True,
-                position_side=side,
-            )
+            try:
+                if use_swing_partial:
+                    res = await apply_swing_sltp(
+                        base_clean,
+                        entry_price=entry,
+                        sl_price=sl_prec,
+                        tp1_price=tp_prec,
+                        tp2_price=float(tp2_prec),
+                        tp3_price=float(tp3_prec),
+                        position_side=side,
+                    )
+                else:
+                    LAST_SLTP.setdefault(base_clean, {})
+                    LAST_SLTP[base_clean][side] = {"sl": sl_prec, "tp": tp_prec}
+                    save_sltp()
+                    res = await apply_sltp(
+                        base_clean,
+                        sl_price=sl_prec,
+                        tp_price=tp_prec,
+                        cancel_first=True,
+                        position_side=side,
+                    )
+            except Exception as protection_error:
+                log(
+                    "ERROR",
+                    f"CRITICAL {base_clean}: protective orders failed after OPEN: "
+                    f"{protection_error}; emergency closing position",
+                )
+                try:
+                    close_result = await close_position_full(base_clean, side)
+                except Exception as close_error:
+                    close_result = f"EMERGENCY CLOSE FAILED: {close_error}"
+                await _send_to_tg(
+                    f"🚨 {base_clean}/USDT: не вдалося встановити захист після входу. "
+                    f"Аварійне закриття: {close_result}"
+                )
+                return
             log("INFO", f"APPLY SL/TP after OPEN done: {res}")
+            swing_partial_active = use_swing_partial and not res.startswith(
+                "FALLBACK_FULL_TP1"
+            )
+            if use_swing_partial and not swing_partial_active:
+                await _send_to_tg(
+                    f"⚠️ {base_clean}/USDT: три часткові TP не встановились. "
+                    "Увімкнено безпечний fallback: повний SL + 100% TP1."
+                )
 
             actual_liquidation = _extract_position_liquidation(pos_seen)
             shown_liquidation = actual_liquidation or estimate_liquidation_price(entry, side, int(lev))
@@ -2050,11 +2890,17 @@ async def handle_ai_command(cmd: dict):
                     entry=entry,
                     sl=sl_prec,
                     tp=tp_prec,
+                    tp2=tp2_prec,
+                    tp3=tp3_prec,
+                    swing_partial=swing_partial_active,
                     qty=qty,
                     leverage=int(lev),
                     liquidation=shown_liquidation,
                     risk_usdt=float(trade_plan["expected_loss_at_sl"]),
-                    expected_tp1_profit=float(trade_plan["expected_profit_at_tp1"]),
+                    expected_tp1_profit=(
+                        float(trade_plan["expected_profit_at_tp1"])
+                        * (SWING_RULES.target_split[0] if swing_partial_active else 1.0)
+                    ),
                     margin_usdt=float(trade_plan["margin"]),
                 )
             )
@@ -2074,6 +2920,11 @@ async def handle_ai_command(cmd: dict):
         return
 
     if action == "ADD":
+        early_policy_block = open_policy_block_reason(side or "long")
+        if early_policy_block:
+            log("WARNING", f"POLICY SKIP ADD {base}: {early_policy_block}")
+            return
+
         base_clean = _clean_base_from_context(base, tg_text)
         symbol = await resolve_symbol(base_clean)
 
@@ -2088,6 +2939,11 @@ async def handle_ai_command(cmd: dict):
 
         side = (pos.get("side") or (pos.get("info") or {}).get("positionSide") or "").lower()
         lev = int(float(pos.get("leverage") or (pos.get("info") or {}).get("leverage") or 1))
+
+        policy_block = open_policy_block_reason(side)
+        if policy_block:
+            log("WARNING", f"POLICY SKIP ADD {base_clean}: {policy_block}")
+            return
 
         pct = add_pct if add_pct is not None else risk_pct
         if pct is None:
@@ -2610,6 +3466,23 @@ async def main():
             )
         )
 
+        asyncio.create_task(swing_exit_watcher_loop())
+
+        log(
+            "INFO",
+            "ENTRY POLICY "
+            f"styles={sorted(ALLOWED_SIGNAL_STYLES)} "
+            f"long_only={TRADE_LONG_ONLY} "
+            f"crypto_only={TRADE_CRYPTO_ONLY} "
+            f"swing_long_overnight={ALLOW_SWING_LONG_DURING_BLOCKED_HOURS} "
+            f"swing_rule={SWING_RULES.version} "
+            f"swing_risk={SWING_RULES.risk_per_trade_pct:g}% "
+            f"swing_live_partial={SWING_RULES.live_partial_exit_ready} "
+            f"full_tp1_rr_lt={FULL_TP1_MAX_RR_EXCLUSIVE:g} "
+            f"scalp_full_tp1_rr_lt={SCALP_FULL_TP1_MAX_RR_EXCLUSIVE:g} "
+            f"blocked_kyiv={ENTRY_BLOCK_START_HOUR_KYIV:02d}:00-"
+            f"{ENTRY_BLOCK_END_HOUR_KYIV:02d}:00",
+        )
         log("INFO", f"DRY_RUN={DRY_RUN} | Listening TARGET_CHAT_ID={TARGET_CHAT_ID}")
         await idle()
 

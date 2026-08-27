@@ -6,7 +6,7 @@ from dataclasses import dataclass
 
 @dataclass(frozen=True)
 class SwingTradingRules:
-    version: str = "swing-long-crypto-v2"
+    version: str = "swing-long-crypto-v3"
     allowed_side: str = "long"
     ordinary_crypto_only: bool = True
     allow_kyiv_00_06: bool = True
@@ -21,6 +21,10 @@ class SwingTradingRules:
     # Keep a small part of the original risk after TP1 so fees/noise around the
     # entry do not turn the remainder into an immediate stop-out.
     breakeven_buffer_r: float = 0.08
+
+    # Reject a market entry when price has already moved too far beyond the
+    # signal entry. This keeps a planned 2R TP1 from collapsing after delay.
+    max_adverse_entry_drift_r: float = 0.25
 
     live_partial_exit_ready: bool = True
 
@@ -38,6 +42,8 @@ class SwingTradingRules:
             raise ValueError("SWING RR targets must be ordered")
         if not (0 <= self.breakeven_buffer_r < 1):
             raise ValueError("SWING breakeven_buffer_r must be in [0, 1)")
+        if not (0 <= self.max_adverse_entry_drift_r < 1):
+            raise ValueError("SWING max_adverse_entry_drift_r must be in [0, 1)")
         if self.accepted_six_trade_batch_risk_pct < self.risk_per_trade_pct * 6:
             raise ValueError("SWING batch allowance must cover six configured risks")
 

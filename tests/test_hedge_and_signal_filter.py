@@ -81,6 +81,8 @@ def _load_trade_module():
     os.environ.setdefault("TG_API_ID", "1")
     os.environ.setdefault("TG_API_HASH", "test")
     os.environ.setdefault("TG_SESSION_STRING", "test")
+    os.environ["TRADE_LONG_ALL_STYLES"] = "0"
+    os.environ["ALLOWED_SIGNAL_STYLES"] = "SWING"
 
     ccxt_stub = types.ModuleType("ccxt")
     ccxt_stub.bingx = _BingX
@@ -107,14 +109,14 @@ class SignalFilterTests(unittest.TestCase):
     def setUpClass(cls):
         cls.bot = _load_trade_module()
 
-    def test_all_signal_styles_are_allowed(self):
+    def test_only_swing_signal_style_is_allowed(self):
         intraday = "📈 INTRADAY  LONG 🟢 — SUI/USDT:USDT\nTF: 4H / 1H / 15M"
         scalp = "⚡ SCALP  LONG 🟢 — SUI/USDT:USDT\nTF: 1H / 15M / 5M"
         swing = "🌊 SWING  LONG 🟢 — SUI/USDT:USDT\nTF: 1D / 4H / 1H"
         stats = "📊 Paper-trading статистика\n⚡ SCALP: угод 325\n📈 INTRADAY: угод 180"
 
-        self.assertTrue(self.bot.is_allowed_signal_style(intraday))
-        self.assertTrue(self.bot.is_allowed_signal_style(scalp))
+        self.assertFalse(self.bot.is_allowed_signal_style(intraday))
+        self.assertFalse(self.bot.is_allowed_signal_style(scalp))
         self.assertTrue(self.bot.is_allowed_signal_style(swing))
         self.assertIsNone(self.bot.extract_signal_style(stats))
 
@@ -281,6 +283,16 @@ TF: 1H / 15M / 5M
             2.0,
         )
 
+    def test_stale_swing_entry_is_blocked_in_r_units(self):
+        self.assertIsNone(
+            self.bot.swing_entry_drift_block_reason("long", 4.205, 4.21, 4.14)
+        )
+        reason = self.bot.swing_entry_drift_block_reason(
+            "long", 4.205, 4.311, 4.14
+        )
+        self.assertIn("stale SWING entry", reason)
+        self.assertIn("exceeds 0.25R", reason)
+
     def test_auto_plan_risks_half_percent_and_adapts_leverage(self):
         plan = self.bot.calculate_auto_trade_plan(
             1000.0,
@@ -309,6 +321,7 @@ TF: 1H / 15M / 5M
         self.assertEqual(rules.target_split, (0.40, 0.30, 0.30))
         self.assertTrue(rules.move_sl_to_breakeven_after_tp1)
         self.assertEqual(rules.breakeven_buffer_r, 0.08)
+        self.assertEqual(rules.max_adverse_entry_drift_r, 0.25)
         self.assertFalse(rules.use_order_book_for_targets)
         self.assertTrue(rules.live_partial_exit_ready)
 
@@ -455,6 +468,31 @@ class SwingPartialExitTests(unittest.TestCase):
         self.assertTrue(result.startswith("FALLBACK_FULL_TP1"))
         self.assertNotIn("swing_plan", self.bot.LAST_SLTP["SUI"]["long"])
         self.assertEqual(self.bot.LAST_SLTP["SUI"]["long"]["tp"], 108.0)
+
+    def test_position_too_small_for_three_targets_falls_back_safely(self):
+        self.exchange.markets[self.symbol]["limits"]["amount"]["min"] = 0.48
+        self.exchange.positions[0]["contracts"] = 0.66
+        calls = []
+
+        def fake_place(symbol, side, price, quantity, kind):
+            calls.append((symbol, side, price, quantity, kind))
+            return {"data": {"order": {"orderId": f"fallback-{len(calls)}"}}}
+
+        with mock.patch.object(
+            self.bot, "_place_bingx_tpsl_raw_sync", side_effect=fake_place
+        ):
+            result = self.bot.apply_swing_sltp_sync(
+                "SUI",
+                entry_price=100.0,
+                sl_price=96.0,
+                tp1_price=108.0,
+                tp2_price=112.0,
+                tp3_price=120.0,
+            )
+
+        self.assertTrue(result.startswith("FALLBACK_FULL_TP1"))
+        self.assertEqual([call[4] for call in calls], ["sl", "tp"])
+        self.assertEqual([call[3] for call in calls], [0.66, 0.66])
 
 
 class BingXSymbolResolutionTests(unittest.TestCase):

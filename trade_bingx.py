@@ -64,16 +64,13 @@ OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4.1")
 DRY_RUN = os.getenv("DRY_RUN", "1").strip() == "1"
 HEARTBEAT_SEC = int(os.getenv("HEARTBEAT_SEC", "300"))  # 5 хв
 SWING_EXIT_WATCH_SEC = float(os.getenv("SWING_EXIT_WATCH_SEC", "4"))
-# Trading policy v2:
-# - execute every generated LONG style (SCALP / INTRADAY / SWING);
+# Trading policy v3:
+# - execute SWING LONG only by default;
 # - never open SHORT;
-# - block SCALP/INTRADAY entries from 00:00 through 05:59 Kyiv time;
 # - allow SWING LONG entries around the clock.
-# - Full TP1 SCALP/INTRADAY: reject every setup with effective RR1 >= 3.0;
-# - Full TP1 SCALP: reject RR1 >= 2.5 (there is deliberately no minimum RR).
 # SWING uses the three-target partial model declared in trade_rules.py.
 # Existing position management (SL/TP/BE/CLOSE) remains active around the clock.
-TRADE_LONG_ALL_STYLES = os.getenv("TRADE_LONG_ALL_STYLES", "1").strip() == "1"
+TRADE_LONG_ALL_STYLES = os.getenv("TRADE_LONG_ALL_STYLES", "0").strip() == "1"
 TRADE_LONG_ONLY = os.getenv("TRADE_LONG_ONLY", "1").strip() == "1"
 # Signals remain in the generator database for future TradFi research.  This
 # flag only prevents a new exchange order for stocks, ETFs and other non-crypto
@@ -95,9 +92,15 @@ if TRADE_LONG_ALL_STYLES:
 else:
     ALLOWED_SIGNAL_STYLES = {
         style.strip().upper()
-        for style in os.getenv("ALLOWED_SIGNAL_STYLES", "SCALP").split(",")
+        for style in os.getenv("ALLOWED_SIGNAL_STYLES", "SWING").split(",")
         if style.strip()
     }
+SWING_MAX_ENTRY_DRIFT_R = float(
+    os.getenv(
+        "SWING_MAX_ENTRY_DRIFT_R",
+        str(SWING_RULES.max_adverse_entry_drift_r),
+    )
+)
 FIXED_RISK_PCT = float(os.getenv("FIXED_RISK_PCT", "0.5"))
 MAX_AUTO_LEVERAGE = int(os.getenv("MAX_AUTO_LEVERAGE", "20"))
 LEVERAGE_DISTANCE_BUFFER = float(os.getenv("LEVERAGE_DISTANCE_BUFFER", "3.0"))
@@ -1043,7 +1046,11 @@ def calculate_swing_breakeven_price(
     raise ValueError(f"unsupported side={normalized_side or 'missing'}")
 
 
-def _split_swing_target_quantities(symbol: str, total_qty: float) -> tuple[float, float, float]:
+def _split_swing_target_quantities(
+    symbol: str,
+    total_qty: float,
+    reference_price: Optional[float] = None,
+) -> tuple[float, float, float]:
     """Split an exchange-precision position without exceeding its total size."""
     total = float(total_qty)
     if total <= 0:
@@ -1072,6 +1079,17 @@ def _split_swing_target_quantities(symbol: str, total_qty: float) -> tuple[float
         raise ValueError(
             f"one of SWING target quantities {quantities} is below exchange minimum {min_amount_f}"
         )
+    min_cost = (((market.get("limits") or {}).get("cost") or {}).get("min"))
+    if min_cost is None:
+        min_cost = (market.get("info") or {}).get("tradeMinUSDT")
+    min_cost_f = float(min_cost) if min_cost not in (None, "") else 0.0
+    reference_price_f = float(reference_price) if reference_price is not None else 0.0
+    if min_cost_f > 0 and reference_price_f > 0:
+        costs = tuple(q * reference_price_f for q in quantities)
+        if any(cost < min_cost_f for cost in costs):
+            raise ValueError(
+                f"one of SWING target notionals {costs} is below exchange minimum {min_cost_f} USDT"
+            )
     if sum(quantities) > total + max(1e-12, total * 1e-10):
         raise ValueError(f"SWING target quantities {quantities} exceed position {total}")
     return quantities
@@ -1186,14 +1204,13 @@ def apply_swing_sltp_sync(
     if pos_side != "long":
         raise RuntimeError("Live SWING partial-exit model is LONG-only")
 
-    qty = _extract_position_qty_sync(pos, symbol)
-    if qty <= 0:
-        return "NO_POSITION"
-    qty1, qty2, qty3 = _split_swing_target_quantities(symbol, qty)
-
     actual_entry = _position_entry_price(pos, entry_price)
     if actual_entry is None:
         raise RuntimeError("Cannot determine SWING entry price")
+
+    qty = _extract_position_qty_sync(pos, symbol)
+    if qty <= 0:
+        return "NO_POSITION"
 
     prices = []
     for value in (sl_price, tp1_price, tp2_price, tp3_price):
@@ -1207,6 +1224,27 @@ def apply_swing_sltp_sync(
             "SWING prices must be ordered SL < entry < TP1 < TP2 < TP3; "
             f"got {sl_prec}, {actual_entry}, {tp1_prec}, {tp2_prec}, {tp3_prec}"
         )
+
+    try:
+        qty1, qty2, qty3 = _split_swing_target_quantities(
+            symbol,
+            qty,
+            reference_price=actual_entry,
+        )
+    except Exception as partial_error:
+        log(
+            "ERROR",
+            f"SWING position cannot support 40/30/30 for {symbol}: {partial_error}; "
+            "arming full-size SL + TP1 fallback",
+        )
+        fallback = apply_sltp_sync(
+            base_u,
+            sl_price=sl_prec,
+            tp_price=tp1_prec,
+            cancel_first=True,
+            position_side=pos_side,
+        )
+        return f"FALLBACK_FULL_TP1 after split error={partial_error} | {fallback}"
 
     be_prec = calculate_swing_breakeven_price(actual_entry, sl_prec, pos_side)
     try:
@@ -1787,6 +1825,41 @@ def calculate_rr_from_prices(entry: float, sl: float, tp: float, side: str) -> f
     if risk <= 0 or reward <= 0:
         raise ValueError("entry/SL/TP1 do not form a valid positive-RR setup")
     return reward / risk
+
+
+def swing_entry_drift_block_reason(
+    side: str,
+    signal_entry: float,
+    market_entry: float,
+    planned_sl: float,
+    *,
+    max_adverse_drift_r: float = SWING_MAX_ENTRY_DRIFT_R,
+) -> Optional[str]:
+    """Return a reason when a delayed SWING entry has materially worsened."""
+    normalized_side = str(side or "").strip().lower()
+    signal_entry_f = float(signal_entry)
+    market_entry_f = float(market_entry)
+    planned_sl_f = float(planned_sl)
+
+    if normalized_side == "long":
+        planned_risk = signal_entry_f - planned_sl_f
+        adverse_drift = market_entry_f - signal_entry_f
+    elif normalized_side == "short":
+        planned_risk = planned_sl_f - signal_entry_f
+        adverse_drift = signal_entry_f - market_entry_f
+    else:
+        return f"unsupported side={normalized_side or 'missing'}"
+
+    if planned_risk <= 0:
+        return "signal Entry and SL do not define positive planned risk"
+
+    drift_r = max(0.0, adverse_drift) / planned_risk
+    if drift_r > float(max_adverse_drift_r):
+        return (
+            f"stale SWING entry: market={market_entry_f:g}, signal={signal_entry_f:g}, "
+            f"adverse drift={drift_r:.3f}R exceeds {float(max_adverse_drift_r):g}R"
+        )
+    return None
 
 
 def extract_rr_from_text(text: str) -> Optional[float]:
@@ -2648,6 +2721,9 @@ async def handle_ai_command(cmd: dict):
         use_swing_partial = (
             signal_style == "SWING" and SWING_RULES.live_partial_exit_ready
         )
+        if use_swing_partial and cmd.get("entry") is None:
+            log("ERROR", f"SAFE SKIP OPEN {base}: live SWING requires signal Entry")
+            return
         if use_swing_partial and (tp2 is None or tp3 is None):
             log(
                 "ERROR",
@@ -2681,6 +2757,27 @@ async def handle_ai_command(cmd: dict):
         except Exception as e:
             log("ERROR", f"fetch_ticker failed: {e}")
             return
+
+        if use_swing_partial and cmd.get("entry") is not None:
+            try:
+                signal_entry = normalize_price_from_tail(
+                    float(cmd["entry"]), entry, side, "entry"
+                )
+                signal_sl = normalize_price_from_tail(
+                    float(sl), signal_entry, side, "sl"
+                )
+                drift_block = swing_entry_drift_block_reason(
+                    side,
+                    signal_entry,
+                    entry,
+                    signal_sl,
+                )
+            except (TypeError, ValueError) as drift_error:
+                drift_block = f"cannot validate SWING entry freshness: {drift_error}"
+            if drift_block:
+                log("WARNING", f"POLICY SKIP OPEN {base_clean}: {drift_block}")
+                await _send_to_tg(f"⚠️ {base_clean}/USDT SWING пропущено: {drift_block}")
+                return
 
         sl_fixed = normalize_price_from_tail(float(sl), entry, side, "sl")
 
@@ -2794,6 +2891,27 @@ async def handle_ai_command(cmd: dict):
         if qty <= 0:
             log("INFO", "SKIP qty became 0")
             return
+
+
+        if use_swing_partial:
+            try:
+                planned_parts = _split_swing_target_quantities(
+                    symbol,
+                    qty,
+                    reference_price=entry,
+                )
+                log(
+                    "INFO",
+                    f"SWING SIZE PREFLIGHT PASS {base_clean} qty={qty} parts={planned_parts}",
+                )
+            except Exception as size_error:
+                reason = (
+                    f"позиція {qty:g} не підтримує безпечний поділ 40/30/30: "
+                    f"{size_error}"
+                )
+                log("WARNING", f"SAFE SKIP OPEN {base_clean}: {reason}")
+                await _send_to_tg(f"⚠️ {base_clean}/USDT SWING пропущено: {reason}")
+                return
 
         if DRY_RUN:
             log("INFO", "DRY_RUN OPEN skipped (test mode)")
@@ -3478,6 +3596,7 @@ async def main():
             f"swing_rule={SWING_RULES.version} "
             f"swing_risk={SWING_RULES.risk_per_trade_pct:g}% "
             f"swing_live_partial={SWING_RULES.live_partial_exit_ready} "
+            f"swing_max_entry_drift={SWING_MAX_ENTRY_DRIFT_R:g}R "
             f"full_tp1_rr_lt={FULL_TP1_MAX_RR_EXCLUSIVE:g} "
             f"scalp_full_tp1_rr_lt={SCALP_FULL_TP1_MAX_RR_EXCLUSIVE:g} "
             f"blocked_kyiv={ENTRY_BLOCK_START_HOUR_KYIV:02d}:00-"

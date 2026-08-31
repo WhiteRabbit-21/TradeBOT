@@ -27,9 +27,11 @@ class _Filters:
     text = _Filter()
     caption = _Filter()
     photo = _Filter()
+    last_chat = None
 
-    @staticmethod
-    def chat(_):
+    @classmethod
+    def chat(cls, chat_id):
+        cls.last_chat = chat_id
         return _Filter()
 
 
@@ -85,6 +87,7 @@ def _load_trade_module():
     os.environ["TRADE_LONG_ALL_STYLES"] = "0"
     os.environ["ALLOWED_SIGNAL_STYLES"] = "SWING"
     os.environ["FIXED_RISK_PCT"] = "9.0"
+    os.environ.pop("TARGET_CHAT_ID", None)
 
     ccxt_stub = types.ModuleType("ccxt")
     ccxt_stub.bingx = _BingX
@@ -121,6 +124,10 @@ class SignalFilterTests(unittest.TestCase):
         self.assertTrue(self.bot.is_allowed_signal_style(scalp))
         self.assertTrue(self.bot.is_allowed_signal_style(swing))
         self.assertIsNone(self.bot.extract_signal_style(stats))
+
+    def test_only_signalbot_channel_is_registered_as_source(self):
+        self.assertEqual(self.bot.TARGET_CHAT_ID, -5486330898)
+        self.assertEqual(_Filters.last_chat, -5486330898)
 
     def test_non_scalp_management_event_is_not_mistaken_for_new_entry(self):
         event = "🟢 TP1 ДОСЯГНУТО — позиція ще відкрита\nСтиль: SWING | LONG"

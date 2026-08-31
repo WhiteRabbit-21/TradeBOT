@@ -50,7 +50,7 @@ API_ID = int(os.environ["TG_API_ID"])
 API_HASH = os.environ["TG_API_HASH"]
 SESSION_STRING = os.environ["TG_SESSION_STRING"]
 
-TARGET_CHAT_ID = int(os.getenv("TARGET_CHAT_ID", "-1002598403649"))   # де читаємо сигнали
+TARGET_CHAT_ID = int(os.getenv("TARGET_CHAT_ID", "-5486330898"))   # SignalBot+ only
 LOG_CHAT_ID = int(os.getenv("TG_LOG_CHAT_ID", "-1003828203122"))      # куди шлемо логи
 PNL_CHAT_ID = int(os.getenv("PNL_CHAT_ID", "-1003332013833")) # куди шлемо профіт/лос
 
@@ -3569,7 +3569,7 @@ async def close_bundle_flush():
 _last_hb = 0.0
 
 @app.on_message(
-    filters.chat([TARGET_CHAT_ID, "me"])
+    filters.chat(TARGET_CHAT_ID)
     & (filters.text | filters.caption | filters.photo)
 )
 

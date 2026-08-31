@@ -15,7 +15,7 @@ import requests
 from typing import Optional, Any
 from trade_notifier import pnl_watcher
 from asset_universe import classify_non_crypto_asset
-from trade_rules import SWING_RULES, risk_pct_for_style
+from trade_rules import ENTRY_RULES, SWING_RULES, risk_pct_for_style
 import ccxt
 from pyrogram import Client, filters, idle
 from pyrogram.errors import PeerIdInvalid, FloodWait, RPCError
@@ -64,44 +64,38 @@ OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4.1")
 DRY_RUN = os.getenv("DRY_RUN", "1").strip() == "1"
 HEARTBEAT_SEC = int(os.getenv("HEARTBEAT_SEC", "300"))  # 5 хв
 SWING_EXIT_WATCH_SEC = float(os.getenv("SWING_EXIT_WATCH_SEC", "4"))
-# Trading policy v3:
-# - execute SWING LONG only by default;
-# - never open SHORT;
-# - allow SWING LONG entries around the clock.
-# SWING uses the three-target partial model declared in trade_rules.py.
+# Rule 1 - Swing and Rule 2A - Scalping are deliberately code-owned so stale
+# Railway variables cannot silently re-enable a rejected style or side.
 # Existing position management (SL/TP/BE/CLOSE) remains active around the clock.
-TRADE_LONG_ALL_STYLES = os.getenv("TRADE_LONG_ALL_STYLES", "0").strip() == "1"
-TRADE_LONG_ONLY = os.getenv("TRADE_LONG_ONLY", "1").strip() == "1"
-# Signals remain in the generator database for future TradFi research.  This
-# flag only prevents a new exchange order for stocks, ETFs and other non-crypto
-# underlyings; management of positions that already exist remains enabled.
-TRADE_CRYPTO_ONLY = os.getenv("TRADE_CRYPTO_ONLY", "1").strip() == "1"
-ALLOW_SWING_LONG_DURING_BLOCKED_HOURS = (
-    os.getenv("ALLOW_SWING_LONG_DURING_BLOCKED_HOURS", "1").strip() == "1"
+TRADE_LONG_ONLY = all(
+    rules.allowed_side == "long" for rules in (SWING_RULES, ENTRY_RULES)
 )
 ENTRY_BLOCK_START_HOUR_KYIV = int(os.getenv("ENTRY_BLOCK_START_HOUR_KYIV", "0"))
 ENTRY_BLOCK_END_HOUR_KYIV = int(os.getenv("ENTRY_BLOCK_END_HOUR_KYIV", "6"))
-FULL_TP1_MAX_RR_EXCLUSIVE = float(os.getenv("FULL_TP1_MAX_RR_EXCLUSIVE", "3.0"))
-SCALP_FULL_TP1_MAX_RR_EXCLUSIVE = float(
-    os.getenv("SCALP_FULL_TP1_MAX_RR_EXCLUSIVE", "2.5")
-)
+RR1_MIN_INCLUSIVE = ENTRY_RULES.rr1_min_inclusive
+RR1_MAX_EXCLUSIVE = ENTRY_RULES.rr1_max_exclusive
+RR1_POLICY_EPSILON = 1e-6
 KYIV_TZ = ZoneInfo("Europe/Kyiv")
 
-if TRADE_LONG_ALL_STYLES:
-    ALLOWED_SIGNAL_STYLES = {"SCALP", "INTRADAY", "SWING"}
-else:
-    ALLOWED_SIGNAL_STYLES = {
-        style.strip().upper()
-        for style in os.getenv("ALLOWED_SIGNAL_STYLES", "SWING").split(",")
-        if style.strip()
-    }
+ALLOWED_SIGNAL_STYLES = set(ENTRY_RULES.allowed_styles) | set(SWING_RULES.allowed_styles)
+
+
+def _rules_for_signal_style(style: Optional[str]):
+    normalized_style = str(style or "").strip().upper()
+    if normalized_style in ENTRY_RULES.allowed_styles:
+        return ENTRY_RULES
+    if normalized_style in SWING_RULES.allowed_styles:
+        return SWING_RULES
+    return None
+
+
 SWING_MAX_ENTRY_DRIFT_R = float(
     os.getenv(
         "SWING_MAX_ENTRY_DRIFT_R",
         str(SWING_RULES.max_adverse_entry_drift_r),
     )
 )
-FIXED_RISK_PCT = float(os.getenv("FIXED_RISK_PCT", "0.5"))
+FIXED_RISK_PCT = ENTRY_RULES.risk_per_trade_pct
 MAX_AUTO_LEVERAGE = int(os.getenv("MAX_AUTO_LEVERAGE", "20"))
 LEVERAGE_DISTANCE_BUFFER = float(os.getenv("LEVERAGE_DISTANCE_BUFFER", "3.0"))
 MAX_MARGIN_USAGE_PCT = float(os.getenv("MAX_MARGIN_USAGE_PCT", "95"))
@@ -435,9 +429,11 @@ def non_crypto_open_block_reason(
     base: str,
     signal_text: str = "",
     symbol: Optional[str] = None,
+    style: Optional[str] = None,
 ) -> Optional[str]:
-    """Block only new non-crypto orders while preserving their source signal."""
-    if not TRADE_CRYPTO_ONLY:
+    """Apply the asset universe of the selected trading rule."""
+    rules = _rules_for_signal_style(style) or SWING_RULES
+    if not rules.ordinary_crypto_only:
         return None
 
     market = None
@@ -455,7 +451,7 @@ def non_crypto_open_block_reason(
     if asset_class:
         return (
             f"asset={str(base).upper()} classified as {asset_class}; "
-            "execution policy allows ordinary crypto assets only"
+            f"{rules.version} allows ordinary crypto assets only"
         )
     return None
 
@@ -1050,6 +1046,7 @@ def _split_swing_target_quantities(
     symbol: str,
     total_qty: float,
     reference_price: Optional[float] = None,
+    target_split: Optional[tuple[float, float, float]] = None,
 ) -> tuple[float, float, float]:
     """Split an exchange-precision position without exceeding its total size."""
     total = float(total_qty)
@@ -1059,7 +1056,7 @@ def _split_swing_target_quantities(
     def precise(value: float) -> float:
         return float(exchange.amount_to_precision(symbol, max(0.0, value)))
 
-    split = SWING_RULES.target_split
+    split = target_split or SWING_RULES.target_split
     qty1 = precise(total * split[0])
     qty2 = precise(total * split[1])
     qty3 = precise(total - qty1 - qty2)
@@ -1185,13 +1182,19 @@ def apply_swing_sltp_sync(
     tp2_price: float,
     tp3_price: float,
     position_side: str = "long",
+    signal_style: str = "SWING",
 ) -> str:
-    """Arm one full SL plus 40/30/30 SWING take-profit orders.
+    """Arm one full SL plus rule-specific 40/30/30 take-profit orders.
 
     BingX hedge mode rejects ``reduceOnly``. Closing semantics are provided by
     the opposite order side together with the explicit LONG/SHORT
     ``positionSide`` and the partial quantities.
     """
+    style = str(signal_style or "").strip().upper()
+    exit_rules = _rules_for_signal_style(style)
+    if not exit_rules or not getattr(exit_rules, "live_partial_exit_ready", False):
+        raise ValueError(f"{style or 'missing'} has no live partial-exit rule")
+
     base_u = str(base).upper().strip()
     symbol = resolve_symbol_sync(base_u)
     if not symbol:
@@ -1202,11 +1205,11 @@ def apply_swing_sltp_sync(
         return "NO_POSITION"
     pos_side = _extract_position_side_sync(pos)
     if pos_side != "long":
-        raise RuntimeError("Live SWING partial-exit model is LONG-only")
+        raise RuntimeError(f"Live {style} partial-exit model is LONG-only")
 
     actual_entry = _position_entry_price(pos, entry_price)
     if actual_entry is None:
-        raise RuntimeError("Cannot determine SWING entry price")
+        raise RuntimeError(f"Cannot determine {style} entry price")
 
     qty = _extract_position_qty_sync(pos, symbol)
     if qty <= 0:
@@ -1221,7 +1224,7 @@ def apply_swing_sltp_sync(
     sl_prec, tp1_prec, tp2_prec, tp3_prec = prices
     if not (sl_prec < actual_entry < tp1_prec < tp2_prec < tp3_prec):
         raise ValueError(
-            "SWING prices must be ordered SL < entry < TP1 < TP2 < TP3; "
+            f"{style} prices must be ordered SL < entry < TP1 < TP2 < TP3; "
             f"got {sl_prec}, {actual_entry}, {tp1_prec}, {tp2_prec}, {tp3_prec}"
         )
 
@@ -1230,11 +1233,12 @@ def apply_swing_sltp_sync(
             symbol,
             qty,
             reference_price=actual_entry,
+            target_split=exit_rules.target_split,
         )
     except Exception as partial_error:
         log(
             "ERROR",
-            f"SWING position cannot support 40/30/30 for {symbol}: {partial_error}; "
+            f"{style} position cannot support 40/30/30 for {symbol}: {partial_error}; "
             "arming full-size SL + TP1 fallback",
         )
         fallback = apply_sltp_sync(
@@ -1246,7 +1250,12 @@ def apply_swing_sltp_sync(
         )
         return f"FALLBACK_FULL_TP1 after split error={partial_error} | {fallback}"
 
-    be_prec = calculate_swing_breakeven_price(actual_entry, sl_prec, pos_side)
+    be_prec = calculate_swing_breakeven_price(
+        actual_entry,
+        sl_prec,
+        pos_side,
+        buffer_r=exit_rules.breakeven_buffer_r,
+    )
     try:
         be_prec = float(exchange.price_to_precision(symbol, be_prec))
     except Exception:
@@ -1279,7 +1288,8 @@ def apply_swing_sltp_sync(
             "tp2": tp2_prec,
             "tp3": tp3_prec,
             "swing_plan": {
-                "version": SWING_RULES.version,
+                "version": exit_rules.version,
+                "style": style,
                 "stage": "armed",
                 "entry": actual_entry,
                 "initial_sl": sl_prec,
@@ -1288,7 +1298,7 @@ def apply_swing_sltp_sync(
                 "tp1_qty": qty1,
                 "tp2_qty": qty2,
                 "tp3_qty": qty3,
-                "buffer_r": SWING_RULES.breakeven_buffer_r,
+                "buffer_r": exit_rules.breakeven_buffer_r,
             },
         }
         LAST_ORDER_IDS[key] = placed_ids
@@ -1296,7 +1306,7 @@ def apply_swing_sltp_sync(
         save_order_ids()
         log(
             "INFO",
-            f"SWING EXIT ARMED symbol={symbol} qty={qty} SL={sl_prec} "
+            f"{style} BALANCED EXIT ARMED symbol={symbol} qty={qty} SL={sl_prec} "
             f"TP1={tp1_prec}/{qty1} TP2={tp2_prec}/{qty2} "
             f"TP3={tp3_prec}/{qty3} AFTER_TP1_SL={be_prec}",
         )
@@ -1313,7 +1323,7 @@ def apply_swing_sltp_sync(
         _clear_position_state(base_u, pos_side)
         log(
             "ERROR",
-            f"SWING partial protection failed for {symbol}: {partial_error}; "
+            f"{style} partial protection failed for {symbol}: {partial_error}; "
             "arming full-size SL + TP1 fallback",
         )
         fallback = apply_sltp_sync(
@@ -1335,6 +1345,7 @@ async def apply_swing_sltp(
     tp2_price: float,
     tp3_price: float,
     position_side: str = "long",
+    signal_style: str = "SWING",
 ) -> str:
     return await asyncio.to_thread(
         apply_swing_sltp_sync,
@@ -1345,6 +1356,7 @@ async def apply_swing_sltp(
         tp2_price=tp2_price,
         tp3_price=tp3_price,
         position_side=position_side,
+        signal_style=signal_style,
     )
 
 
@@ -1518,23 +1530,31 @@ async def swing_exit_watcher_loop():
         ]
         for base, side in plans:
             try:
+                plan = (
+                    ((LAST_SLTP.get(base) or {}).get(side) or {}).get("swing_plan")
+                    or {}
+                )
+                style = str(plan.get("style") or "SWING").upper()
+                buffer_r = float(
+                    plan.get("buffer_r", SWING_RULES.breakeven_buffer_r)
+                )
                 result = await asyncio.to_thread(
                     advance_swing_exit_state_sync, base, side
                 )
                 if result not in {"NO_CHANGE", "NO_SWING_PLAN"}:
-                    log("INFO", f"SWING WATCH {base}/{side}: {result}")
+                    log("INFO", f"{style} PARTIAL WATCH {base}/{side}: {result}")
                     if "stage=tp2_done" in result:
                         await _send_to_tg(
                             f"🎯 {base}/USDT TP2 виконано. "
-                            f"SL останніх 30% залишається на Entry − {SWING_RULES.breakeven_buffer_r:.2f}R."
+                            f"SL останніх 30% залишається на Entry − {buffer_r:.2f}R."
                         )
                     elif "stage=tp1_done" in result:
                         await _send_to_tg(
                             f"🎯 {base}/USDT TP1 виконано. "
-                            f"SL залишку перенесено на Entry − {SWING_RULES.breakeven_buffer_r:.2f}R."
+                            f"SL залишку перенесено на Entry − {buffer_r:.2f}R."
                         )
             except Exception as e:
-                log("ERROR", f"SWING WATCH {base}/{side} failed: {e}")
+                log("ERROR", f"PARTIAL WATCH {base}/{side} failed: {e}")
 
 def reapply_saved_sltp_sync(base: str, position_side: Optional[str] = None) -> str:
     base = str(base).upper().strip()
@@ -1570,6 +1590,7 @@ def reapply_saved_sltp_sync(base: str, position_side: Optional[str] = None) -> s
             tp2_price=float(saved["tp2"]),
             tp3_price=float(saved["tp3"]),
             position_side=pos_side,
+            signal_style=str(swing_plan.get("style") or "SWING"),
         )
 
     return apply_sltp_sync(base, sl_price=sl, tp_price=tp, cancel_first=True, position_side=pos_side)
@@ -1989,6 +2010,21 @@ def is_allowed_signal_style(text: str) -> bool:
     return style is None or style in ALLOWED_SIGNAL_STYLES
 
 
+def is_new_entry_signal_text(text: str) -> bool:
+    """Recognize a full signal card without blocking later management events."""
+    if extract_signal_style(text) is None:
+        return False
+    normalized = text or ""
+    return all(
+        re.search(pattern, normalized, re.I)
+        for pattern in (
+            r"(?:📍\s*)?Entry\s*:",
+            r"(?:🛑\s*)?SL\s*:",
+            r"(?:🎯\s*)?TP1\s*:",
+        )
+    )
+
+
 def is_entry_time_allowed(now: Optional[datetime] = None) -> bool:
     """Return whether a new entry may be opened under the Kyiv-time sleep rule."""
     current = now or datetime.now(KYIV_TZ)
@@ -2013,16 +2049,23 @@ def open_policy_block_reason(
     now: Optional[datetime] = None,
     style: Optional[str] = None,
     rr1: Optional[float] = None,
+    *,
+    require_allowed_style: bool = False,
 ) -> Optional[str]:
     normalized_side = str(side or "").strip().lower()
     normalized_style = str(style or "").strip().upper()
     if TRADE_LONG_ONLY and normalized_side != "long":
         return f"side={normalized_side or 'missing'}; policy allows LONG only"
+    if require_allowed_style and normalized_style not in ALLOWED_SIGNAL_STYLES:
+        return (
+            f"style={normalized_style or 'missing'}; policy allows "
+            f"{', '.join(sorted(ALLOWED_SIGNAL_STYLES))} only"
+        )
     if not is_entry_time_allowed(now):
         swing_long_exception = (
-            ALLOW_SWING_LONG_DURING_BLOCKED_HOURS
-            and normalized_side == "long"
-            and normalized_style == "SWING"
+            normalized_style in SWING_RULES.allowed_styles
+            and normalized_side == SWING_RULES.allowed_side
+            and SWING_RULES.allow_kyiv_00_06
         )
         if not swing_long_exception:
             current = (now or datetime.now(KYIV_TZ))
@@ -2043,20 +2086,20 @@ def open_policy_block_reason(
         if not math.isfinite(effective_rr1) or effective_rr1 <= 0:
             return f"invalid effective TP1 RR={effective_rr1}"
         if (
-            normalized_style != "SWING"
-            and effective_rr1 >= FULL_TP1_MAX_RR_EXCLUSIVE
+            normalized_style in ENTRY_RULES.allowed_styles
+            and effective_rr1 + RR1_POLICY_EPSILON < RR1_MIN_INCLUSIVE
         ):
             return (
                 f"effective TP1 RR={effective_rr1:.4f} is blocked; "
-                f"Full TP1 requires RR < {FULL_TP1_MAX_RR_EXCLUSIVE:g}"
+                f"policy requires RR >= {RR1_MIN_INCLUSIVE:g}"
             )
         if (
-            normalized_style == "SCALP"
-            and effective_rr1 >= SCALP_FULL_TP1_MAX_RR_EXCLUSIVE
+            normalized_style in ENTRY_RULES.allowed_styles
+            and effective_rr1 >= RR1_MAX_EXCLUSIVE
         ):
             return (
-                f"effective TP1 RR={effective_rr1:.4f} is blocked for SCALP; "
-                f"Full TP1 SCALP requires RR < {SCALP_FULL_TP1_MAX_RR_EXCLUSIVE:g}"
+                f"effective TP1 RR={effective_rr1:.4f} is blocked; "
+                f"policy requires RR < {RR1_MAX_EXCLUSIVE:g}"
             )
     return None
 
@@ -2114,6 +2157,11 @@ def parse_structured_signal(text: str) -> Optional[dict]:
     if sl is None or tp1 is None:
         return None
 
+    style_rules = _rules_for_signal_style(style)
+    uses_partial_targets = bool(
+        style_rules and getattr(style_rules, "live_partial_exit_ready", False)
+    )
+
     return {
         "action": "OPEN",
         "base": header.group(2).upper(),
@@ -2124,10 +2172,8 @@ def parse_structured_signal(text: str) -> Optional[dict]:
         "entry": entry,
         "sl": sl,
         "tp": tp1,
-        # Only SWING may send later targets to live execution. SCALP and
-        # INTRADAY deliberately keep the full-TP1 model.
-        "tp2": tp2 if style == "SWING" else None,
-        "tp3": tp3 if style == "SWING" else None,
+        "tp2": tp2 if uses_partial_targets else None,
+        "tp3": tp3 if uses_partial_targets else None,
         "position_usdt": position_usdt,
         "margin_usdt": margin_usdt,
         "balance_usdt": balance_usdt,
@@ -2218,8 +2264,8 @@ EXTRACTION RULES:
 - ADD_PCT: for ADD signals parse the percentage being added now
 - SL: number after SL / stop loss
 - TP: always put TP1 in "tp"
-- For SWING OPEN signals, also extract TP2 into "tp2" and TP3 into "tp3"
-- For SCALP/INTRADAY, set "tp2" and "tp3" to null
+- For SCALP and SWING OPEN signals, also extract TP2 into "tp2" and TP3 into "tp3"
+- For INTRADAY, set "tp2" and "tp3" to null
 - RR: if take profit is expressed as RR instead of a price, extract rr as a positive number
 - Examples of RR targets:
   - RR2 -> rr=2
@@ -2423,7 +2469,12 @@ def parse_trade_multi(text: Optional[str], image_paths: Optional[list[str]]) -> 
     structured = parse_structured_signal(text or "")
     if structured:
         style = extract_signal_style(text or "")
-        target_mode = "TP1/TP2/TP3 partial" if style == "SWING" else "TP1 only"
+        style_rules = _rules_for_signal_style(style)
+        target_mode = (
+            "TP1/TP2/TP3 partial"
+            if style_rules and getattr(style_rules, "live_partial_exit_ready", False)
+            else "TP1 only"
+        )
         log(
             "INFO",
             f"STRUCTURED {style} parsed locally; execution target={target_mode}",
@@ -2567,6 +2618,7 @@ def _format_open_notification(
     risk_usdt: Optional[float] = None,
     expected_tp1_profit: Optional[float] = None,
     margin_usdt: Optional[float] = None,
+    breakeven_buffer_r: Optional[float] = None,
 ) -> str:
     lines = [
         f"✅ OPENED {style or 'SIGNAL'} · {base}/USDT",
@@ -2583,7 +2635,7 @@ def _format_open_notification(
         lines.insert(6, f"TP3 (30% position): {tp3}")
         lines.insert(
             7,
-            f"After TP1: SL → Entry − {SWING_RULES.breakeven_buffer_r:.2f}R",
+            f"After TP1: SL → Entry − {float(breakeven_buffer_r or 0.0):.2f}R",
         )
     if risk_usdt is not None:
         lines.append(f"Risk to SL: {risk_usdt:.4f} USDT ({FIXED_RISK_PCT}%)")
@@ -2623,6 +2675,13 @@ async def handle_ai_command(cmd: dict):
     # DCA inside an OPEN setup means "open now + place pending DCA order", not market ADD.
     # We only rescue NONE -> ADD when there is already an open position.
     if action == "NONE" and base and _has_add_intent_text(tg_text):
+        if not ENTRY_RULES.allow_position_additions:
+            log(
+                "WARNING",
+                f"POLICY SKIP ADD {base}: fixed {FIXED_RISK_PCT:g}% entry risk; "
+                "position additions are disabled",
+            )
+            return
         try:
             base_for_add = _clean_base_from_context(base, tg_text)
             symbol_for_add = await resolve_symbol(base_for_add)
@@ -2635,6 +2694,14 @@ async def handle_ai_command(cmd: dict):
 
     if action == "NONE":
         log("DEBUG", "AI SKIP: action=NONE")
+        return
+
+    if action == "ADD" and not ENTRY_RULES.allow_position_additions:
+        log(
+            "WARNING",
+            f"POLICY SKIP ADD {base}: fixed {FIXED_RISK_PCT:g}% entry risk; "
+            "position additions are disabled",
+        )
         return
 
     min_conf = ACTION_MIN_CONF.get(action, 0.70)
@@ -2700,7 +2767,11 @@ async def handle_ai_command(cmd: dict):
             log("INFO", "AI SKIP OPEN: side missing/invalid")
             return
 
-        policy_block = open_policy_block_reason(side, style=cmd.get("_signal_style"))
+        policy_block = open_policy_block_reason(
+            side,
+            style=cmd.get("_signal_style"),
+            require_allowed_style=True,
+        )
         if policy_block:
             log("WARNING", f"POLICY SKIP OPEN {base}: {policy_block}")
             return
@@ -2718,16 +2789,22 @@ async def handle_ai_command(cmd: dict):
             return
 
         signal_style = str(cmd.get("_signal_style") or "").upper()
-        use_swing_partial = (
-            signal_style == "SWING" and SWING_RULES.live_partial_exit_ready
+        partial_rules = _rules_for_signal_style(signal_style)
+        use_partial_exit = bool(
+            partial_rules and getattr(partial_rules, "live_partial_exit_ready", False)
         )
-        if use_swing_partial and cmd.get("entry") is None:
-            log("ERROR", f"SAFE SKIP OPEN {base}: live SWING requires signal Entry")
-            return
-        if use_swing_partial and (tp2 is None or tp3 is None):
+        if use_partial_exit and cmd.get("entry") is None:
             log(
                 "ERROR",
-                f"SAFE SKIP OPEN {base}: live SWING model requires TP1, TP2 and TP3",
+                f"SAFE SKIP OPEN {base}: live {signal_style} partial model "
+                "requires signal Entry",
+            )
+            return
+        if use_partial_exit and (tp2 is None or tp3 is None):
+            log(
+                "ERROR",
+                f"SAFE SKIP OPEN {base}: live {signal_style} model requires "
+                "TP1, TP2 and TP3",
             )
             return
 
@@ -2738,10 +2815,21 @@ async def handle_ai_command(cmd: dict):
             log("ERROR", f"Symbol not listed on BingX: {base_clean}/USDT")
             return
 
+        if not ENTRY_RULES.allow_same_symbol_side_reentry:
+            existing_same_side = await fetch_position_oneway(symbol, side)
+            if existing_same_side:
+                log(
+                    "WARNING",
+                    f"POLICY SKIP OPEN {base_clean}: {side.upper()} position already "
+                    "exists; BingX would aggregate it and change the original risk",
+                )
+                return
+
         asset_policy_block = non_crypto_open_block_reason(
             base_clean,
             signal_text=tg_text,
             symbol=symbol,
+            style=signal_style,
         )
         if asset_policy_block:
             log("WARNING", f"POLICY SKIP OPEN {base_clean}: {asset_policy_block}")
@@ -2758,7 +2846,7 @@ async def handle_ai_command(cmd: dict):
             log("ERROR", f"fetch_ticker failed: {e}")
             return
 
-        if use_swing_partial and cmd.get("entry") is not None:
+        if signal_style == "SWING" and cmd.get("entry") is not None:
             try:
                 signal_entry = normalize_price_from_tail(
                     float(cmd["entry"]), entry, side, "entry"
@@ -2793,7 +2881,7 @@ async def handle_ai_command(cmd: dict):
 
         tp2_fixed = None
         tp3_fixed = None
-        if use_swing_partial:
+        if use_partial_exit:
             tp2_fixed = normalize_price_from_tail(float(tp2), entry, side, "tp")
             tp3_fixed = normalize_price_from_tail(float(tp3), entry, side, "tp")
 
@@ -2811,7 +2899,7 @@ async def handle_ai_command(cmd: dict):
 
         tp2_prec = None
         tp3_prec = None
-        if use_swing_partial:
+        if use_partial_exit:
             try:
                 tp2_prec = float(
                     await asyncio.to_thread(exchange.price_to_precision, symbol, tp2_fixed)
@@ -2828,10 +2916,11 @@ async def handle_ai_command(cmd: dict):
         if not validate_sl_tp(side, entry, sl_prec, tp_prec):
             log("INFO", f"SKIP Bad SL/TP vs entry. entry={entry} SL={sl_prec} TP={tp_prec}")
             return
-        if use_swing_partial and not (tp_prec < tp2_prec < tp3_prec):
+        if use_partial_exit and not (tp_prec < tp2_prec < tp3_prec):
             log(
                 "INFO",
-                f"SKIP Bad SWING target order: TP1={tp_prec} TP2={tp2_prec} TP3={tp3_prec}",
+                f"SKIP Bad {signal_style} target order: "
+                f"TP1={tp_prec} TP2={tp2_prec} TP3={tp3_prec}",
             )
             return
 
@@ -2845,6 +2934,7 @@ async def handle_ai_command(cmd: dict):
             side,
             style=cmd.get("_signal_style"),
             rr1=effective_rr1,
+            require_allowed_style=True,
         )
         if rr_policy_block:
             log("WARNING", f"POLICY SKIP OPEN {base_clean}: {rr_policy_block}")
@@ -2893,16 +2983,18 @@ async def handle_ai_command(cmd: dict):
             return
 
 
-        if use_swing_partial:
+        if use_partial_exit:
             try:
                 planned_parts = _split_swing_target_quantities(
                     symbol,
                     qty,
                     reference_price=entry,
+                    target_split=partial_rules.target_split,
                 )
                 log(
                     "INFO",
-                    f"SWING SIZE PREFLIGHT PASS {base_clean} qty={qty} parts={planned_parts}",
+                    f"{signal_style} SIZE PREFLIGHT PASS {base_clean} "
+                    f"qty={qty} parts={planned_parts}",
                 )
             except Exception as size_error:
                 reason = (
@@ -2910,7 +3002,9 @@ async def handle_ai_command(cmd: dict):
                     f"{size_error}"
                 )
                 log("WARNING", f"SAFE SKIP OPEN {base_clean}: {reason}")
-                await _send_to_tg(f"⚠️ {base_clean}/USDT SWING пропущено: {reason}")
+                await _send_to_tg(
+                    f"⚠️ {base_clean}/USDT {signal_style} пропущено: {reason}"
+                )
                 return
 
         if DRY_RUN:
@@ -2952,7 +3046,7 @@ async def handle_ai_command(cmd: dict):
             await asyncio.sleep(0.7)
 
             try:
-                if use_swing_partial:
+                if use_partial_exit:
                     res = await apply_swing_sltp(
                         base_clean,
                         entry_price=entry,
@@ -2961,6 +3055,7 @@ async def handle_ai_command(cmd: dict):
                         tp2_price=float(tp2_prec),
                         tp3_price=float(tp3_prec),
                         position_side=side,
+                        signal_style=signal_style,
                     )
                 else:
                     LAST_SLTP.setdefault(base_clean, {})
@@ -2989,10 +3084,10 @@ async def handle_ai_command(cmd: dict):
                 )
                 return
             log("INFO", f"APPLY SL/TP after OPEN done: {res}")
-            swing_partial_active = use_swing_partial and not res.startswith(
+            partial_exit_active = use_partial_exit and not res.startswith(
                 "FALLBACK_FULL_TP1"
             )
-            if use_swing_partial and not swing_partial_active:
+            if use_partial_exit and not partial_exit_active:
                 await _send_to_tg(
                     f"⚠️ {base_clean}/USDT: три часткові TP не встановились. "
                     "Увімкнено безпечний fallback: повний SL + 100% TP1."
@@ -3010,27 +3105,32 @@ async def handle_ai_command(cmd: dict):
                     tp=tp_prec,
                     tp2=tp2_prec,
                     tp3=tp3_prec,
-                    swing_partial=swing_partial_active,
+                    swing_partial=partial_exit_active,
                     qty=qty,
                     leverage=int(lev),
                     liquidation=shown_liquidation,
                     risk_usdt=float(trade_plan["expected_loss_at_sl"]),
                     expected_tp1_profit=(
                         float(trade_plan["expected_profit_at_tp1"])
-                        * (SWING_RULES.target_split[0] if swing_partial_active else 1.0)
+                        * (partial_rules.target_split[0] if partial_exit_active else 1.0)
                     ),
                     margin_usdt=float(trade_plan["margin"]),
+                    breakeven_buffer_r=(
+                        partial_rules.breakeven_buffer_r
+                        if partial_exit_active
+                        else None
+                    ),
                 )
             )
 
             dca_price = cmd.get("dca_price") or cmd.get("price")
             dca_pct = cmd.get("dca_pct")
             if dca_price and dca_pct:
-                dca_res = await place_dca(symbol, side, float(dca_pct), float(dca_price), int(lev))
-                if dca_res.get("ok"):
-                    log("INFO", f"DCA after OPEN placed {base_clean} at {dca_res['price']} qty={dca_res['qty']}")
-                else:
-                    log("WARNING", f"DCA after OPEN not placed {base_clean}: {dca_res.get('reason')}")
+                log(
+                    "WARNING",
+                    f"POLICY SKIP DCA {base_clean}: fixed 0.5% entry risk; "
+                    "position additions are disabled",
+                )
 
         except Exception as e:
             log("ERROR", f"OPEN FAILED: {e}")
@@ -3380,7 +3480,11 @@ async def album_flush(gid: str):
     text = (payload.get("text") or "").strip()
     images = (payload.get("images") or [])[:4]
 
-    if text and not is_allowed_signal_style(text):
+    if (
+        text
+        and is_new_entry_signal_text(text)
+        and not is_allowed_signal_style(text)
+    ):
         log("INFO", f"STYLE SKIP album={gid} style={extract_signal_style(text)} allowed={sorted(ALLOWED_SIGNAL_STYLES)}")
         return
 
@@ -3485,7 +3589,12 @@ async def on_signal(_, message):
 
     text = (message.text or message.caption or "").strip()
 
-    if text and not message.media_group_id and not is_allowed_signal_style(text):
+    if (
+        text
+        and not message.media_group_id
+        and is_new_entry_signal_text(text)
+        and not is_allowed_signal_style(text)
+    ):
         log("INFO", f"STYLE SKIP style={extract_signal_style(text)} allowed={sorted(ALLOWED_SIGNAL_STYLES)}")
         return
 
@@ -3589,16 +3698,18 @@ async def main():
         log(
             "INFO",
             "ENTRY POLICY "
+            f"active_rules={[SWING_RULES.version, ENTRY_RULES.version]} "
             f"styles={sorted(ALLOWED_SIGNAL_STYLES)} "
             f"long_only={TRADE_LONG_ONLY} "
-            f"crypto_only={TRADE_CRYPTO_ONLY} "
-            f"swing_long_overnight={ALLOW_SWING_LONG_DURING_BLOCKED_HOURS} "
-            f"swing_rule={SWING_RULES.version} "
-            f"swing_risk={SWING_RULES.risk_per_trade_pct:g}% "
-            f"swing_live_partial={SWING_RULES.live_partial_exit_ready} "
-            f"swing_max_entry_drift={SWING_MAX_ENTRY_DRIFT_R:g}R "
-            f"full_tp1_rr_lt={FULL_TP1_MAX_RR_EXCLUSIVE:g} "
-            f"scalp_full_tp1_rr_lt={SCALP_FULL_TP1_MAX_RR_EXCLUSIVE:g} "
+            f"risk={FIXED_RISK_PCT:g}% "
+            f"rule2_rr1={RR1_MIN_INCLUSIVE:g}<=RR<{RR1_MAX_EXCLUSIVE:g} "
+            "rule2_assets=all_bingx_listed "
+            "rule2_exit=40/30/30_TP1/TP2/TP3 "
+            f"rule2_be_buffer={ENTRY_RULES.breakeven_buffer_r:g}R "
+            "rule1_exit=40/30/30_TP1/TP2/TP3 "
+            f"additions={ENTRY_RULES.allow_position_additions} "
+            f"same_side_reentry={ENTRY_RULES.allow_same_symbol_side_reentry} "
+            f"max_positions={ENTRY_RULES.max_concurrent_positions or 'unlimited'} "
             f"blocked_kyiv={ENTRY_BLOCK_START_HOUR_KYIV:02d}:00-"
             f"{ENTRY_BLOCK_END_HOUR_KYIV:02d}:00",
         )

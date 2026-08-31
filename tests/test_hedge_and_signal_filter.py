@@ -81,8 +81,10 @@ def _load_trade_module():
     os.environ.setdefault("TG_API_ID", "1")
     os.environ.setdefault("TG_API_HASH", "test")
     os.environ.setdefault("TG_SESSION_STRING", "test")
+    # Deliberately stale v3 variables: v4 entry policy must ignore them.
     os.environ["TRADE_LONG_ALL_STYLES"] = "0"
     os.environ["ALLOWED_SIGNAL_STYLES"] = "SWING"
+    os.environ["FIXED_RISK_PCT"] = "9.0"
 
     ccxt_stub = types.ModuleType("ccxt")
     ccxt_stub.bingx = _BingX
@@ -109,22 +111,36 @@ class SignalFilterTests(unittest.TestCase):
     def setUpClass(cls):
         cls.bot = _load_trade_module()
 
-    def test_only_swing_signal_style_is_allowed(self):
+    def test_rule_one_swing_and_rule_two_scalp_are_allowed(self):
         intraday = "📈 INTRADAY  LONG 🟢 — SUI/USDT:USDT\nTF: 4H / 1H / 15M"
         scalp = "⚡ SCALP  LONG 🟢 — SUI/USDT:USDT\nTF: 1H / 15M / 5M"
         swing = "🌊 SWING  LONG 🟢 — SUI/USDT:USDT\nTF: 1D / 4H / 1H"
         stats = "📊 Paper-trading статистика\n⚡ SCALP: угод 325\n📈 INTRADAY: угод 180"
 
         self.assertFalse(self.bot.is_allowed_signal_style(intraday))
-        self.assertFalse(self.bot.is_allowed_signal_style(scalp))
+        self.assertTrue(self.bot.is_allowed_signal_style(scalp))
         self.assertTrue(self.bot.is_allowed_signal_style(swing))
         self.assertIsNone(self.bot.extract_signal_style(stats))
 
+    def test_non_scalp_management_event_is_not_mistaken_for_new_entry(self):
+        event = "🟢 TP1 ДОСЯГНУТО — позиція ще відкрита\nСтиль: SWING | LONG"
+        signal = """🌊 SWING LONG 🟢 — SUI/USDT:USDT
+📍 Entry: 1.00
+🛑 SL: 0.95
+🎯 TP1: 1.05
+"""
+        self.assertFalse(self.bot.is_new_entry_signal_text(event))
+        self.assertTrue(self.bot.is_new_entry_signal_text(signal))
+
     def test_non_crypto_assets_are_blocked_but_crypto_is_allowed(self):
         for base in ("SNDK", "MU", "MUU", "SKHY", "ZHIPU", "SPY", "XAU"):
-            reason = self.bot.non_crypto_open_block_reason(base)
+            reason = self.bot.non_crypto_open_block_reason(base, style="SWING")
             self.assertIsNotNone(reason, base)
             self.assertIn("ordinary crypto assets only", reason)
+            self.assertIsNone(
+                self.bot.non_crypto_open_block_reason(base, style="SCALP"),
+                base,
+            )
 
         for base in ("BTC", "HYPE", "ONDO", "1000SHIB", "DOGE"):
             self.assertIsNone(self.bot.non_crypto_open_block_reason(base), base)
@@ -151,7 +167,7 @@ class SignalFilterTests(unittest.TestCase):
         text = "⚡ SCALP LONG\n💧 Орієнт. ліквід: 0.507049"
         self.assertEqual(self.bot.extract_liquidation_from_text(text), 0.507049)
 
-    def test_structured_feed_parses_tp1_and_ignores_later_targets(self):
+    def test_structured_scalp_feed_parses_all_balanced_targets(self):
         text = """⚡ SCALP  LONG 🟢  —  SUI/USDT:USDT
 TF: 1H / 15M / 5M
 📍 Entry:   0.726500
@@ -170,7 +186,8 @@ TF: 1H / 15M / 5M
         self.assertEqual(parsed["base"], "SUI")
         self.assertEqual(parsed["side"], "long")
         self.assertEqual(parsed["tp"], 0.748712)
-        self.assertNotEqual(parsed["tp"], 0.768148)
+        self.assertEqual(parsed["tp2"], 0.768148)
+        self.assertEqual(parsed["tp3"], 0.795913)
         self.assertEqual(parsed["position_usdt"], 261.66)
         self.assertEqual(parsed["balance_usdt"], 1000.0)
         self.assertEqual(parsed["leverage"], 3)
@@ -196,82 +213,113 @@ TF: 1H / 15M / 5M
                 self.assertIsNone(parsed["tp2"])
                 self.assertIsNone(parsed["tp3"])
 
-    def test_open_policy_allows_long_only_outside_sleep_window(self):
+    def test_open_policy_allows_scalp_long_only_outside_sleep_window(self):
         kyiv = ZoneInfo("Europe/Kyiv")
         self.assertIsNotNone(
             self.bot.open_policy_block_reason(
-                "short", datetime(2026, 8, 26, 12, 0, tzinfo=kyiv), style="SWING"
+                "short",
+                datetime(2026, 8, 26, 12, 0, tzinfo=kyiv),
+                style="SCALP",
+                require_allowed_style=True,
             )
         )
         self.assertIsNotNone(
             self.bot.open_policy_block_reason(
-                "long", datetime(2026, 8, 26, 0, 0, tzinfo=kyiv), style="SCALP"
+                "long",
+                datetime(2026, 8, 26, 0, 0, tzinfo=kyiv),
+                style="SCALP",
+                require_allowed_style=True,
             )
         )
         self.assertIsNotNone(
             self.bot.open_policy_block_reason(
-                "long", datetime(2026, 8, 26, 5, 59, tzinfo=kyiv), style="INTRADAY"
+                "long",
+                datetime(2026, 8, 26, 5, 59, tzinfo=kyiv),
+                style="SCALP",
+                require_allowed_style=True,
+            )
+        )
+        self.assertIsNotNone(
+            self.bot.open_policy_block_reason(
+                "long",
+                datetime(2026, 8, 26, 12, 0, tzinfo=kyiv),
+                style="INTRADAY",
+                require_allowed_style=True,
             )
         )
         self.assertIsNone(
             self.bot.open_policy_block_reason(
-                "long", datetime(2026, 8, 26, 0, 0, tzinfo=kyiv), style="SWING"
+                "long",
+                datetime(2026, 8, 26, 12, 0, tzinfo=kyiv),
+                style="SWING",
+                require_allowed_style=True,
             )
         )
         self.assertIsNone(
             self.bot.open_policy_block_reason(
-                "long", datetime(2026, 8, 26, 5, 59, tzinfo=kyiv), style="SWING"
+                "long",
+                datetime(2026, 8, 26, 6, 0, tzinfo=kyiv),
+                style="SCALP",
+                require_allowed_style=True,
             )
         )
         self.assertIsNone(
             self.bot.open_policy_block_reason(
-                "long", datetime(2026, 8, 26, 6, 0, tzinfo=kyiv), style="SCALP"
-            )
-        )
-        self.assertIsNone(
-            self.bot.open_policy_block_reason(
-                "long", datetime(2026, 8, 26, 23, 59, tzinfo=kyiv), style="INTRADAY"
+                "long",
+                datetime(2026, 8, 26, 23, 59, tzinfo=kyiv),
+                style="SCALP",
+                require_allowed_style=True,
             )
         )
 
-    def test_full_tp1_rr_policy_has_maximum_but_no_minimum(self):
+    def test_full_tp1_rr_policy_is_exactly_point_eight_to_below_one(self):
         kyiv = ZoneInfo("Europe/Kyiv")
         noon = datetime(2026, 8, 26, 12, 0, tzinfo=kyiv)
 
-        # Low RR remains valid: the historical 0.8-1.0 band must not be cut.
-        self.assertIsNone(
-            self.bot.open_policy_block_reason("long", noon, style="SCALP", rr1=0.20)
-        )
-        self.assertIsNone(
-            self.bot.open_policy_block_reason("long", noon, style="SCALP", rr1=2.4999)
-        )
         self.assertIsNotNone(
-            self.bot.open_policy_block_reason("long", noon, style="SCALP", rr1=2.50)
-        )
-
-        # RR1 2.5-2.99 is allowed outside SCALP. The RR>=3 cap only belongs
-        # to full-TP1 styles; SWING now exits 40/30/30.
-        self.assertIsNone(
-            self.bot.open_policy_block_reason("long", noon, style="INTRADAY", rr1=2.9999)
-        )
-        for style in ("SCALP", "INTRADAY"):
-            self.assertIsNotNone(
-                self.bot.open_policy_block_reason("long", noon, style=style, rr1=3.0)
+            self.bot.open_policy_block_reason(
+                "long", noon, style="SCALP", rr1=0.79, require_allowed_style=True
             )
+        )
         self.assertIsNone(
-            self.bot.open_policy_block_reason("long", noon, style="SWING", rr1=3.0)
+            self.bot.open_policy_block_reason(
+                "long",
+                noon,
+                style="SCALP",
+                rr1=0.799999999,
+                require_allowed_style=True,
+            )
+        )
+        for rr1 in (0.8, 0.9, 0.999999):
+            self.assertIsNone(
+                self.bot.open_policy_block_reason(
+                    "long",
+                    noon,
+                    style="SCALP",
+                    rr1=rr1,
+                    require_allowed_style=True,
+                )
+            )
+        self.assertIsNotNone(
+            self.bot.open_policy_block_reason(
+                "long", noon, style="SCALP", rr1=1.0, require_allowed_style=True
+            )
         )
 
-    def test_night_swing_exception_uses_partial_exit_rr_policy(self):
+    def test_rule_one_swing_is_allowed_at_night_and_keeps_its_own_rr_model(self):
         kyiv = ZoneInfo("Europe/Kyiv")
         night = datetime(2026, 8, 26, 2, 0, tzinfo=kyiv)
 
-        self.assertIsNone(
-            self.bot.open_policy_block_reason("long", night, style="SWING", rr1=2.0)
-        )
-        self.assertIsNone(
-            self.bot.open_policy_block_reason("long", night, style="SWING", rr1=3.0)
-        )
+        for rr1 in (0.9, 2.0, 5.0):
+            self.assertIsNone(
+                self.bot.open_policy_block_reason(
+                    "long",
+                    night,
+                    style="SWING",
+                    rr1=rr1,
+                    require_allowed_style=True,
+                )
+            )
 
     def test_effective_rr_is_calculated_from_execution_prices(self):
         self.assertAlmostEqual(
@@ -310,13 +358,55 @@ TF: 1H / 15M / 5M
         wide_target = self.bot.calculate_auto_trade_plan(1000.0, 100.0, 96.0, 120.0)
         self.assertLess(wide_target["leverage"], plan["leverage"])
 
-    def test_swing_rules_are_explicit_and_risk_is_style_specific(self):
+        tight_stop = self.bot.calculate_auto_trade_plan(1000.0, 100.0, 99.0, 100.8)
+        wide_stop = self.bot.calculate_auto_trade_plan(1000.0, 100.0, 90.0, 108.0)
+        self.assertAlmostEqual(tight_stop["expected_loss_at_sl"], 5.0, places=8)
+        self.assertAlmostEqual(wide_stop["expected_loss_at_sl"], 5.0, places=8)
+        self.assertGreater(tight_stop["notional"], wide_stop["notional"])
+
+    def test_live_entry_rules_are_explicit_and_have_no_position_cap(self):
+        rules = self.bot.ENTRY_RULES
+        self.assertEqual(rules.version, "rule-2a-scalping-balanced-all-assets")
+        self.assertEqual(rules.allowed_styles, ("SCALP",))
+        self.assertEqual(rules.allowed_side, "long")
+        self.assertFalse(rules.ordinary_crypto_only)
+        self.assertEqual(rules.risk_per_trade_pct, 0.5)
+        self.assertEqual(rules.rr1_min_inclusive, 0.8)
+        self.assertEqual(rules.rr1_max_exclusive, 1.0)
+        self.assertEqual(rules.target_split, (0.40, 0.30, 0.30))
+        self.assertTrue(rules.move_sl_to_breakeven_after_tp1)
+        self.assertEqual(rules.breakeven_buffer_r, 0.05)
+        self.assertTrue(rules.live_partial_exit_ready)
+        self.assertFalse(rules.allow_position_additions)
+        self.assertFalse(rules.allow_same_symbol_side_reentry)
+        self.assertIsNone(rules.max_concurrent_positions)
+        self.assertEqual(self.bot.FIXED_RISK_PCT, 0.5)
+        self.assertEqual(self.bot.ALLOWED_SIGNAL_STYLES, {"SCALP", "SWING"})
+        self.assertEqual(self.bot.risk_pct_for_style("SCALP", 9.0), 0.5)
+        self.assertEqual(self.bot.risk_pct_for_style("SWING", 9.0), 0.5)
+
+    def test_position_addition_is_rejected_before_exchange_access(self):
+        asyncio.run(
+            self.bot.handle_ai_command(
+                {
+                    "action": "ADD",
+                    "confidence": 1.0,
+                    "base": "BTC",
+                    "side": "long",
+                    "add_pct": 0.5,
+                    "_tg_text": "Add BTC",
+                }
+            )
+        )
+
+    def test_rule_one_swing_rules_are_active(self):
         rules = self.bot.SWING_RULES
+        self.assertEqual(rules.version, "rule-1-swing")
+        self.assertEqual(rules.allowed_styles, ("SWING",))
         self.assertEqual(rules.allowed_side, "long")
         self.assertTrue(rules.ordinary_crypto_only)
         self.assertTrue(rules.allow_kyiv_00_06)
         self.assertEqual(rules.risk_per_trade_pct, 0.5)
-        self.assertEqual(rules.accepted_six_trade_batch_risk_pct, 3.0)
         self.assertEqual(rules.target_rr, (2.0, 3.0, 5.0))
         self.assertEqual(rules.target_split, (0.40, 0.30, 0.30))
         self.assertTrue(rules.move_sl_to_breakeven_after_tp1)
@@ -324,9 +414,6 @@ TF: 1H / 15M / 5M
         self.assertEqual(rules.max_adverse_entry_drift_r, 0.25)
         self.assertFalse(rules.use_order_book_for_targets)
         self.assertTrue(rules.live_partial_exit_ready)
-
-        self.assertEqual(self.bot.risk_pct_for_style("SWING", 1.0), 0.5)
-        self.assertEqual(self.bot.risk_pct_for_style("SCALP", 1.0), 1.0)
 
 
 class HedgeIsolationTests(unittest.TestCase):
@@ -442,6 +529,34 @@ class SwingPartialExitTests(unittest.TestCase):
             self.assertEqual(state["swing_plan"]["stage"], "tp2_done")
             self.assertAlmostEqual(state["sl"], 99.68)
             self.assertEqual(calls[-1][3], 3.0)
+
+    def test_rule_2a_scalp_arms_40_30_30_with_point_zero_five_r_buffer(self):
+        calls = []
+
+        def fake_place(symbol, side, price, quantity, kind):
+            calls.append((symbol, side, price, quantity, kind))
+            return {"data": {"order": {"orderId": f"scalp-{len(calls)}"}}}
+
+        with mock.patch.object(
+            self.bot, "_place_bingx_tpsl_raw_sync", side_effect=fake_place
+        ):
+            result = self.bot.apply_swing_sltp_sync(
+                "SUI",
+                entry_price=100.0,
+                sl_price=96.0,
+                tp1_price=103.2,
+                tp2_price=108.0,
+                tp3_price=112.0,
+                signal_style="SCALP",
+            )
+
+        self.assertIn("TP1=103.2/4.0", result)
+        self.assertEqual([call[3] for call in calls], [10.0, 4.0, 3.0, 3.0])
+        plan = self.bot.LAST_SLTP["SUI"]["long"]["swing_plan"]
+        self.assertEqual(plan["style"], "SCALP")
+        self.assertEqual(plan["version"], "rule-2a-scalping-balanced-all-assets")
+        self.assertAlmostEqual(plan["be_sl"], 99.8)
+        self.assertAlmostEqual(plan["buffer_r"], 0.05)
 
     def test_partial_order_failure_falls_back_to_full_sl_and_tp1(self):
         call_number = 0

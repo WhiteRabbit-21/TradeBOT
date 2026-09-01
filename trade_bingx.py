@@ -3875,7 +3875,7 @@ async def main():
             f"long_only={TRADE_LONG_ONLY} "
             f"risk={FIXED_RISK_PCT:g}% "
             f"rule2_rr1={RR1_MIN_INCLUSIVE:g}<=RR<{RR1_MAX_EXCLUSIVE:g} "
-            "rule2_assets=all_bingx_listed "
+            f"rule2_assets={'ordinary_crypto_only' if ENTRY_RULES.ordinary_crypto_only else 'all_bingx_listed'} "
             "rule2_exit=40/30/30_TP1/TP2/TP3 "
             f"rule2_be_buffer={ENTRY_RULES.breakeven_buffer_r:g}R "
             "rule1_exit=40/30/30_TP1/TP2/TP3 "

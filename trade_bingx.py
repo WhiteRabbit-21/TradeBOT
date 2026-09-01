@@ -50,7 +50,9 @@ API_ID = int(os.environ["TG_API_ID"])
 API_HASH = os.environ["TG_API_HASH"]
 SESSION_STRING = os.environ["TG_SESSION_STRING"]
 
-TARGET_CHAT_ID = int(os.getenv("TARGET_CHAT_ID", "-5486330898"))   # SignalBot+ only
+TARGET_CHAT_ID = int(os.getenv("TARGET_CHAT_ID", "-5486330898"))   # SignalBot+ automatic source
+CONTROL_CHAT_ID = int(os.getenv("CONTROL_CHAT_ID", "566620979"))   # Saved Messages manual fallback
+SOURCE_CHAT_IDS = list(dict.fromkeys((TARGET_CHAT_ID, CONTROL_CHAT_ID)))
 LOG_CHAT_ID = int(os.getenv("TG_LOG_CHAT_ID", "-1003828203122"))      # куди шлемо логи
 PNL_CHAT_ID = int(os.getenv("PNL_CHAT_ID", "-1003332013833")) # куди шлемо профіт/лос
 
@@ -1848,6 +1850,30 @@ def calculate_rr_from_prices(entry: float, sl: float, tp: float, side: str) -> f
     return reward / risk
 
 
+def source_signal_rr1(command: dict, side: str) -> Optional[float]:
+    """Return the RR1 used by the signal-level statistical rule.
+
+    Prefer the RR printed by SignalBot because its database keeps the original
+    unrounded levels while the Telegram card contains rounded prices. Falling
+    back to the card's Entry/SL/TP1 keeps older generated messages usable.
+    Live fill RR is logged separately and must not silently change membership
+    in the historical RR1 0.8-0.99 cohort.
+    """
+    declared_rr1 = command.get("signal_rr1")
+    if declared_rr1 is not None:
+        value = float(declared_rr1)
+        if not math.isfinite(value) or value <= 0:
+            raise ValueError(f"invalid signal RR1={declared_rr1!r}")
+        return value
+
+    signal_entry = command.get("entry")
+    signal_sl = command.get("sl")
+    signal_tp1 = command.get("tp")
+    if signal_entry is None or signal_sl is None or signal_tp1 is None:
+        return None
+    return calculate_rr_from_prices(signal_entry, signal_sl, signal_tp1, side)
+
+
 def swing_entry_drift_block_reason(
     side: str,
     signal_entry: float,
@@ -1973,6 +1999,10 @@ CLOSE_INTENT_PATTERNS = [
     r"\bsecure(?:d|ing)?\s+profit\b",
     r"\bclose\s+these\b",
     r"\btp\s+these\b",
+    r"\bзакрий\b",
+    r"\bзакрити\b",
+    r"\bзакрой\b",
+    r"\bзакрыть\b",
 ]
 
 CLOSE_NEGATIVE_PATTERNS = [
@@ -2023,6 +2053,42 @@ def is_new_entry_signal_text(text: str) -> bool:
             r"(?:🎯\s*)?TP1\s*:",
         )
     )
+
+
+CONTROL_PREFIX_RE = re.compile(
+    r"^\s*/(?:tb|tradebot)(?:@[A-Z0-9_]+)?(?:\s+|\s*:\s*)",
+    re.I,
+)
+
+
+def normalize_source_text(chat_id: int, text: str) -> Optional[str]:
+    """Gate Saved Messages without exposing the executor to arbitrary notes.
+
+    SignalBot+ remains the automatic source. Saved Messages accepts either a
+    complete generated signal card or an explicit /tb (or /tradebot) command.
+    This preserves a manual recovery path without re-enabling automatic private
+    chat duplicates.
+    """
+    raw = (text or "").strip()
+    try:
+        source_id = int(chat_id)
+    except (TypeError, ValueError):
+        return None
+
+    if source_id == TARGET_CHAT_ID:
+        return raw
+    if source_id != CONTROL_CHAT_ID:
+        return None
+
+    prefix = CONTROL_PREFIX_RE.match(raw)
+    if prefix:
+        command = raw[prefix.end():].strip()
+        return command or None
+
+    if is_new_entry_signal_text(raw):
+        return raw
+
+    return None
 
 
 def is_entry_time_allowed(now: Optional[datetime] = None) -> bool:
@@ -2145,6 +2211,10 @@ def parse_structured_signal(text: str) -> Optional[dict]:
     tp1 = _extract_message_number(text, r"^\s*[^\n]*\bTP1\s*:\s*([0-9]+(?:[.,][0-9]+)?)")
     tp2 = _extract_message_number(text, r"^\s*[^\n]*\bTP2\s*:\s*([0-9]+(?:[.,][0-9]+)?)")
     tp3 = _extract_message_number(text, r"^\s*[^\n]*\bTP3\s*:\s*([0-9]+(?:[.,][0-9]+)?)")
+    signal_rr1 = _extract_message_number(
+        text,
+        r"^\s*[^\n]*\bTP1\s*:.*?\bRR\s*[:=]?\s*([0-9]+(?:[.,][0-9]+)?)",
+    )
     leverage = _extract_message_number(text, r"(?:Плече|Leverage)\s*:\s*([0-9]+(?:[.,][0-9]+)?)\s*x")
     position_usdt = _extract_message_number(text, r"(?:Позиція|Позиция|Position)\s*:\s*([0-9]+(?:[.,][0-9]+)?)\s*USDT")
     margin_usdt = _extract_message_number(text, r"(?:маржа|margin)\s*:\s*([0-9]+(?:[.,][0-9]+)?)\s*USDT")
@@ -2172,6 +2242,7 @@ def parse_structured_signal(text: str) -> Optional[dict]:
         "entry": entry,
         "sl": sl,
         "tp": tp1,
+        "signal_rr1": signal_rr1,
         "tp2": tp2 if uses_partial_targets else None,
         "tp3": tp3 if uses_partial_targets else None,
         "position_usdt": position_usdt,
@@ -2230,6 +2301,73 @@ def _normalize_base_word(w: str) -> Optional[str]:
     if b in BAD_BASE_WORDS or len(b) > 12:
         return None
     return b
+
+
+def parse_manual_control_command(text: str) -> Optional[dict]:
+    """Parse a small, explicit Saved Messages command language without AI."""
+    raw = (text or "").strip()
+    if not raw:
+        return None
+
+    base_pattern = r"#?([A-Z0-9]{1,15})(?:\s*/\s*USDT(?::USDT)?)?"
+    side_pattern = r"(?:\s+(LONG|SHORT))?"
+
+    close_match = re.fullmatch(
+        rf"(?:close(?:\s+now)?|закрий|закрити|закрой|закрыть)\s+{base_pattern}{side_pattern}",
+        raw,
+        re.I,
+    )
+    if close_match:
+        base = _normalize_base_word(close_match.group(1))
+        if base:
+            return {
+                "action": "CLOSE",
+                "base": base,
+                "bases": None,
+                "side": (close_match.group(2) or "").lower() or None,
+                "confidence": 1.0,
+                "raw_text": raw[:500],
+            }
+
+    be_match = re.fullmatch(
+        rf"(?:be|breakeven|break\s+even|беззбиток|безубыток)\s+{base_pattern}{side_pattern}",
+        raw,
+        re.I,
+    )
+    if be_match:
+        base = _normalize_base_word(be_match.group(1))
+        if base:
+            return {
+                "action": "BE",
+                "base": base,
+                "side": (be_match.group(2) or "").lower() or None,
+                "confidence": 1.0,
+                "raw_text": raw[:500],
+            }
+
+    price_match = re.fullmatch(
+        rf"(sl|stop(?:\s+loss)?|стоп|tp|take\s+profit|тейк)\s+"
+        rf"{base_pattern}\s+([0-9]+(?:[.,][0-9]+)?){side_pattern}",
+        raw,
+        re.I,
+    )
+    if price_match:
+        token = price_match.group(1).lower()
+        base = _normalize_base_word(price_match.group(2))
+        if base:
+            is_sl = token in {"sl", "stop", "stop loss", "стоп"}
+            price = float(price_match.group(3).replace(",", "."))
+            return {
+                "action": "SET_SL" if is_sl else "SET_TP",
+                "base": base,
+                "side": (price_match.group(4) or "").lower() or None,
+                "sl": price if is_sl else None,
+                "tp": None if is_sl else price,
+                "confidence": 1.0,
+                "raw_text": raw[:500],
+            }
+
+    return None
 
 
 # =========================
@@ -2466,6 +2604,11 @@ def ai_parse_trade_multi(text: Optional[str], image_paths: Optional[list[str]]) 
         }
 
 def parse_trade_multi(text: Optional[str], image_paths: Optional[list[str]]) -> dict:
+    manual = parse_manual_control_command(text or "")
+    if manual:
+        log("INFO", f"LOCAL CONTROL parsed action={manual['action']} base={manual.get('base')}")
+        return manual
+
     structured = parse_structured_signal(text or "")
     if structured:
         style = extract_signal_style(text or "")
@@ -2808,6 +2951,32 @@ async def handle_ai_command(cmd: dict):
             )
             return
 
+        source_rr1 = None
+        if signal_style in ENTRY_RULES.allowed_styles:
+            try:
+                source_rr1 = source_signal_rr1(cmd, side)
+            except (TypeError, ValueError) as rr_error:
+                log(
+                    "WARNING",
+                    f"POLICY SKIP OPEN {base}: source RR1 calculation failed: {rr_error}",
+                )
+                return
+            if source_rr1 is None:
+                log(
+                    "WARNING",
+                    f"POLICY SKIP OPEN {base}: SCALP statistical rule requires signal RR1",
+                )
+                return
+            source_rr_block = open_policy_block_reason(
+                side,
+                style=signal_style,
+                rr1=source_rr1,
+                require_allowed_style=True,
+            )
+            if source_rr_block:
+                log("WARNING", f"POLICY SKIP OPEN {base}: {source_rr_block}")
+                return
+
         base_clean = _clean_base_from_context(base, tg_text)
         symbol = await resolve_symbol(base_clean)
 
@@ -2930,20 +3099,11 @@ async def handle_ai_command(cmd: dict):
             log("WARNING", f"POLICY SKIP OPEN {base_clean}: RR1 calculation failed: {e}")
             return
 
-        rr_policy_block = open_policy_block_reason(
-            side,
-            style=cmd.get("_signal_style"),
-            rr1=effective_rr1,
-            require_allowed_style=True,
-        )
-        if rr_policy_block:
-            log("WARNING", f"POLICY SKIP OPEN {base_clean}: {rr_policy_block}")
-            return
-
         log(
             "INFO",
             f"RR1 POLICY PASS {base_clean} style={cmd.get('_signal_style')} "
-            f"effective_rr1={effective_rr1:.4f}",
+            f"signal_rr1={source_rr1 if source_rr1 is not None else 'n/a'} "
+            f"live_fill_rr1={effective_rr1:.4f}",
         )
 
         try:
@@ -3564,12 +3724,12 @@ async def close_bundle_flush():
 
 
 # =========================
-# TG HANDLER: read from TARGET_CHAT_ID
+# TG HANDLER: automatic SignalBot+ source plus guarded Saved Messages control
 # =========================
 _last_hb = 0.0
 
 @app.on_message(
-    filters.chat(TARGET_CHAT_ID)
+    filters.chat(SOURCE_CHAT_IDS)
     & (filters.text | filters.caption | filters.photo)
 )
 
@@ -3587,7 +3747,11 @@ async def on_signal(_, message):
         _last_hb = now
         log("INFO", f"HB alive DRY_RUN={DRY_RUN} model={OPENAI_MODEL}")
 
-    text = (message.text or message.caption or "").strip()
+    raw_text = (message.text or message.caption or "").strip()
+    text = normalize_source_text(message.chat.id, raw_text)
+    if int(message.chat.id) == CONTROL_CHAT_ID and text is None:
+        log("INFO", "CONTROL SKIP: Saved Messages payload needs a full signal card or /tb command")
+        return
 
     if (
         text
@@ -3637,6 +3801,7 @@ async def on_signal(_, message):
     cmd = await asyncio.to_thread(parse_trade_multi, text if text else None, [img_path] if img_path else [])
     cmd["_tg_text"] = text
     cmd["_signal_style"] = extract_signal_style(text)
+    cmd["_source_chat_id"] = int(message.chat.id)
     cmd["liquidation"] = cmd.get("liquidation") or extract_liquidation_from_text(text)
     await handle_ai_command(cmd)
 
@@ -3658,6 +3823,13 @@ async def main():
             log("WARNING", "⏳ TARGET retry in 60s…")
             await asyncio.sleep(60)
             ok = await ensure_peer_known(TARGET_CHAT_ID)
+
+        if CONTROL_CHAT_ID != TARGET_CHAT_ID:
+            control_ok = await ensure_peer_known(CONTROL_CHAT_ID)
+            if control_ok:
+                log("INFO", f"Saved Messages control ready. control_chat_id={CONTROL_CHAT_ID}")
+            else:
+                log("WARNING", f"Saved Messages control unavailable. control_chat_id={CONTROL_CHAT_ID}")
 
         if LOG_CHAT_ID:
             ok2 = await ensure_peer_known(LOG_CHAT_ID)
@@ -3713,7 +3885,11 @@ async def main():
             f"blocked_kyiv={ENTRY_BLOCK_START_HOUR_KYIV:02d}:00-"
             f"{ENTRY_BLOCK_END_HOUR_KYIV:02d}:00",
         )
-        log("INFO", f"DRY_RUN={DRY_RUN} | Listening TARGET_CHAT_ID={TARGET_CHAT_ID}")
+        log(
+            "INFO",
+            f"DRY_RUN={DRY_RUN} | Listening source_chat_ids={SOURCE_CHAT_IDS} "
+            "| Saved Messages accepts full signal cards or /tb commands",
+        )
         await idle()
 
     finally:

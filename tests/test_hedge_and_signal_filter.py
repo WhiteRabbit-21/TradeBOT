@@ -88,6 +88,7 @@ def _load_trade_module():
     os.environ["ALLOWED_SIGNAL_STYLES"] = "SWING"
     os.environ["FIXED_RISK_PCT"] = "9.0"
     os.environ.pop("TARGET_CHAT_ID", None)
+    os.environ.pop("CONTROL_CHAT_ID", None)
 
     ccxt_stub = types.ModuleType("ccxt")
     ccxt_stub.bingx = _BingX
@@ -125,9 +126,53 @@ class SignalFilterTests(unittest.TestCase):
         self.assertTrue(self.bot.is_allowed_signal_style(swing))
         self.assertIsNone(self.bot.extract_signal_style(stats))
 
-    def test_only_signalbot_channel_is_registered_as_source(self):
+    def test_signalbot_and_saved_messages_are_registered_as_sources(self):
         self.assertEqual(self.bot.TARGET_CHAT_ID, -5486330898)
-        self.assertEqual(_Filters.last_chat, -5486330898)
+        self.assertEqual(self.bot.CONTROL_CHAT_ID, 566620979)
+        self.assertEqual(_Filters.last_chat, [-5486330898, 566620979])
+
+    def test_saved_messages_accepts_full_signal_or_explicit_command_only(self):
+        signal = """⚡ SCALP LONG 🟢 — HYPE/USDT:USDT
+📍 Entry: 83.889
+🛑 SL: 80.3994
+🎯 TP1: 86.6806
+🎯 TP2: 89.1233
+🎯 TP3: 92.6129
+"""
+        self.assertEqual(
+            self.bot.normalize_source_text(566620979, signal),
+            signal.strip(),
+        )
+        self.assertEqual(
+            self.bot.normalize_source_text(566620979, "/tb close HYPE"),
+            "close HYPE",
+        )
+        self.assertEqual(
+            self.bot.normalize_source_text(566620979, "/tradebot: sl HYPE 80.5"),
+            "sl HYPE 80.5",
+        )
+        self.assertIsNone(
+            self.bot.normalize_source_text(566620979, "нагадати перевірити HYPE")
+        )
+        self.assertIsNone(self.bot.normalize_source_text(123456, signal))
+
+    def test_manual_control_commands_parse_without_openai(self):
+        close = self.bot.parse_manual_control_command("закрий HYPE")
+        self.assertEqual(close["action"], "CLOSE")
+        self.assertEqual(close["base"], "HYPE")
+        self.assertTrue(self.bot.has_close_intent("закрий HYPE"))
+
+        be = self.bot.parse_manual_control_command("be HYPE long")
+        self.assertEqual(be["action"], "BE")
+        self.assertEqual(be["side"], "long")
+
+        sl = self.bot.parse_manual_control_command("sl HYPE 80,5")
+        self.assertEqual(sl["action"], "SET_SL")
+        self.assertEqual(sl["sl"], 80.5)
+
+        tp = self.bot.parse_manual_control_command("tp HYPE 90")
+        self.assertEqual(tp["action"], "SET_TP")
+        self.assertEqual(tp["tp"], 90.0)
 
     def test_non_scalp_management_event_is_not_mistaken_for_new_entry(self):
         event = "🟢 TP1 ДОСЯГНУТО — позиція ще відкрита\nСтиль: SWING | LONG"
@@ -141,13 +186,10 @@ class SignalFilterTests(unittest.TestCase):
 
     def test_non_crypto_assets_are_blocked_but_crypto_is_allowed(self):
         for base in ("SNDK", "MU", "MUU", "SKHY", "ZHIPU", "SPY", "XAU"):
-            reason = self.bot.non_crypto_open_block_reason(base, style="SWING")
-            self.assertIsNotNone(reason, base)
-            self.assertIn("ordinary crypto assets only", reason)
-            self.assertIsNone(
-                self.bot.non_crypto_open_block_reason(base, style="SCALP"),
-                base,
-            )
+            for style in ("SCALP", "SWING"):
+                reason = self.bot.non_crypto_open_block_reason(base, style=style)
+                self.assertIsNotNone(reason, f"{style} {base}")
+                self.assertIn("ordinary crypto assets only", reason)
 
         for base in ("BTC", "HYPE", "ONDO", "1000SHIB", "DOGE"):
             self.assertIsNone(self.bot.non_crypto_open_block_reason(base), base)
@@ -179,7 +221,7 @@ class SignalFilterTests(unittest.TestCase):
 TF: 1H / 15M / 5M
 📍 Entry:   0.726500
 🛑 SL:      0.698735  (3.82%)
-🎯 TP1:     0.748712  +3.2 USDT
+🎯 TP1:     0.748712  +3.2 USDT (40%, RR 0.8)
 🎯 TP2:     0.768148  +4.5 USDT
 🎯 TP3:     0.795913  +7.5 USDT
 💼 Баланс:  1000.0 USDT | ризик: 10.0 USDT (1.0%)
@@ -193,6 +235,7 @@ TF: 1H / 15M / 5M
         self.assertEqual(parsed["base"], "SUI")
         self.assertEqual(parsed["side"], "long")
         self.assertEqual(parsed["tp"], 0.748712)
+        self.assertEqual(parsed["signal_rr1"], 0.8)
         self.assertEqual(parsed["tp2"], 0.768148)
         self.assertEqual(parsed["tp3"], 0.795913)
         self.assertEqual(parsed["position_usdt"], 261.66)
@@ -333,6 +376,19 @@ TF: 1H / 15M / 5M
             self.bot.calculate_rr_from_prices(100.0, 96.0, 108.0, "long"),
             2.0,
         )
+
+    def test_scalp_statistical_filter_uses_declared_signal_rr(self):
+        command = {
+            "entry": 100.0,
+            "sl": 90.0,
+            "tp": 107.98,
+            "signal_rr1": 0.8,
+        }
+        self.assertAlmostEqual(
+            self.bot.calculate_rr_from_prices(100.0, 90.0, 107.98, "long"),
+            0.798,
+        )
+        self.assertEqual(self.bot.source_signal_rr1(command, "long"), 0.8)
         self.assertAlmostEqual(
             self.bot.calculate_rr_from_prices(100.0, 104.0, 92.0, "short"),
             2.0,
@@ -373,10 +429,10 @@ TF: 1H / 15M / 5M
 
     def test_live_entry_rules_are_explicit_and_have_no_position_cap(self):
         rules = self.bot.ENTRY_RULES
-        self.assertEqual(rules.version, "rule-2a-scalping-balanced-all-assets")
+        self.assertEqual(rules.version, "rule-2a-scalping-balanced-ordinary-crypto")
         self.assertEqual(rules.allowed_styles, ("SCALP",))
         self.assertEqual(rules.allowed_side, "long")
-        self.assertFalse(rules.ordinary_crypto_only)
+        self.assertTrue(rules.ordinary_crypto_only)
         self.assertEqual(rules.risk_per_trade_pct, 0.5)
         self.assertEqual(rules.rr1_min_inclusive, 0.8)
         self.assertEqual(rules.rr1_max_exclusive, 1.0)
@@ -561,7 +617,7 @@ class SwingPartialExitTests(unittest.TestCase):
         self.assertEqual([call[3] for call in calls], [10.0, 4.0, 3.0, 3.0])
         plan = self.bot.LAST_SLTP["SUI"]["long"]["swing_plan"]
         self.assertEqual(plan["style"], "SCALP")
-        self.assertEqual(plan["version"], "rule-2a-scalping-balanced-all-assets")
+        self.assertEqual(plan["version"], "rule-2a-scalping-balanced-ordinary-crypto")
         self.assertAlmostEqual(plan["be_sl"], 99.8)
         self.assertAlmostEqual(plan["buffer_r"], 0.05)
 

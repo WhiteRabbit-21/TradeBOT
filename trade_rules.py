@@ -6,12 +6,12 @@ from dataclasses import dataclass
 
 @dataclass(frozen=True)
 class LiveEntryRules:
-    """Rule 2A - Scalping Balanced, all BingX-listed assets."""
+    """Rule 2A - Scalping Balanced, ordinary crypto assets only."""
 
-    version: str = "rule-2a-scalping-balanced-all-assets"
+    version: str = "rule-2a-scalping-balanced-ordinary-crypto"
     allowed_styles: tuple[str, ...] = ("SCALP",)
     allowed_side: str = "long"
-    ordinary_crypto_only: bool = False
+    ordinary_crypto_only: bool = True
     risk_per_trade_pct: float = 0.5
     rr1_min_inclusive: float = 0.8
     rr1_max_exclusive: float = 1.0

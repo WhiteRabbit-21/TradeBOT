@@ -2978,6 +2978,20 @@ async def handle_ai_command(cmd: dict):
                 return
 
         base_clean = _clean_base_from_context(base, tg_text)
+
+        # Fail closed for explicitly known TradFi symbols before resolving an
+        # exchange contract.  This both gives a policy reason for markets that
+        # are unavailable through the standard crypto API (for example HOOD)
+        # and prevents a future exchange/CCXT listing from bypassing Rule 1/2A.
+        asset_policy_block = non_crypto_open_block_reason(
+            base_clean,
+            signal_text=tg_text,
+            style=signal_style,
+        )
+        if asset_policy_block:
+            log("WARNING", f"POLICY SKIP OPEN {base_clean}: {asset_policy_block}")
+            return
+
         symbol = await resolve_symbol(base_clean)
 
         if not symbol:
@@ -2994,6 +3008,8 @@ async def handle_ai_command(cmd: dict):
                 )
                 return
 
+        # A second pass uses exchange metadata to block new/unknown TradFi
+        # symbols that are not yet present in the explicit fallback lists.
         asset_policy_block = non_crypto_open_block_reason(
             base_clean,
             signal_text=tg_text,

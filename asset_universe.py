@@ -16,7 +16,7 @@ from typing import Any
 # marker below are the primary future-proof detection paths.
 EQUITY_BASES = {
     "AAPL", "AMD", "AMZN", "ARM", "ASML", "AVGO", "COIN", "GOOG",
-    "GOOGL", "HK0700", "HK1810", "INTC", "META", "MSFT", "MSTR", "MU",
+    "GOOGL", "HK0700", "HK1810", "HOOD", "INTC", "META", "MSFT", "MSTR", "MU",
     "NFLX", "NVDA", "PLTR", "SNDK", "SKHY", "SKHYNIX", "TSLA", "TSM",
     "TENCENT", "XIAOMI", "ZHIPU",
 }

@@ -185,7 +185,7 @@ class SignalFilterTests(unittest.TestCase):
         self.assertTrue(self.bot.is_new_entry_signal_text(signal))
 
     def test_non_crypto_assets_are_blocked_but_crypto_is_allowed(self):
-        for base in ("SNDK", "MU", "MUU", "SKHY", "ZHIPU", "SPY", "XAU"):
+        for base in ("HOOD", "SNDK", "MU", "MUU", "SKHY", "ZHIPU", "SPY", "XAU"):
             for style in ("SCALP", "SWING"):
                 reason = self.bot.non_crypto_open_block_reason(base, style=style)
                 self.assertIsNotNone(reason, f"{style} {base}")

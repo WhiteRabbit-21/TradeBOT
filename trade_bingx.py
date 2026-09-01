@@ -66,12 +66,14 @@ OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4.1")
 DRY_RUN = os.getenv("DRY_RUN", "1").strip() == "1"
 HEARTBEAT_SEC = int(os.getenv("HEARTBEAT_SEC", "300"))  # 5 хв
 SWING_EXIT_WATCH_SEC = float(os.getenv("SWING_EXIT_WATCH_SEC", "4"))
-# Rule 1 - Swing and Rule 2A - Scalping are deliberately code-owned so stale
-# Railway variables cannot silently re-enable a rejected style or side.
+# Only Rule 2A - Scalping is allowed to create new live positions. Rule 1 -
+# Swing remains available for managing positions that were already opened and
+# for paper statistics in SignalBot, but it cannot pass the live entry gate.
+# The policy is deliberately code-owned so stale Railway variables cannot
+# silently re-enable a rejected style or side.
 # Existing position management (SL/TP/BE/CLOSE) remains active around the clock.
-TRADE_LONG_ONLY = all(
-    rules.allowed_side == "long" for rules in (SWING_RULES, ENTRY_RULES)
-)
+ACTIVE_ENTRY_RULES = (ENTRY_RULES,)
+TRADE_LONG_ONLY = all(rules.allowed_side == "long" for rules in ACTIVE_ENTRY_RULES)
 ENTRY_BLOCK_START_HOUR_KYIV = int(os.getenv("ENTRY_BLOCK_START_HOUR_KYIV", "0"))
 ENTRY_BLOCK_END_HOUR_KYIV = int(os.getenv("ENTRY_BLOCK_END_HOUR_KYIV", "6"))
 RR1_MIN_INCLUSIVE = ENTRY_RULES.rr1_min_inclusive
@@ -79,13 +81,18 @@ RR1_MAX_EXCLUSIVE = ENTRY_RULES.rr1_max_exclusive
 RR1_POLICY_EPSILON = 1e-6
 KYIV_TZ = ZoneInfo("Europe/Kyiv")
 
-ALLOWED_SIGNAL_STYLES = set(ENTRY_RULES.allowed_styles) | set(SWING_RULES.allowed_styles)
+ALLOWED_SIGNAL_STYLES = {
+    style for rules in ACTIVE_ENTRY_RULES for style in rules.allowed_styles
+}
 
 
 def _rules_for_signal_style(style: Optional[str]):
     normalized_style = str(style or "").strip().upper()
     if normalized_style in ENTRY_RULES.allowed_styles:
         return ENTRY_RULES
+    # Retained for protective-order management of SWING positions opened
+    # before live Rule 1 was paused. New SWING entries are rejected earlier by
+    # ALLOWED_SIGNAL_STYLES.
     if normalized_style in SWING_RULES.allowed_styles:
         return SWING_RULES
     return None
@@ -3886,7 +3893,7 @@ async def main():
         log(
             "INFO",
             "ENTRY POLICY "
-            f"active_rules={[SWING_RULES.version, ENTRY_RULES.version]} "
+            f"active_rules={[rules.version for rules in ACTIVE_ENTRY_RULES]} "
             f"styles={sorted(ALLOWED_SIGNAL_STYLES)} "
             f"long_only={TRADE_LONG_ONLY} "
             f"risk={FIXED_RISK_PCT:g}% "
@@ -3894,7 +3901,7 @@ async def main():
             f"rule2_assets={'ordinary_crypto_only' if ENTRY_RULES.ordinary_crypto_only else 'all_bingx_listed'} "
             "rule2_exit=40/30/30_TP1/TP2/TP3 "
             f"rule2_be_buffer={ENTRY_RULES.breakeven_buffer_r:g}R "
-            "rule1_exit=40/30/30_TP1/TP2/TP3 "
+            "rule1_swing=paper_only_existing_positions_managed "
             f"additions={ENTRY_RULES.allow_position_additions} "
             f"same_side_reentry={ENTRY_RULES.allow_same_symbol_side_reentry} "
             f"max_positions={ENTRY_RULES.max_concurrent_positions or 'unlimited'} "

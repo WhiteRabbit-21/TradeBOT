@@ -115,7 +115,7 @@ class SignalFilterTests(unittest.TestCase):
     def setUpClass(cls):
         cls.bot = _load_trade_module()
 
-    def test_rule_one_swing_and_rule_two_scalp_are_allowed(self):
+    def test_only_rule_two_scalp_is_allowed_for_new_entries(self):
         intraday = "📈 INTRADAY  LONG 🟢 — SUI/USDT:USDT\nTF: 4H / 1H / 15M"
         scalp = "⚡ SCALP  LONG 🟢 — SUI/USDT:USDT\nTF: 1H / 15M / 5M"
         swing = "🌊 SWING  LONG 🟢 — SUI/USDT:USDT\nTF: 1D / 4H / 1H"
@@ -123,7 +123,7 @@ class SignalFilterTests(unittest.TestCase):
 
         self.assertFalse(self.bot.is_allowed_signal_style(intraday))
         self.assertTrue(self.bot.is_allowed_signal_style(scalp))
-        self.assertTrue(self.bot.is_allowed_signal_style(swing))
+        self.assertFalse(self.bot.is_allowed_signal_style(swing))
         self.assertIsNone(self.bot.extract_signal_style(stats))
 
     def test_signalbot_and_saved_messages_are_registered_as_sources(self):
@@ -297,7 +297,7 @@ TF: 1H / 15M / 5M
                 require_allowed_style=True,
             )
         )
-        self.assertIsNone(
+        self.assertIsNotNone(
             self.bot.open_policy_block_reason(
                 "long",
                 datetime(2026, 8, 26, 12, 0, tzinfo=kyiv),
@@ -356,12 +356,12 @@ TF: 1H / 15M / 5M
             )
         )
 
-    def test_rule_one_swing_is_allowed_at_night_and_keeps_its_own_rr_model(self):
+    def test_rule_one_swing_is_paper_only_and_blocked_for_live_entry(self):
         kyiv = ZoneInfo("Europe/Kyiv")
         night = datetime(2026, 8, 26, 2, 0, tzinfo=kyiv)
 
         for rr1 in (0.9, 2.0, 5.0):
-            self.assertIsNone(
+            self.assertIsNotNone(
                 self.bot.open_policy_block_reason(
                     "long",
                     night,
@@ -444,7 +444,7 @@ TF: 1H / 15M / 5M
         self.assertFalse(rules.allow_same_symbol_side_reentry)
         self.assertIsNone(rules.max_concurrent_positions)
         self.assertEqual(self.bot.FIXED_RISK_PCT, 0.5)
-        self.assertEqual(self.bot.ALLOWED_SIGNAL_STYLES, {"SCALP", "SWING"})
+        self.assertEqual(self.bot.ALLOWED_SIGNAL_STYLES, {"SCALP"})
         self.assertEqual(self.bot.risk_pct_for_style("SCALP", 9.0), 0.5)
         self.assertEqual(self.bot.risk_pct_for_style("SWING", 9.0), 0.5)
 
@@ -462,7 +462,7 @@ TF: 1H / 15M / 5M
             )
         )
 
-    def test_rule_one_swing_rules_are_active(self):
+    def test_rule_one_swing_rules_are_retained_for_management_and_statistics(self):
         rules = self.bot.SWING_RULES
         self.assertEqual(rules.version, "rule-1-swing")
         self.assertEqual(rules.allowed_styles, ("SWING",))

@@ -753,6 +753,33 @@ class SwingPartialExitTests(unittest.TestCase):
         self.assertEqual([call[4] for call in calls], ["sl", "tp"])
         self.assertEqual([call[3] for call in calls], [0.66, 0.66])
 
+    def test_small_scalp_preflight_uses_full_tp1_without_raising_risk(self):
+        self.exchange.markets[self.symbol]["limits"]["amount"]["min"] = 0.48
+
+        mode, quantities, reason = self.bot._choose_partial_exit_mode(
+            self.symbol,
+            0.66,
+            reference_price=100.0,
+            target_split=(0.4, 0.3, 0.3),
+        )
+
+        self.assertEqual(mode, "full_tp1")
+        self.assertIsNone(quantities)
+        self.assertIn("partial target quantities", reason)
+        self.assertNotIn("SWING", reason)
+
+    def test_executable_scalp_preflight_keeps_balanced_split(self):
+        mode, quantities, reason = self.bot._choose_partial_exit_mode(
+            self.symbol,
+            10.0,
+            reference_price=100.0,
+            target_split=(0.4, 0.3, 0.3),
+        )
+
+        self.assertEqual(mode, "balanced")
+        self.assertEqual(quantities, (4.0, 3.0, 3.0))
+        self.assertIsNone(reason)
+
 
 class BingXSymbolResolutionTests(unittest.TestCase):
     @classmethod

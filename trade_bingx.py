@@ -1083,10 +1083,15 @@ def _split_swing_target_quantities(
     reference_price: Optional[float] = None,
     target_split: Optional[tuple[float, float, float]] = None,
 ) -> tuple[float, float, float]:
-    """Split an exchange-precision position without exceeding its total size."""
+    """Split an exchange-precision position without exceeding its total size.
+
+    The helper is shared by SWING and SCALP partial-exit rules. Keep the
+    historical function name for compatibility, but make diagnostics
+    style-neutral so a SCALP rejection is not mislabeled as SWING.
+    """
     total = float(total_qty)
     if total <= 0:
-        raise ValueError("SWING position quantity must be positive")
+        raise ValueError("partial-exit position quantity must be positive")
 
     def precise(value: float) -> float:
         return float(exchange.amount_to_precision(symbol, max(0.0, value)))
@@ -1106,10 +1111,10 @@ def _split_swing_target_quantities(
     min_amount_f = float(min_amount) if min_amount is not None else 0.0
     quantities = (qty1, qty2, qty3)
     if any(q <= 0 for q in quantities):
-        raise ValueError(f"position {total} is too small for three SWING targets")
+        raise ValueError(f"position {total} is too small for three partial targets")
     if min_amount_f > 0 and any(q < min_amount_f for q in quantities):
         raise ValueError(
-            f"one of SWING target quantities {quantities} is below exchange minimum {min_amount_f}"
+            f"one of partial target quantities {quantities} is below exchange minimum {min_amount_f}"
         )
     min_cost = (((market.get("limits") or {}).get("cost") or {}).get("min"))
     if min_cost is None:
@@ -1120,11 +1125,35 @@ def _split_swing_target_quantities(
         costs = tuple(q * reference_price_f for q in quantities)
         if any(cost < min_cost_f for cost in costs):
             raise ValueError(
-                f"one of SWING target notionals {costs} is below exchange minimum {min_cost_f} USDT"
+                f"one of partial target notionals {costs} is below exchange minimum {min_cost_f} USDT"
             )
     if sum(quantities) > total + max(1e-12, total * 1e-10):
-        raise ValueError(f"SWING target quantities {quantities} exceed position {total}")
+        raise ValueError(f"partial target quantities {quantities} exceed position {total}")
     return quantities
+
+
+def _choose_partial_exit_mode(
+    symbol: str,
+    total_qty: float,
+    reference_price: Optional[float] = None,
+    target_split: Optional[tuple[float, float, float]] = None,
+) -> tuple[str, Optional[tuple[float, float, float]], Optional[str]]:
+    """Choose Balanced when executable, otherwise a risk-safe full-TP1 exit.
+
+    Raising the position size to satisfy an exchange minimum would breach the
+    configured 0.5% risk budget. A 100% TP1 fallback keeps the original
+    position size and always arms both a full-size SL and TP.
+    """
+    try:
+        quantities = _split_swing_target_quantities(
+            symbol,
+            total_qty,
+            reference_price=reference_price,
+            target_split=target_split,
+        )
+    except Exception as split_error:
+        return "full_tp1", None, str(split_error)
+    return "balanced", quantities, None
 
 def apply_sltp_sync(
     base: str,
@@ -3227,29 +3256,30 @@ async def handle_ai_command(cmd: dict):
             return
 
 
+        partial_exit_mode = "single"
+        partial_exit_fallback_reason = None
         if use_partial_exit:
-            try:
-                planned_parts = _split_swing_target_quantities(
+            partial_exit_mode, planned_parts, partial_exit_fallback_reason = (
+                _choose_partial_exit_mode(
                     symbol,
                     qty,
                     reference_price=entry,
                     target_split=partial_rules.target_split,
                 )
+            )
+            if partial_exit_mode == "balanced":
                 log(
                     "INFO",
                     f"{signal_style} SIZE PREFLIGHT PASS {base_clean} "
                     f"qty={qty} parts={planned_parts}",
                 )
-            except Exception as size_error:
-                reason = (
-                    f"позиція {qty:g} не підтримує безпечний поділ 40/30/30: "
-                    f"{size_error}"
+            else:
+                log(
+                    "WARNING",
+                    f"{signal_style} FULL TP1 FALLBACK PLANNED {base_clean}: "
+                    f"position qty={qty:g} cannot execute 40/30/30 without "
+                    f"exceeding the risk budget; {partial_exit_fallback_reason}",
                 )
-                log("WARNING", f"SAFE SKIP OPEN {base_clean}: {reason}")
-                await _send_to_tg(
-                    f"⚠️ {base_clean}/USDT {signal_style} пропущено: {reason}"
-                )
-                return
 
         if DRY_RUN:
             log("INFO", "DRY_RUN OPEN skipped (test mode)")
@@ -3290,7 +3320,7 @@ async def handle_ai_command(cmd: dict):
             await asyncio.sleep(0.7)
 
             try:
-                if use_partial_exit:
+                if use_partial_exit and partial_exit_mode == "balanced":
                     res = await apply_swing_sltp(
                         base_clean,
                         entry_price=entry,
@@ -3300,6 +3330,18 @@ async def handle_ai_command(cmd: dict):
                         tp3_price=float(tp3_prec),
                         position_side=side,
                         signal_style=signal_style,
+                    )
+                elif use_partial_exit:
+                    fallback = await apply_sltp(
+                        base_clean,
+                        sl_price=sl_prec,
+                        tp_price=tp_prec,
+                        cancel_first=True,
+                        position_side=side,
+                    )
+                    res = (
+                        "FALLBACK_FULL_TP1 after size preflight error="
+                        f"{partial_exit_fallback_reason} | {fallback}"
                     )
                 else:
                     LAST_SLTP.setdefault(base_clean, {})

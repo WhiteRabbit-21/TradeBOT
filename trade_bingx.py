@@ -66,6 +66,10 @@ OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4.1")
 DRY_RUN = os.getenv("DRY_RUN", "1").strip() == "1"
 HEARTBEAT_SEC = int(os.getenv("HEARTBEAT_SEC", "300"))  # 5 хв
 SWING_EXIT_WATCH_SEC = float(os.getenv("SWING_EXIT_WATCH_SEC", "4"))
+POSITION_MISSING_CONFIRMATIONS_REQUIRED = max(
+    2,
+    int(os.getenv("POSITION_MISSING_CONFIRMATIONS_REQUIRED", "3")),
+)
 # Only Rule 2A - Scalping is allowed to create new live positions. Rule 1 -
 # Swing remains available for managing positions that were already opened and
 # for paper statistics in SignalBot, but it cannot pass the live entry gate.
@@ -124,6 +128,11 @@ SLTP_FILE = os.path.join(STATE_DIR, "sltp.json")
 LAST_SLTP = {}
 ORDER_IDS_FILE = os.path.join(STATE_DIR, "order_ids.json")
 LAST_ORDER_IDS = {}
+POSITION_MISSING_COUNTS = {}
+
+
+class PositionLookupError(RuntimeError):
+    """BingX position state could not be read reliably."""
 
 # =========================
 # PYROGRAM CLIENT (USER)
@@ -582,7 +591,12 @@ def place_dca_order_sync(symbol: str, side: str, qty: float, price: float):
         }
     )
 
-def fetch_position_oneway_sync(symbol: str, position_side: Optional[str] = None):
+def fetch_position_oneway_sync(
+    symbol: str,
+    position_side: Optional[str] = None,
+    *,
+    raise_on_error: bool = False,
+):
 
     try:
         positions = exchange.fetch_positions([symbol])
@@ -602,11 +616,13 @@ def fetch_position_oneway_sync(symbol: str, position_side: Optional[str] = None)
             if side in {"long", "short"}:
                 if wanted_side and side != wanted_side:
                     continue
-                size = float(
-                    p.get("contracts")
-                    or p.get("size")
-                    or p.get("positionAmt")
-                    or 0
+                size = abs(
+                    float(
+                        p.get("contracts")
+                        or p.get("size")
+                        or p.get("positionAmt")
+                        or 0
+                    )
                 )
 
                 if size > best_size:
@@ -615,7 +631,16 @@ def fetch_position_oneway_sync(symbol: str, position_side: Optional[str] = None)
 
         return best if best_size > 0 else None
 
-    except Exception:
+    except Exception as e:
+        log(
+            "ERROR",
+            f"POSITION FETCH FAILED symbol={symbol} "
+            f"position_side={position_side or 'any'} err={e}",
+        )
+        if raise_on_error:
+            raise PositionLookupError(
+                f"cannot verify {symbol}/{position_side or 'any'} position: {e}"
+            ) from e
         return None
         
 async def fetch_position_oneway(symbol: str, position_side: Optional[str] = None):
@@ -917,6 +942,7 @@ def _clear_position_state(base: str, pos_side: str):
         LAST_SLTP.pop(base_u, None)
 
     LAST_ORDER_IDS.pop(_state_key(base_u, side), None)
+    POSITION_MISSING_COUNTS.pop(_state_key(base_u, side), None)
     save_sltp()
     save_order_ids()
 
@@ -1381,7 +1407,11 @@ def _replace_swing_sl_sync(
     symbol = resolve_symbol_sync(base_u)
     if not symbol:
         raise RuntimeError(f"Symbol not found: {base_u}")
-    pos = fetch_position_oneway_sync(symbol, pos_side)
+    pos = fetch_position_oneway_sync(
+        symbol,
+        pos_side,
+        raise_on_error=True,
+    )
     if not pos:
         return "NO_POSITION"
     qty = _extract_position_qty_sync(pos, symbol)
@@ -1471,11 +1501,35 @@ def advance_swing_exit_state_sync(base: str, position_side: str = "long") -> str
     symbol = resolve_symbol_sync(base_u)
     if not symbol:
         return "NO_SYMBOL"
-    pos = fetch_position_oneway_sync(symbol, pos_side)
+    position_key = _state_key(base_u, pos_side)
+    try:
+        pos = fetch_position_oneway_sync(
+            symbol,
+            pos_side,
+            raise_on_error=True,
+        )
+    except PositionLookupError:
+        # An API error is not evidence that the position is closed. Reset any
+        # previous empty-result streak and leave every protective order intact.
+        POSITION_MISSING_COUNTS.pop(position_key, None)
+        raise
     if not pos:
+        missing_count = POSITION_MISSING_COUNTS.get(position_key, 0) + 1
+        POSITION_MISSING_COUNTS[position_key] = missing_count
+        if missing_count < POSITION_MISSING_CONFIRMATIONS_REQUIRED:
+            return (
+                "POSITION_MISSING_UNCONFIRMED "
+                f"{missing_count}/{POSITION_MISSING_CONFIRMATIONS_REQUIRED}"
+            )
+
+        # Only a repeated sequence of successful, empty BingX responses proves
+        # that the position is gone. At that point orphan SL/TP orders and local
+        # state can be removed safely.
         cancel_all_open_orders_for_symbol_sync(symbol, pos_side)
         _clear_position_state(base_u, pos_side)
-        return "POSITION_CLOSED"
+        return "POSITION_CLOSED_CONFIRMED"
+
+    POSITION_MISSING_COUNTS.pop(position_key, None)
 
     current_qty = _extract_position_qty_sync(pos, symbol)
     initial_qty = float(plan["initial_qty"])
@@ -1503,9 +1557,16 @@ def advance_swing_exit_state_sync(base: str, position_side: str = "long") -> str
         state = (LAST_SLTP.get(base_u) or {}).get(pos_side) or {}
         plan = state.get("swing_plan") or plan
         stage = str(plan.get("stage") or next_stage)
-        pos = fetch_position_oneway_sync(symbol, pos_side)
+        pos = fetch_position_oneway_sync(
+            symbol,
+            pos_side,
+            raise_on_error=True,
+        )
         if not pos:
-            return " | ".join(messages + ["POSITION_CLOSED"])
+            # Do not clean up after a single empty response, even during the
+            # short transition immediately after replacing the SL. The next
+            # watcher cycles perform the normal three-step confirmation.
+            return " | ".join(messages + ["POSITION_MISSING_UNCONFIRMED"])
         current_qty = _extract_position_qty_sync(pos, symbol)
 
     if stage == "tp1_done" and _swing_qty_reached(

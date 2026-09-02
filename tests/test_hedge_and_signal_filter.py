@@ -539,6 +539,7 @@ class SwingPartialExitTests(unittest.TestCase):
         self.bot.exchange = self.exchange
         self.bot.LAST_SLTP = {}
         self.bot.LAST_ORDER_IDS = {}
+        self.bot.POSITION_MISSING_COUNTS = {}
         self.bot.save_sltp = lambda: None
         self.bot.save_order_ids = lambda: None
 
@@ -620,6 +621,86 @@ class SwingPartialExitTests(unittest.TestCase):
         self.assertEqual(plan["version"], "rule-2a-scalping-balanced-ordinary-crypto")
         self.assertAlmostEqual(plan["be_sl"], 99.8)
         self.assertAlmostEqual(plan["buffer_r"], 0.05)
+
+    def test_missing_position_must_be_confirmed_before_orders_are_deleted(self):
+        self.bot.LAST_SLTP = {
+            "SUI": {
+                "long": {
+                    "sl": 96.0,
+                    "tp": 103.2,
+                    "swing_plan": {
+                        "style": "SCALP",
+                        "initial_qty": 10.0,
+                        "tp1_qty": 4.0,
+                        "tp2_qty": 3.0,
+                        "stage": "armed",
+                    },
+                }
+            }
+        }
+        self.bot.LAST_ORDER_IDS = {
+            "SUI:long": {"sl_id": "sl-1", "tp1_id": "tp-1"}
+        }
+        self.exchange.positions = []
+        self.exchange.open_orders = [
+            {
+                "id": "sl-1",
+                "type": "stop_market",
+                "side": "sell",
+                "info": {"positionSide": "LONG"},
+            },
+            {
+                "id": "tp-1",
+                "type": "take_profit_market",
+                "side": "sell",
+                "info": {"positionSide": "LONG"},
+            },
+        ]
+
+        first = self.bot.advance_swing_exit_state_sync("SUI", "long")
+        second = self.bot.advance_swing_exit_state_sync("SUI", "long")
+        self.assertEqual(first, "POSITION_MISSING_UNCONFIRMED 1/3")
+        self.assertEqual(second, "POSITION_MISSING_UNCONFIRMED 2/3")
+        self.assertEqual(self.exchange.canceled, [])
+        self.assertIn("SUI", self.bot.LAST_SLTP)
+
+        third = self.bot.advance_swing_exit_state_sync("SUI", "long")
+        self.assertEqual(third, "POSITION_CLOSED_CONFIRMED")
+        self.assertEqual(self.exchange.canceled, ["sl-1", "tp-1"])
+        self.assertNotIn("SUI", self.bot.LAST_SLTP)
+
+    def test_position_api_error_never_deletes_protection(self):
+        self.bot.LAST_SLTP = {
+            "SUI": {
+                "long": {
+                    "sl": 96.0,
+                    "tp": 103.2,
+                    "swing_plan": {"style": "SCALP", "stage": "armed"},
+                }
+            }
+        }
+        self.bot.LAST_ORDER_IDS = {"SUI:long": {"sl_id": "sl-1"}}
+        self.exchange.open_orders = [
+            {
+                "id": "sl-1",
+                "type": "stop_market",
+                "side": "sell",
+                "info": {"positionSide": "LONG"},
+            }
+        ]
+        self.bot.POSITION_MISSING_COUNTS["SUI:long"] = 2
+
+        with mock.patch.object(
+            self.exchange,
+            "fetch_positions",
+            side_effect=RuntimeError("temporary BingX timeout"),
+        ):
+            with self.assertRaises(self.bot.PositionLookupError):
+                self.bot.advance_swing_exit_state_sync("SUI", "long")
+
+        self.assertEqual(self.exchange.canceled, [])
+        self.assertIn("SUI", self.bot.LAST_SLTP)
+        self.assertNotIn("SUI:long", self.bot.POSITION_MISSING_COUNTS)
 
     def test_partial_order_failure_falls_back_to_full_sl_and_tp1(self):
         call_number = 0

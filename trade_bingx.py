@@ -7,6 +7,7 @@ import asyncio
 import hashlib
 import hmac
 import math
+from decimal import Decimal
 from urllib.parse import urlencode
 from datetime import datetime
 from zoneinfo import ZoneInfo
@@ -814,7 +815,15 @@ def _bingx_raw_request_sync(method: str, path: str, params: dict) -> dict:
 
     return data
 
-def _place_bingx_tpsl_raw_sync(symbol: str, pos_side: str, trigger_price: float, quantity: float, kind: str) -> dict:
+def _place_bingx_tpsl_raw_sync(
+    symbol: str,
+    pos_side: str,
+    trigger_price: float,
+    quantity: float,
+    kind: str,
+    *,
+    close_position: bool = False,
+) -> dict:
     side = "SELL" if pos_side.lower() == "long" else "BUY"
     order_type = "STOP_MARKET" if kind == "sl" else "TAKE_PROFIT_MARKET"
 
@@ -827,6 +836,11 @@ def _place_bingx_tpsl_raw_sync(symbol: str, pos_side: str, trigger_price: float,
         "stopPrice": _fmt_num(trigger_price),
         "workingType": "MARK_PRICE",
     }
+    if close_position:
+        # BingX Position TP/SL dynamically closes the entire remaining hedge
+        # leg when the trigger fires. Quantity is still mandatory in the API,
+        # but closePosition prevents precision dust after TP1/TP2 reductions.
+        payload["closePosition"] = "true"
 
     return _bingx_raw_request_sync("POST", "/openApi/swap/v2/trade/order", payload)
 
@@ -954,6 +968,12 @@ def cancel_order_exact_sync(symbol: str, order_id: str) -> bool:
         log("INFO", f"CANCEL EXACT OK symbol={symbol} id={order_id}")
         return True
     except Exception as e:
+        error_text = str(e).lower()
+        if "109400" in error_text or "order not exist" in error_text:
+            # A filled TP/SL disappears before the next same-symbol signal.
+            # Treat that as successful cleanup instead of a false alarm.
+            log("INFO", f"CANCEL EXACT ALREADY GONE symbol={symbol} id={order_id}")
+            return True
         log("WARNING", f"CANCEL EXACT FAILED symbol={symbol} id={order_id} err={e}")
         return False
 
@@ -1097,9 +1117,16 @@ def _split_swing_target_quantities(
         return float(exchange.amount_to_precision(symbol, max(0.0, value)))
 
     split = target_split or SWING_RULES.target_split
-    qty1 = precise(total * split[0])
-    qty2 = precise(total * split[1])
-    qty3 = precise(total - qty1 - qty2)
+    total_decimal = Decimal(str(total))
+    qty1 = precise(float(total_decimal * Decimal(str(split[0]))))
+    qty2 = precise(float(total_decimal * Decimal(str(split[1]))))
+    # Do the residual arithmetic in decimal space. With binary floats,
+    # 113.65 - 45.46 - 34.09 becomes 34.099999..., which BingX truncates to
+    # 34.09 and leaves 0.01 open after TP3.
+    remaining_decimal = (
+        total_decimal - Decimal(str(qty1)) - Decimal(str(qty2))
+    )
+    qty3 = precise(float(max(Decimal("0"), remaining_decimal)))
 
     # Defensive correction for exchanges whose formatter rounds instead of
     # truncating. TP quantities must never sum above the current position.
@@ -1334,13 +1361,18 @@ def apply_swing_sltp_sync(
     try:
         sl_resp = _place_bingx_tpsl_raw_sync(symbol, pos_side, sl_prec, qty, "sl")
         placed_ids["sl_id"] = _extract_bingx_order_id(sl_resp)
-        for label, target_price, target_qty in (
-            ("tp1", tp1_prec, qty1),
-            ("tp2", tp2_prec, qty2),
-            ("tp3", tp3_prec, qty3),
+        for label, target_price, target_qty, close_position in (
+            ("tp1", tp1_prec, qty1, False),
+            ("tp2", tp2_prec, qty2, False),
+            ("tp3", tp3_prec, qty3, True),
         ):
             response = _place_bingx_tpsl_raw_sync(
-                symbol, pos_side, target_price, target_qty, "tp"
+                symbol,
+                pos_side,
+                target_price,
+                target_qty,
+                "tp",
+                close_position=close_position,
             )
             placed_ids[f"{label}_id"] = _extract_bingx_order_id(response)
 
@@ -2266,16 +2298,56 @@ def open_policy_block_reason(
             )
     return None
 
+def _parse_message_number_token(raw: str) -> float:
+    """Parse decimal values while preserving Telegram thousands separators.
+
+    SignalBot formats large prices as ``77,277.00``. The old parser captured
+    only ``77,277`` and interpreted it as ``77.277``, which made otherwise
+    valid BTC/ETH protection levels fail the live-price safety check.
+    """
+    token = str(raw or "").strip().replace(" ", "")
+    if not token:
+        raise ValueError("empty numeric token")
+
+    if "," in token and "." in token:
+        decimal_separator = "." if token.rfind(".") > token.rfind(",") else ","
+        thousands_separator = "," if decimal_separator == "." else "."
+        token = token.replace(thousands_separator, "")
+        if decimal_separator == ",":
+            token = token.replace(",", ".")
+    elif token.count(",") > 1:
+        groups = token.split(",")
+        if all(len(group) == 3 for group in groups[1:]):
+            token = "".join(groups)
+        else:
+            token = "".join(groups[:-1]) + "." + groups[-1]
+    elif token.count(".") > 1:
+        groups = token.split(".")
+        if all(len(group) == 3 for group in groups[1:]):
+            token = "".join(groups)
+        else:
+            token = "".join(groups[:-1]) + "." + groups[-1]
+    else:
+        # A single comma remains supported as the decimal separator used by
+        # manually forwarded Ukrainian/European-style messages.
+        token = token.replace(",", ".")
+
+    value = float(token)
+    if not math.isfinite(value):
+        raise ValueError(f"non-finite numeric token={raw!r}")
+    return value
+
+
 def extract_liquidation_from_text(text: str) -> Optional[float]:
     match = re.search(
-        r"(?:liquidation(?:\s+price)?|liq(?:uid)?|ліквід\w*|ликвид\w*)\s*[:=]\s*([0-9]+(?:[.,][0-9]+)?)",
+        r"(?:liquidation(?:\s+price)?|liq(?:uid)?|ліквід\w*|ликвид\w*)\s*[:=]\s*([0-9][0-9.,]*)",
         text or "",
         re.I,
     )
     if not match:
         return None
     try:
-        value = float(match.group(1).replace(",", "."))
+        value = _parse_message_number_token(match.group(1))
         return value if value > 0 else None
     except ValueError:
         return None
@@ -2285,7 +2357,7 @@ def _extract_message_number(text: str, pattern: str) -> Optional[float]:
     if not match:
         return None
     try:
-        return float(match.group(1).replace(",", "."))
+        return _parse_message_number_token(match.group(1))
     except (TypeError, ValueError):
         return None
 
@@ -2303,22 +2375,22 @@ def parse_structured_signal(text: str) -> Optional[dict]:
     if not header:
         return None
 
-    entry = _extract_message_number(text, r"^\s*[^\n]*\bEntry\s*:\s*([0-9]+(?:[.,][0-9]+)?)")
-    sl = _extract_message_number(text, r"^\s*[^\n]*\bSL\s*:\s*([0-9]+(?:[.,][0-9]+)?)")
-    tp1 = _extract_message_number(text, r"^\s*[^\n]*\bTP1\s*:\s*([0-9]+(?:[.,][0-9]+)?)")
-    tp2 = _extract_message_number(text, r"^\s*[^\n]*\bTP2\s*:\s*([0-9]+(?:[.,][0-9]+)?)")
-    tp3 = _extract_message_number(text, r"^\s*[^\n]*\bTP3\s*:\s*([0-9]+(?:[.,][0-9]+)?)")
+    entry = _extract_message_number(text, r"^\s*[^\n]*\bEntry\s*:\s*([0-9][0-9.,]*)")
+    sl = _extract_message_number(text, r"^\s*[^\n]*\bSL\s*:\s*([0-9][0-9.,]*)")
+    tp1 = _extract_message_number(text, r"^\s*[^\n]*\bTP1\s*:\s*([0-9][0-9.,]*)")
+    tp2 = _extract_message_number(text, r"^\s*[^\n]*\bTP2\s*:\s*([0-9][0-9.,]*)")
+    tp3 = _extract_message_number(text, r"^\s*[^\n]*\bTP3\s*:\s*([0-9][0-9.,]*)")
     signal_rr1 = _extract_message_number(
         text,
-        r"^\s*[^\n]*\bTP1\s*:.*?\bRR\s*[:=]?\s*([0-9]+(?:[.,][0-9]+)?)",
+        r"^\s*[^\n]*\bTP1\s*:.*?\bRR\s*[:=]?\s*([0-9][0-9.,]*)",
     )
-    leverage = _extract_message_number(text, r"(?:Плече|Leverage)\s*:\s*([0-9]+(?:[.,][0-9]+)?)\s*x")
-    position_usdt = _extract_message_number(text, r"(?:Позиція|Позиция|Position)\s*:\s*([0-9]+(?:[.,][0-9]+)?)\s*USDT")
-    margin_usdt = _extract_message_number(text, r"(?:маржа|margin)\s*:\s*([0-9]+(?:[.,][0-9]+)?)\s*USDT")
-    balance_usdt = _extract_message_number(text, r"(?:Баланс|Balance)\s*:\s*([0-9]+(?:[.,][0-9]+)?)\s*USDT")
+    leverage = _extract_message_number(text, r"(?:Плече|Leverage)\s*:\s*([0-9][0-9.,]*)\s*x")
+    position_usdt = _extract_message_number(text, r"(?:Позиція|Позиция|Position)\s*:\s*([0-9][0-9.,]*)\s*USDT")
+    margin_usdt = _extract_message_number(text, r"(?:маржа|margin)\s*:\s*([0-9][0-9.,]*)\s*USDT")
+    balance_usdt = _extract_message_number(text, r"(?:Баланс|Balance)\s*:\s*([0-9][0-9.,]*)\s*USDT")
     risk_pct = _extract_message_number(
         text,
-        r"(?:ризик|риск|risk)\s*:\s*[0-9]+(?:[.,][0-9]+)?\s*USDT\s*\(([0-9]+(?:[.,][0-9]+)?)\s*%\)",
+        r"(?:ризик|риск|risk)\s*:\s*[0-9][0-9.,]*\s*USDT\s*\(([0-9][0-9.,]*)\s*%\)",
     )
 
     if sl is None or tp1 is None:

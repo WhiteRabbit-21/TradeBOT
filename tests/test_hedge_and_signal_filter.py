@@ -216,6 +216,26 @@ class SignalFilterTests(unittest.TestCase):
         text = "⚡ SCALP LONG\n💧 Орієнт. ліквід: 0.507049"
         self.assertEqual(self.bot.extract_liquidation_from_text(text), 0.507049)
 
+    def test_structured_parser_preserves_thousands_separators(self):
+        text = """⚡ SCALP LONG 🟢 — BTC/USDT:USDT
+📍 Entry: 77,277.00
+🛑 SL: 76,107.00 (1.51%)
+🎯 TP1: 78,286.00 (40%, RR 0.8)
+🎯 TP2: 79,133.00 (30%)
+🎯 TP3: 80,343.00 (30%)
+💼 Баланс: 1,000.00 USDT | ризик: 10.0 USDT (1.0%)
+💧 Орієнт. ліквід: 65,818.00
+"""
+        parsed = self.bot.parse_structured_signal(text)
+
+        self.assertEqual(parsed["entry"], 77277.0)
+        self.assertEqual(parsed["sl"], 76107.0)
+        self.assertEqual(parsed["tp"], 78286.0)
+        self.assertEqual(parsed["tp2"], 79133.0)
+        self.assertEqual(parsed["tp3"], 80343.0)
+        self.assertEqual(parsed["balance_usdt"], 1000.0)
+        self.assertEqual(parsed["liquidation"], 65818.0)
+
     def test_structured_scalp_feed_parses_all_balanced_targets(self):
         text = """⚡ SCALP  LONG 🟢  —  SUI/USDT:USDT
 TF: 1H / 15M / 5M
@@ -552,8 +572,10 @@ class SwingPartialExitTests(unittest.TestCase):
     def test_arms_40_30_30_and_advances_sl_after_actual_reductions(self):
         calls = []
 
-        def fake_place(symbol, side, price, quantity, kind):
-            calls.append((symbol, side, price, quantity, kind))
+        def fake_place(
+            symbol, side, price, quantity, kind, *, close_position=False
+        ):
+            calls.append((symbol, side, price, quantity, kind, close_position))
             order_id = f"order-{len(calls)}"
             return {"data": {"order": {"orderId": order_id}}}
 
@@ -570,6 +592,10 @@ class SwingPartialExitTests(unittest.TestCase):
             )
             self.assertIn("TP1=108.0/4.0", result)
             self.assertEqual([call[3] for call in calls[:4]], [10.0, 4.0, 3.0, 3.0])
+            self.assertEqual(
+                [call[5] for call in calls[:4]],
+                [False, False, False, True],
+            )
 
             plan = self.bot.LAST_SLTP["SUI"]["long"]["swing_plan"]
             self.assertEqual(plan["stage"], "armed")
@@ -597,8 +623,10 @@ class SwingPartialExitTests(unittest.TestCase):
     def test_rule_2a_scalp_arms_40_30_30_with_point_zero_five_r_buffer(self):
         calls = []
 
-        def fake_place(symbol, side, price, quantity, kind):
-            calls.append((symbol, side, price, quantity, kind))
+        def fake_place(
+            symbol, side, price, quantity, kind, *, close_position=False
+        ):
+            calls.append((symbol, side, price, quantity, kind, close_position))
             return {"data": {"order": {"orderId": f"scalp-{len(calls)}"}}}
 
         with mock.patch.object(
@@ -616,6 +644,10 @@ class SwingPartialExitTests(unittest.TestCase):
 
         self.assertIn("TP1=103.2/4.0", result)
         self.assertEqual([call[3] for call in calls], [10.0, 4.0, 3.0, 3.0])
+        self.assertEqual(
+            [call[5] for call in calls],
+            [False, False, False, True],
+        )
         plan = self.bot.LAST_SLTP["SUI"]["long"]["swing_plan"]
         self.assertEqual(plan["style"], "SCALP")
         self.assertEqual(plan["version"], "rule-2a-scalping-balanced-ordinary-crypto")
@@ -705,7 +737,15 @@ class SwingPartialExitTests(unittest.TestCase):
     def test_partial_order_failure_falls_back_to_full_sl_and_tp1(self):
         call_number = 0
 
-        def fake_place(_symbol, _side, _price, _quantity, _kind):
+        def fake_place(
+            _symbol,
+            _side,
+            _price,
+            _quantity,
+            _kind,
+            *,
+            close_position=False,
+        ):
             nonlocal call_number
             call_number += 1
             if call_number == 3:
@@ -733,8 +773,10 @@ class SwingPartialExitTests(unittest.TestCase):
         self.exchange.positions[0]["contracts"] = 0.66
         calls = []
 
-        def fake_place(symbol, side, price, quantity, kind):
-            calls.append((symbol, side, price, quantity, kind))
+        def fake_place(
+            symbol, side, price, quantity, kind, *, close_position=False
+        ):
+            calls.append((symbol, side, price, quantity, kind, close_position))
             return {"data": {"order": {"orderId": f"fallback-{len(calls)}"}}}
 
         with mock.patch.object(
@@ -779,6 +821,58 @@ class SwingPartialExitTests(unittest.TestCase):
         self.assertEqual(mode, "balanced")
         self.assertEqual(quantities, (4.0, 3.0, 3.0))
         self.assertIsNone(reason)
+
+    def test_final_target_uses_exact_decimal_remainder(self):
+        def truncate_to_two_decimals(_symbol, qty):
+            return f"{int(float(qty) * 100) / 100:.2f}"
+
+        with mock.patch.object(
+            self.exchange,
+            "amount_to_precision",
+            side_effect=truncate_to_two_decimals,
+        ):
+            quantities = self.bot._split_swing_target_quantities(
+                self.symbol,
+                113.65,
+                reference_price=0.344,
+                target_split=(0.4, 0.3, 0.3),
+            )
+
+        self.assertEqual(quantities, (45.46, 34.09, 34.1))
+        self.assertAlmostEqual(sum(quantities), 113.65)
+
+    def test_raw_final_tp_requests_close_entire_remaining_position(self):
+        with mock.patch.object(
+            self.bot,
+            "_bingx_raw_request_sync",
+            return_value={"code": 0},
+        ) as raw_request:
+            self.bot._place_bingx_tpsl_raw_sync(
+                self.symbol,
+                "long",
+                120.0,
+                3.0,
+                "tp",
+                close_position=True,
+            )
+
+        payload = raw_request.call_args.args[2]
+        self.assertEqual(payload["closePosition"], "true")
+        self.assertEqual(payload["quantity"], "3")
+
+    def test_missing_old_order_is_successful_cleanup(self):
+        with mock.patch.object(
+            self.exchange,
+            "cancel_order",
+            side_effect=RuntimeError('bingx {"code":109400,"msg":"order not exist"}'),
+        ), mock.patch.object(self.bot, "log") as logger:
+            result = self.bot.cancel_order_exact_sync(self.symbol, "old-order")
+
+        self.assertTrue(result)
+        logger.assert_called_once_with(
+            "INFO",
+            f"CANCEL EXACT ALREADY GONE symbol={self.symbol} id=old-order",
+        )
 
 
 class BingXSymbolResolutionTests(unittest.TestCase):

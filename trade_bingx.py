@@ -7,9 +7,10 @@ import asyncio
 import hashlib
 import hmac
 import math
+import threading
 from decimal import Decimal
 from urllib.parse import urlencode
-from datetime import datetime
+from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 
 import requests
@@ -130,6 +131,10 @@ LAST_SLTP = {}
 ORDER_IDS_FILE = os.path.join(STATE_DIR, "order_ids.json")
 LAST_ORDER_IDS = {}
 POSITION_MISSING_COUNTS = {}
+EXECUTION_STATE_FILE = os.path.join(STATE_DIR, "execution_state.json")
+EXECUTION_STATE = {"signals": {}, "positions": {}}
+EXECUTION_STATE_LOCK = threading.RLock()
+EXECUTION_SYNC_SEC = max(10.0, float(os.getenv("EXECUTION_SYNC_SEC", "30")))
 
 
 class PositionLookupError(RuntimeError):
@@ -216,6 +221,185 @@ def load_order_ids():
                 LAST_ORDER_IDS = json.load(f)
     except Exception as e:
         print("ORDER_IDS load error:", e)
+
+
+def _utc_iso() -> str:
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def load_execution_state():
+    """Load the durable SignalBot -> BingX execution journal."""
+    global EXECUTION_STATE
+    with EXECUTION_STATE_LOCK:
+        try:
+            if os.path.exists(EXECUTION_STATE_FILE):
+                with open(EXECUTION_STATE_FILE, "r", encoding="utf-8") as f:
+                    loaded = json.load(f)
+                if isinstance(loaded, dict):
+                    EXECUTION_STATE = {
+                        "signals": dict(loaded.get("signals") or {}),
+                        "positions": dict(loaded.get("positions") or {}),
+                    }
+        except Exception as e:
+            print("EXECUTION_STATE load error:", e)
+
+
+def save_execution_state():
+    """Atomically persist the journal on the Railway volume."""
+    with EXECUTION_STATE_LOCK:
+        try:
+            os.makedirs(STATE_DIR, exist_ok=True)
+            tmp_path = EXECUTION_STATE_FILE + ".tmp"
+            with open(tmp_path, "w", encoding="utf-8") as f:
+                json.dump(EXECUTION_STATE, f, ensure_ascii=False, indent=2)
+            os.replace(tmp_path, EXECUTION_STATE_FILE)
+        except Exception as e:
+            print("EXECUTION_STATE save error:", e)
+
+
+def signal_execution_key(chat_id: Any, message_id: Any, text: str) -> str:
+    """Stable identity for Telegram messages, with a content fallback."""
+    if chat_id is not None and message_id is not None:
+        return f"tg:{chat_id}:{message_id}"
+    normalized = re.sub(r"\s+", " ", str(text or "").strip().casefold())
+    return "sha256:" + hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+
+
+def signal_content_hash(text: str) -> str:
+    normalized = re.sub(r"\s+", " ", str(text or "").strip().casefold())
+    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+
+
+def update_execution_signal(signal_key: Optional[str], status: str, **fields):
+    if not signal_key:
+        return
+    with EXECUTION_STATE_LOCK:
+        row = EXECUTION_STATE["signals"].setdefault(
+            signal_key, {"signal_key": signal_key, "received_at": _utc_iso()}
+        )
+        row.update({k: v for k, v in fields.items() if v is not None})
+        row["status"] = status
+        row["updated_at"] = _utc_iso()
+        save_execution_state()
+
+
+def execution_signal_is_duplicate(
+    signal_key: Optional[str], content_hash: Optional[str] = None
+) -> bool:
+    if not signal_key:
+        return False
+    terminal_statuses = {
+        "order_placed", "open", "open_protected", "closed", "emergency_closed"
+    }
+    signals = EXECUTION_STATE.get("signals", {})
+    status = str((signals.get(signal_key) or {}).get("status") or "")
+    if status in terminal_statuses:
+        return True
+    if content_hash:
+        return any(
+            row.get("content_hash") == content_hash
+            and str(row.get("status") or "") in terminal_statuses
+            for row in signals.values()
+        )
+    return False
+
+
+def bind_signal_to_position(
+    signal_key: Optional[str], symbol: str, side: str, order_id: Any = None, **fields
+):
+    position_key = f"{symbol}:{str(side).lower()}"
+    with EXECUTION_STATE_LOCK:
+        EXECUTION_STATE["positions"][position_key] = {
+            "position_key": position_key,
+            "signal_key": signal_key,
+            "symbol": symbol,
+            "side": str(side).lower(),
+            "entry_order_id": str(order_id) if order_id is not None else None,
+            "status": "open",
+            "opened_at": _utc_iso(),
+            "updated_at": _utc_iso(),
+            **{k: v for k, v in fields.items() if v is not None},
+        }
+        save_execution_state()
+
+
+def _live_positions_snapshot_sync() -> dict[str, dict]:
+    positions = exchange.fetch_positions()
+    result = {}
+    for pos in positions or []:
+        symbol = str(pos.get("symbol") or (pos.get("info") or {}).get("symbol") or "")
+        side = _extract_position_side_sync(pos)
+        if not symbol or side not in {"long", "short"}:
+            continue
+        qty = _extract_position_qty_sync(pos, symbol)
+        if qty <= 0:
+            continue
+        result[f"{symbol}:{side}"] = {
+            "symbol": symbol,
+            "side": side,
+            "qty": qty,
+            "entry": _position_entry_price(pos),
+        }
+    return result
+
+
+def reconcile_execution_state_sync() -> dict:
+    """Make BingX the source of truth for tracked open positions."""
+    live = _live_positions_snapshot_sync()
+    now = _utc_iso()
+    closed = []
+    unmatched = []
+    with EXECUTION_STATE_LOCK:
+        tracked = EXECUTION_STATE["positions"]
+        for position_key, row in list(tracked.items()):
+            actual = live.get(position_key)
+            if actual:
+                row.update(actual)
+                row["status"] = "open"
+                row["last_seen_at"] = now
+                row["updated_at"] = now
+            elif row.get("status") == "open":
+                row["status"] = "closed"
+                row["closed_at"] = now
+                row["updated_at"] = now
+                signal_key = row.get("signal_key")
+                if signal_key:
+                    signal_row = EXECUTION_STATE["signals"].get(signal_key) or {}
+                    signal_row.update({"status": "closed", "closed_at": now, "updated_at": now})
+                    EXECUTION_STATE["signals"][signal_key] = signal_row
+                closed.append(position_key)
+        for position_key, actual in live.items():
+            if position_key not in tracked or tracked[position_key].get("status") != "open":
+                tracked[position_key] = {
+                    "position_key": position_key,
+                    **actual,
+                    "signal_key": None,
+                    "status": "open",
+                    "origin": "unmatched_exchange_position",
+                    "opened_at": now,
+                    "last_seen_at": now,
+                    "updated_at": now,
+                }
+                unmatched.append(position_key)
+        save_execution_state()
+    return {"live": len(live), "closed": closed, "unmatched": unmatched}
+
+
+async def execution_reconcile_loop():
+    while True:
+        try:
+            result = await asyncio.to_thread(reconcile_execution_state_sync)
+            if result["closed"]:
+                log("INFO", f"EXEC SYNC closed_on_exchange={result['closed']}")
+            if result["unmatched"]:
+                log("WARNING", f"EXEC SYNC unmatched_exchange_positions={result['unmatched']}")
+                await _send_to_tg(
+                    "⚠️ На BingX знайдено позиції без прив'язаного сигналу: "
+                    + ", ".join(result["unmatched"])
+                )
+        except Exception as e:
+            log("ERROR", f"EXEC SYNC failed: {e}")
+        await asyncio.sleep(EXECUTION_SYNC_SEC)
 
 # =========================
 # TG LOGGER (batched)
@@ -1551,6 +1735,30 @@ def _swing_qty_reached(current_qty: float, initial_qty: float, closed_qty: float
     return float(current_qty) <= float(initial_qty) - float(closed_qty) + tolerance
 
 
+def _position_mark_price(pos: dict) -> Optional[float]:
+    info = pos.get("info") or {}
+    for value in (
+        pos.get("markPrice"), pos.get("mark_price"),
+        info.get("markPrice"), info.get("mark_price"),
+    ):
+        try:
+            if value is not None and float(value) > 0:
+                return float(value)
+        except (TypeError, ValueError):
+            continue
+    return None
+
+
+def _final_target_reached(pos_side: str, mark_price: Optional[float], tp3: float) -> bool:
+    if mark_price is None:
+        return False
+    if str(pos_side).lower() == "long":
+        return float(mark_price) >= float(tp3)
+    if str(pos_side).lower() == "short":
+        return float(mark_price) <= float(tp3)
+    return False
+
+
 def advance_swing_exit_state_sync(base: str, position_side: str = "long") -> str:
     """Observe actual position reductions and advance the live SWING stop."""
     base_u = str(base).upper().strip()
@@ -1598,6 +1806,19 @@ def advance_swing_exit_state_sync(base: str, position_side: str = "long") -> str
     tp2_qty = float(plan["tp2_qty"])
     stage = str(plan.get("stage") or "armed")
     messages = []
+
+    # Exchange-side closePosition is the first line of defence. This watcher
+    # is the independent backstop for precision dust or a partially executed
+    # TP3: once MARK_PRICE has reached the final target, no remainder is
+    # allowed to stay open.
+    tp3_price = float(state.get("tp3") or plan.get("tp3") or 0)
+    mark_price = _position_mark_price(pos)
+    if tp3_price > 0 and _final_target_reached(pos_side, mark_price, tp3_price):
+        close_result = close_position_full_sync(base_u, pos_side)
+        return (
+            f"TP3_REMAINDER_FORCE_CLOSED mark={mark_price:g} target={tp3_price:g} "
+            f"qty={current_qty:g} result={close_result}"
+        )
 
     if stage == "armed" and _swing_qty_reached(current_qty, initial_qty, tp1_qty):
         next_stage = (
@@ -1674,7 +1895,12 @@ async def swing_exit_watcher_loop():
                 )
                 if result not in {"NO_CHANGE", "NO_SWING_PLAN"}:
                     log("INFO", f"{style} PARTIAL WATCH {base}/{side}: {result}")
-                    if "stage=tp2_done" in result:
+                    if result.startswith("TP3_REMAINDER_FORCE_CLOSED"):
+                        await _send_to_tg(
+                            f"✅ {base}/USDT TP3 досягнуто. "
+                            "Увесь біржовий залишок позиції закрито."
+                        )
+                    elif "stage=tp2_done" in result:
                         await _send_to_tg(
                             f"🎯 {base}/USDT TP2 виконано. "
                             f"SL останніх 30% залишається на Entry − {buffer_r:.2f}R."
@@ -2980,6 +3206,7 @@ async def handle_ai_command(cmd: dict):
         liquidation = extract_liquidation_from_text(cmd.get("_tg_text", ""))
 
     tg_text = cmd.get("_tg_text", "")
+    signal_key = cmd.get("_signal_key")
 
     log("INFO", f"AI action={action} conf={conf} base={base} side={side} lev={lev} risk={risk_pct} signal_balance={signal_balance_usdt} position_usdt={position_usdt} margin_usdt={margin_usdt} sl={sl} tp={tp} tp2={tp2} tp3={tp3} liq={liquidation} add_pct={add_pct}")
 
@@ -3071,12 +3298,24 @@ async def handle_ai_command(cmd: dict):
         return
 
     if action == "OPEN":
+        update_execution_signal(
+            signal_key,
+            "evaluating",
+            source_chat_id=cmd.get("_source_chat_id"),
+            source_message_id=cmd.get("_source_message_id"),
+            content_hash=cmd.get("_signal_content_hash"),
+            style=cmd.get("_signal_style"),
+            base=base,
+            side=side,
+        )
         if not base:
             log("INFO", "AI SKIP OPEN: base missing")
+            update_execution_signal(signal_key, "skipped", reason="base missing")
             return
 
         if side not in {"long", "short"}:
             log("INFO", "AI SKIP OPEN: side missing/invalid")
+            update_execution_signal(signal_key, "skipped", reason="side missing/invalid")
             return
 
         policy_block = open_policy_block_reason(
@@ -3086,6 +3325,7 @@ async def handle_ai_command(cmd: dict):
         )
         if policy_block:
             log("WARNING", f"POLICY SKIP OPEN {base}: {policy_block}")
+            update_execution_signal(signal_key, "skipped", reason=policy_block)
             return
 
         rr_value = cmd.get("rr")
@@ -3144,6 +3384,7 @@ async def handle_ai_command(cmd: dict):
             )
             if source_rr_block:
                 log("WARNING", f"POLICY SKIP OPEN {base}: {source_rr_block}")
+                update_execution_signal(signal_key, "skipped", reason=source_rr_block)
                 return
 
         base_clean = _clean_base_from_context(base, tg_text)
@@ -3159,21 +3400,30 @@ async def handle_ai_command(cmd: dict):
         )
         if asset_policy_block:
             log("WARNING", f"POLICY SKIP OPEN {base_clean}: {asset_policy_block}")
+            update_execution_signal(signal_key, "skipped", reason=asset_policy_block)
             return
 
         symbol = await resolve_symbol(base_clean)
 
         if not symbol:
             log("ERROR", f"Symbol not listed on BingX: {base_clean}/USDT")
+            update_execution_signal(signal_key, "skipped", reason="symbol not listed on BingX")
             return
 
         if not ENTRY_RULES.allow_same_symbol_side_reentry:
             existing_same_side = await fetch_position_oneway(symbol, side)
             if existing_same_side:
+                reason = (
+                    f"{side.upper()} position already exists on BingX; "
+                    "repeat signal is not added to the aggregated position"
+                )
                 log(
                     "WARNING",
-                    f"POLICY SKIP OPEN {base_clean}: {side.upper()} position already "
-                    "exists; BingX would aggregate it and change the original risk",
+                    f"POLICY SKIP OPEN {base_clean}: {reason}",
+                )
+                update_execution_signal(
+                    signal_key, "skipped_existing_position", reason=reason,
+                    symbol=symbol, base=base_clean, side=side,
                 )
                 return
 
@@ -3187,11 +3437,13 @@ async def handle_ai_command(cmd: dict):
         )
         if asset_policy_block:
             log("WARNING", f"POLICY SKIP OPEN {base_clean}: {asset_policy_block}")
+            update_execution_signal(signal_key, "skipped", reason=asset_policy_block)
             return
 
         api_open_issue = await asyncio.to_thread(market_api_open_disabled_sync, symbol)
         if api_open_issue:
             log("ERROR", api_open_issue)
+            update_execution_signal(signal_key, "skipped", reason=api_open_issue)
             return
 
         try:
@@ -3355,6 +3607,7 @@ async def handle_ai_command(cmd: dict):
 
         if DRY_RUN:
             log("INFO", "DRY_RUN OPEN skipped (test mode)")
+            update_execution_signal(signal_key, "dry_run", symbol=symbol, base=base_clean)
             return
 
         log("INFO", f"TRY SET LEVERAGE {symbol} lev={lev} side={side}")
@@ -3380,6 +3633,30 @@ async def handle_ai_command(cmd: dict):
 
             resp = await open_market(symbol, side, qty)
             log("INFO", f"SUCCESS OPEN placed id={resp.get('id')} {base_clean} side={side} qty={qty}")
+            bind_signal_to_position(
+                signal_key,
+                symbol,
+                side,
+                order_id=resp.get("id"),
+                base=base_clean,
+                requested_qty=qty,
+                risk_pct=float(trade_plan["risk_pct"]),
+                risk_budget=float(trade_plan["risk_budget"]),
+                sl=sl_prec,
+                tp1=tp_prec,
+                tp2=tp2_prec,
+                tp3=tp3_prec,
+                style=signal_style,
+            )
+            update_execution_signal(
+                signal_key,
+                "order_placed",
+                symbol=symbol,
+                base=base_clean,
+                side=side,
+                entry_order_id=resp.get("id"),
+                requested_qty=qty,
+            )
 
             pos_seen = await wait_position_update(
                 symbol,
@@ -3389,6 +3666,12 @@ async def handle_ai_command(cmd: dict):
                 position_side=side,
             )
             log("INFO", f"POSITION_VISIBLE_AFTER_OPEN {base_clean}={bool(pos_seen)}")
+            if not pos_seen:
+                update_execution_signal(
+                    signal_key,
+                    "order_unconfirmed",
+                    reason="market order placed but position was not visible before timeout",
+                )
             await asyncio.sleep(0.7)
 
             try:
@@ -3440,8 +3723,22 @@ async def handle_ai_command(cmd: dict):
                     f"🚨 {base_clean}/USDT: не вдалося встановити захист після входу. "
                     f"Аварійне закриття: {close_result}"
                 )
+                update_execution_signal(
+                    signal_key,
+                    "emergency_closed",
+                    reason=f"protective orders failed: {protection_error}",
+                )
                 return
             log("INFO", f"APPLY SL/TP after OPEN done: {res}")
+            update_execution_signal(
+                signal_key,
+                "open_protected",
+                protection_result=res,
+                actual_qty=(
+                    _extract_position_qty_sync(pos_seen, symbol) if pos_seen else None
+                ),
+                actual_entry=_position_entry_price(pos_seen) if pos_seen else None,
+            )
             partial_exit_active = use_partial_exit and not res.startswith(
                 "FALLBACK_FULL_TP1"
             )
@@ -3947,6 +4244,9 @@ async def on_signal(_, message):
 
     raw_text = (message.text or message.caption or "").strip()
     text = normalize_source_text(message.chat.id, raw_text)
+    source_message_id = getattr(message, "id", None)
+    signal_key = signal_execution_key(message.chat.id, source_message_id, text or raw_text)
+    content_hash = signal_content_hash(text or raw_text)
     if int(message.chat.id) == CONTROL_CHAT_ID and text is None:
         log("INFO", "CONTROL SKIP: Saved Messages payload needs a full signal card or /tb command")
         return
@@ -3958,6 +4258,14 @@ async def on_signal(_, message):
         and not is_allowed_signal_style(text)
     ):
         log("INFO", f"STYLE SKIP style={extract_signal_style(text)} allowed={sorted(ALLOWED_SIGNAL_STYLES)}")
+        update_execution_signal(
+            signal_key,
+            "skipped",
+            reason=f"style={extract_signal_style(text)} is not live-enabled",
+            source_chat_id=int(message.chat.id),
+            source_message_id=source_message_id,
+            content_hash=content_hash,
+        )
         return
 
     img_path = None
@@ -3995,11 +4303,22 @@ async def on_signal(_, message):
     if not text and not img_path:
         return
 
+    if (
+        text
+        and is_new_entry_signal_text(text)
+        and execution_signal_is_duplicate(signal_key, content_hash)
+    ):
+        log("WARNING", f"EXEC DUPLICATE SKIP signal_key={signal_key}")
+        return
+
     log("INFO", f"AI_RAW {text[:400] if text else '<no text>'}")
     cmd = await asyncio.to_thread(parse_trade_multi, text if text else None, [img_path] if img_path else [])
     cmd["_tg_text"] = text
     cmd["_signal_style"] = extract_signal_style(text)
     cmd["_source_chat_id"] = int(message.chat.id)
+    cmd["_source_message_id"] = source_message_id
+    cmd["_signal_key"] = signal_key
+    cmd["_signal_content_hash"] = content_hash
     cmd["liquidation"] = cmd.get("liquidation") or extract_liquidation_from_text(text)
     await handle_ai_command(cmd)
 
@@ -4011,6 +4330,7 @@ async def on_signal(_, message):
 async def main():
     load_sltp()
     load_order_ids()
+    load_execution_state()
     await app.start()
 
     asyncio.create_task(log_pump())
@@ -4048,6 +4368,13 @@ async def main():
         try:
             await ensure_markets_loaded()
             log("INFO", "BINGX markets loaded")
+            sync_result = await asyncio.to_thread(reconcile_execution_state_sync)
+            log(
+                "INFO",
+                f"EXEC SYNC startup live={sync_result['live']} "
+                f"closed={len(sync_result['closed'])} "
+                f"unmatched={len(sync_result['unmatched'])}",
+            )
         except Exception as e:
             log("ERROR", f"BINGX load_markets failed: {e}")
 
@@ -4064,6 +4391,7 @@ async def main():
         )
 
         asyncio.create_task(swing_exit_watcher_loop())
+        asyncio.create_task(execution_reconcile_loop())
 
         log(
             "INFO",
@@ -4080,6 +4408,7 @@ async def main():
             f"additions={ENTRY_RULES.allow_position_additions} "
             f"same_side_reentry={ENTRY_RULES.allow_same_symbol_side_reentry} "
             f"max_positions={ENTRY_RULES.max_concurrent_positions or 'unlimited'} "
+            f"execution_sync={EXECUTION_SYNC_SEC:g}s "
             f"blocked_kyiv={ENTRY_BLOCK_START_HOUR_KYIV:02d}:00-"
             f"{ENTRY_BLOCK_END_HOUR_KYIV:02d}:00",
         )

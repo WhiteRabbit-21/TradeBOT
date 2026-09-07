@@ -860,6 +860,33 @@ class SwingPartialExitTests(unittest.TestCase):
         self.assertEqual(payload["closePosition"], "true")
         self.assertEqual(payload["quantity"], "3")
 
+    def test_watcher_force_closes_any_remainder_after_tp3_mark_price(self):
+        self.exchange.positions[0].update(contracts=0.01, markPrice=120.1)
+        self.bot.LAST_SLTP = {
+            "SUI": {
+                "long": {
+                    "sl": 99.8,
+                    "tp3": 120.0,
+                    "swing_plan": {
+                        "style": "SCALP",
+                        "stage": "tp2_done",
+                        "initial_qty": 10.0,
+                        "tp1_qty": 4.0,
+                        "tp2_qty": 3.0,
+                        "tp3_qty": 3.0,
+                    },
+                }
+            }
+        }
+        with mock.patch.object(
+            self.bot, "close_position_full_sync", return_value="CLOSED long"
+        ) as close_full:
+            result = self.bot.advance_swing_exit_state_sync("SUI", "long")
+
+        close_full.assert_called_once_with("SUI", "long")
+        self.assertIn("TP3_REMAINDER_FORCE_CLOSED", result)
+        self.assertIn("qty=0.01", result)
+
     def test_missing_old_order_is_successful_cleanup(self):
         with mock.patch.object(
             self.exchange,
@@ -924,6 +951,69 @@ class BingXSymbolResolutionTests(unittest.TestCase):
         issue = self.bot.market_api_open_disabled_sync(symbol)
         self.assertIn("apiStateOpen=false", issue)
         self.assertIn("MVLL-USDT", issue)
+
+
+class ExecutionSynchronizationTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.bot = _load_trade_module()
+
+    def setUp(self):
+        self.exchange = _BingX({})
+        self.bot.exchange = self.exchange
+        self.bot.EXECUTION_STATE = {"signals": {}, "positions": {}}
+
+    def test_signal_identity_uses_telegram_message(self):
+        first = self.bot.signal_execution_key(-5486330898, 123, "signal")
+        repeated = self.bot.signal_execution_key(-5486330898, 123, "changed text")
+        another = self.bot.signal_execution_key(-5486330898, 124, "signal")
+        self.assertEqual(first, repeated)
+        self.assertNotEqual(first, another)
+
+    def test_forwarded_copy_is_deduplicated_by_content(self):
+        content_hash = self.bot.signal_content_hash("SCALP LONG SUI Entry: 1")
+        self.bot.EXECUTION_STATE["signals"]["tg:-5486330898:1"] = {
+            "status": "open_protected",
+            "content_hash": content_hash,
+        }
+        self.assertTrue(
+            self.bot.execution_signal_is_duplicate("tg:566620979:9", content_hash)
+        )
+
+    def test_reconcile_closes_missing_tracked_position(self):
+        self.bot.EXECUTION_STATE = {
+            "signals": {"tg:1:2": {"status": "open_protected"}},
+            "positions": {
+                "SUI/USDT:USDT:long": {
+                    "status": "open",
+                    "signal_key": "tg:1:2",
+                    "symbol": "SUI/USDT:USDT",
+                    "side": "long",
+                }
+            },
+        }
+        with mock.patch.object(self.bot, "save_execution_state"):
+            result = self.bot.reconcile_execution_state_sync()
+        self.assertEqual(result["closed"], ["SUI/USDT:USDT:long"])
+        self.assertEqual(
+            self.bot.EXECUTION_STATE["signals"]["tg:1:2"]["status"], "closed"
+        )
+
+    def test_reconcile_registers_unmatched_exchange_position(self):
+        self.exchange.positions = [
+            {
+                "symbol": "SUI/USDT:USDT",
+                "side": "long",
+                "contracts": 3,
+                "entryPrice": 1.25,
+            }
+        ]
+        with mock.patch.object(self.bot, "save_execution_state"):
+            result = self.bot.reconcile_execution_state_sync()
+        self.assertEqual(result["unmatched"], ["SUI/USDT:USDT:long"])
+        row = self.bot.EXECUTION_STATE["positions"]["SUI/USDT:USDT:long"]
+        self.assertEqual(row["origin"], "unmatched_exchange_position")
+        self.assertEqual(row["qty"], 3.0)
 
 
 class NotifierHedgeTests(unittest.IsolatedAsyncioTestCase):

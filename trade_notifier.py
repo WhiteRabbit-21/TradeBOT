@@ -1,4 +1,6 @@
 import asyncio
+import json
+import os
 import time
 import hmac
 import hashlib
@@ -15,10 +17,15 @@ SENT_CLOSE_CACHE: Dict[str, int] = {}
 CACHE_TTL_SEC = 90
 
 weekly_pnl = 0.0
+weekly_strategy_pnl: Dict[str, float] = {}
 week_start = time.time()
 weekly_start_equity: Optional[float] = None
 last_weekly_report_key: Optional[str] = None
 KYIV_TZ = ZoneInfo("Europe/Kiev")
+_STATE_DIR = (
+    os.getenv("DATA_DIR") or os.getenv("RAILWAY_VOLUME_MOUNT_PATH") or "/data"
+).rstrip("/\\")
+WEEKLY_STATE_FILE = os.path.join(_STATE_DIR, "weekly_report_state.json")
 
 
 def _to_float(value: Any, default: float = 0.0) -> float:
@@ -115,6 +122,114 @@ def _current_week_key() -> str:
     return monday.isoformat()
 
 
+def _load_weekly_state() -> dict:
+    try:
+        with open(WEEKLY_STATE_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except (FileNotFoundError, ValueError, OSError):
+        return {}
+
+
+def _save_weekly_state(state: dict) -> None:
+    try:
+        os.makedirs(_STATE_DIR, exist_ok=True)
+        tmp_path = WEEKLY_STATE_FILE + ".tmp"
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            json.dump(state, f, ensure_ascii=False, indent=2)
+        os.replace(tmp_path, WEEKLY_STATE_FILE)
+    except OSError:
+        # Reporting persistence must never stop position protection/notifying.
+        return
+
+
+def _income_cashflow_kind(row: dict) -> Optional[str]:
+    """Classify only explicit capital transfers, never PnL/fees/funding."""
+    income_type = _extract_income_type(row)
+    info_text = _extract_income_info_text(row).upper()
+    marker = f"{income_type} {info_text}"
+    if any(word in marker for word in ("PNL", "FEE", "FUNDING", "COMMISSION")):
+        return None
+    if "DEPOSIT" in marker or "TRANSFER_IN" in marker or "TRANSFER IN" in marker:
+        return "deposit"
+    if "WITHDRAW" in marker or "TRANSFER_OUT" in marker or "TRANSFER OUT" in marker:
+        return "withdrawal"
+    if "TRANSFER" in marker:
+        return "deposit" if _extract_income_value(row) > 0 else "withdrawal"
+    return None
+
+
+async def _get_week_cashflows(
+    api_key: str,
+    api_secret: str,
+    start_ms: int,
+    end_ms: int,
+    log,
+) -> dict:
+    try:
+        response = await asyncio.to_thread(
+            get_swap_income, api_key, api_secret, start_ms, end_ms, 1000
+        )
+        rows = _extract_income_rows(response)
+    except Exception as exc:
+        log("WARNING", f"WEEKLY cashflow request failed: {exc}")
+        return {"deposits": 0.0, "withdrawals": 0.0, "available": False}
+
+    deposits = 0.0
+    withdrawals = 0.0
+    for row in rows:
+        kind = _income_cashflow_kind(row)
+        value = _extract_income_value(row)
+        if kind == "deposit":
+            deposits += abs(value)
+        elif kind == "withdrawal":
+            withdrawals += abs(value)
+    return {
+        "deposits": round(deposits, 8),
+        "withdrawals": round(withdrawals, 8),
+        "available": True,
+    }
+
+
+def _format_weekly_report(
+    *,
+    week_start_date,
+    week_end_date,
+    start_equity: float,
+    end_equity: float,
+    tracked_pnl: float,
+    deposits: float,
+    withdrawals: float,
+    cashflows_available: bool,
+    strategy_pnl: Optional[Dict[str, float]] = None,
+) -> str:
+    net_cashflow = deposits - withdrawals
+    adjusted_pnl = end_equity - start_equity - net_cashflow
+    pct_text = (
+        f"{adjusted_pnl / start_equity * 100.0:.2f}%"
+        if start_equity > 0 else "n/a"
+    )
+    status = "🟢 PROFIT" if adjusted_pnl >= 0 else "🔴 LOSS"
+    cashflow_note = "" if cashflows_available else " (дані API недоступні)"
+    strategy_lines = "".join(
+        f"\n{strategy}: {value:+.4f} USDT"
+        for strategy, value in sorted((strategy_pnl or {}).items())
+    )
+    return (
+        "📊 WEEKLY REPORT\n\n"
+        f"{status}\n"
+        f"Week: {week_start_date.isoformat()} → {week_end_date.isoformat()}\n"
+        f"Starting balance: {start_equity:.4f} USDT\n"
+        f"Ending balance: {end_equity:.4f} USDT\n"
+        f"Deposits: +{deposits:.4f} USDT{cashflow_note}\n"
+        f"Withdrawals: -{withdrawals:.4f} USDT{cashflow_note}\n"
+        f"Net cashflow: {net_cashflow:+.4f} USDT\n"
+        f"Trading PnL (balance-adjusted): {adjusted_pnl:+.4f} USDT\n"
+        f"Closed-trade PnL tracked: {tracked_pnl:+.4f} USDT{strategy_lines}\n"
+        f"Percent Growth excluding deposits: {pct_text}"
+    )
+
+
 def _should_send_weekly_report_now() -> tuple[bool, str]:
     now_local = datetime.now(KYIV_TZ)
 
@@ -144,12 +259,14 @@ def _format_pnl_message(
     qty: float,
     entry_price: float = 0.0,
     liquidation_price: float = 0.0,
+    strategy: Optional[str] = None,
 ) -> str:
     status = "🟢 PROFIT" if pnl > 0 else "🔴 LOSS"
     side_text = side.upper() if side else "UNKNOWN"
 
     lines = [
         f"{status} #{symbol}",
+        f"Strategy: {strategy}" if strategy else "Strategy: UNKNOWN",
         f"Side: {side_text}",
         f"Net PnL: {round(pnl, 4)} USDT",
         f"Qty: {round(qty, 4)}",
@@ -526,14 +643,36 @@ async def pnl_watcher(
     api_key: str,
     api_secret: str,
     interval: int = 3,
+    strategy_resolver=None,
 ):
-    global LAST_POSITIONS, weekly_pnl, week_start, weekly_start_equity, last_weekly_report_key
+    global LAST_POSITIONS, weekly_pnl, weekly_strategy_pnl, week_start, weekly_start_equity, last_weekly_report_key
+
+    persisted = _load_weekly_state()
+    if persisted:
+        weekly_pnl = _to_float(persisted.get("tracked_pnl"), weekly_pnl)
+        stored_strategy_pnl = persisted.get("strategy_pnl") or {}
+        weekly_strategy_pnl = {
+            str(key): _to_float(value) for key, value in stored_strategy_pnl.items()
+        }
+        weekly_start_equity = _to_float(
+            persisted.get("start_equity"), weekly_start_equity or 0.0
+        ) or None
+        week_start = _to_float(persisted.get("started_at"), week_start)
+        last_weekly_report_key = persisted.get("last_report_key")
 
     while True:
         try:
             if weekly_start_equity is None:
                 weekly_start_equity = await _get_total_usdt_balance(exchange)
                 log("INFO", f"WEEKLY baseline equity set: {weekly_start_equity}")
+                _save_weekly_state({
+                    "week_key": _current_week_key(),
+                    "started_at": week_start,
+                    "start_equity": weekly_start_equity,
+                    "tracked_pnl": weekly_pnl,
+                    "strategy_pnl": weekly_strategy_pnl,
+                    "last_report_key": last_weekly_report_key,
+                })
 
             current_positions = await _fetch_positions_map(exchange)
 
@@ -591,6 +730,12 @@ async def pnl_watcher(
                     log("INFO", f"PNL notifier skip: {symbol} pnl=0.0")
                     continue
 
+                strategy = "UNKNOWN"
+                if strategy_resolver:
+                    try:
+                        strategy = str(strategy_resolver(position_key) or "UNKNOWN").upper()
+                    except Exception as exc:
+                        log("WARNING", f"PNL strategy resolve failed {position_key}: {exc}")
                 msg = _format_pnl_message(
                     symbol=symbol,
                     side=side,
@@ -598,11 +743,23 @@ async def pnl_watcher(
                     qty=qty,
                     entry_price=entry_price,
                     liquidation_price=liquidation_price,
+                    strategy=strategy,
                 )
 
                 try:
                     await app.send_message(log_chat_id, msg)
                     weekly_pnl += pnl
+                    weekly_strategy_pnl[strategy] = weekly_strategy_pnl.get(strategy, 0.0) + pnl
+                    state = _load_weekly_state()
+                    state.update({
+                        "week_key": state.get("week_key") or _current_week_key(),
+                        "started_at": state.get("started_at") or week_start,
+                        "start_equity": weekly_start_equity,
+                        "tracked_pnl": weekly_pnl,
+                        "strategy_pnl": weekly_strategy_pnl,
+                        "last_report_key": last_weekly_report_key,
+                    })
+                    _save_weekly_state(state)
                     log("INFO", f"PNL notifier sent: {symbol} net_pnl={pnl} qty={qty}")
                 except Exception as e:
                     log("ERROR", f"PNL send failed for {symbol}: {e}")
@@ -611,22 +768,35 @@ async def pnl_watcher(
 
             should_send_weekly, week_key = _should_send_weekly_report_now()
             if should_send_weekly and last_weekly_report_key != week_key:
-                status = "🟢 PROFIT" if weekly_pnl >= 0 else "🔴 LOSS"
-
-                pct_text = "n/a"
                 start_equity = float(weekly_start_equity or 0.0)
-                if start_equity > 0:
-                    weekly_pct = (weekly_pnl / start_equity) * 100.0
-                    pct_text = f"{round(weekly_pct, 2)}%"
-
                 week_start_date = datetime.fromisoformat(week_key).date()
                 week_end_date = week_start_date + timedelta(days=6)
-                report = (
-                    "📊 WEEKLY REPORT\n\n"
-                    f"{status}\n"
-                    f"Week: {week_start_date.isoformat()} → {week_end_date.isoformat()}\n"
-                    f"Total Net PnL: {round(weekly_pnl, 4)} USDT\n"
-                    f"Percent Growth: {pct_text}"
+                end_equity = await _get_total_usdt_balance(exchange)
+                start_ms = int(
+                    datetime.combine(
+                        week_start_date, datetime.min.time(), tzinfo=KYIV_TZ
+                    ).timestamp() * 1000
+                )
+                end_ms = int(
+                    datetime.combine(
+                        week_end_date + timedelta(days=1),
+                        datetime.min.time(),
+                        tzinfo=KYIV_TZ,
+                    ).timestamp() * 1000 - 1
+                )
+                cashflows = await _get_week_cashflows(
+                    api_key, api_secret, start_ms, end_ms, log
+                )
+                report = _format_weekly_report(
+                    week_start_date=week_start_date,
+                    week_end_date=week_end_date,
+                    start_equity=start_equity,
+                    end_equity=end_equity,
+                    tracked_pnl=weekly_pnl,
+                    deposits=cashflows["deposits"],
+                    withdrawals=cashflows["withdrawals"],
+                    cashflows_available=cashflows["available"],
+                    strategy_pnl=weekly_strategy_pnl,
                 )
                 try:
                     await app.send_message(log_chat_id, report)
@@ -636,8 +806,17 @@ async def pnl_watcher(
                     log("ERROR", f"Weekly report send failed: {e}")
                 else:
                     weekly_pnl = 0.0
+                    weekly_strategy_pnl = {}
                     week_start = time.time()
                     weekly_start_equity = await _get_total_usdt_balance(exchange)
+                    _save_weekly_state({
+                        "week_key": _current_week_key(),
+                        "started_at": week_start,
+                        "start_equity": weekly_start_equity,
+                        "tracked_pnl": weekly_pnl,
+                        "strategy_pnl": weekly_strategy_pnl,
+                        "last_report_key": last_weekly_report_key,
+                    })
                     log("INFO", f"NEW weekly baseline equity: {weekly_start_equity}")
 
         except Exception as e:

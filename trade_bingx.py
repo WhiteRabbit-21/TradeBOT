@@ -17,7 +17,8 @@ import requests
 from typing import Optional, Any
 from trade_notifier import pnl_watcher
 from asset_universe import classify_non_crypto_asset
-from trade_rules import ENTRY_RULES, SWING_RULES, risk_pct_for_style
+from trade_rules import ENTRY_RULES, SHADOW_S2_RULES, SWING_RULES, risk_pct_for_style
+from shadow_trading import ShadowBook, extract_calibrated_probability, qualifies_s2
 import ccxt
 from pyrogram import Client, filters, idle
 from pyrogram.errors import PeerIdInvalid, FloodWait, RPCError
@@ -72,16 +73,17 @@ POSITION_MISSING_CONFIRMATIONS_REQUIRED = max(
     2,
     int(os.getenv("POSITION_MISSING_CONFIRMATIONS_REQUIRED", "3")),
 )
-# Only Rule 2A - Scalping is allowed to create new live positions. Rule 1 -
-# Swing remains available for managing positions that were already opened and
-# for paper statistics in SignalBot, but it cannot pass the live entry gate.
+# Only S3 is allowed to create new live positions. Older positions remain
+# manageable, but S1 and every other entry policy are disabled.
 # The policy is deliberately code-owned so stale Railway variables cannot
 # silently re-enable a rejected style or side.
 # Existing position management (SL/TP/BE/CLOSE) remains active around the clock.
 ACTIVE_ENTRY_RULES = (ENTRY_RULES,)
 TRADE_LONG_ONLY = all(rules.allowed_side == "long" for rules in ACTIVE_ENTRY_RULES)
-ENTRY_BLOCK_START_HOUR_KYIV = int(os.getenv("ENTRY_BLOCK_START_HOUR_KYIV", "0"))
-ENTRY_BLOCK_END_HOUR_KYIV = int(os.getenv("ENTRY_BLOCK_END_HOUR_KYIV", "6"))
+# S3 has no time-of-day filter. Keep this code-owned so stale Railway values
+# from the old S1 policy cannot silently remove qualifying S3 trades.
+ENTRY_BLOCK_START_HOUR_KYIV = 0
+ENTRY_BLOCK_END_HOUR_KYIV = 0
 RR1_MIN_INCLUSIVE = ENTRY_RULES.rr1_min_inclusive
 RR1_MAX_EXCLUSIVE = ENTRY_RULES.rr1_max_exclusive
 RR1_POLICY_EPSILON = 1e-6
@@ -135,6 +137,9 @@ EXECUTION_STATE_FILE = os.path.join(STATE_DIR, "execution_state.json")
 EXECUTION_STATE = {"signals": {}, "positions": {}}
 EXECUTION_STATE_LOCK = threading.RLock()
 EXECUTION_SYNC_SEC = max(10.0, float(os.getenv("EXECUTION_SYNC_SEC", "30")))
+SHADOW_S2_FILE = os.path.join(STATE_DIR, "shadow_s2.json")
+SHADOW_S2 = ShadowBook(SHADOW_S2_FILE)
+SHADOW_S2_WATCH_SEC = max(2.0, float(os.getenv("SHADOW_S2_WATCH_SEC", "5")))
 
 
 class PositionLookupError(RuntimeError):
@@ -2465,11 +2470,27 @@ def is_entry_time_allowed(now: Optional[datetime] = None) -> bool:
     return not (hour >= start or hour < end)
 
 
+def source_stop_distance_pct(cmd: dict, side: str) -> Optional[float]:
+    """Return stop distance from the declared signal levels, in percent."""
+    if cmd.get("entry") is None or cmd.get("sl") is None:
+        return None
+    entry = float(cmd["entry"])
+    sl = float(cmd["sl"])
+    if entry <= 0:
+        raise ValueError("signal entry must be positive")
+    normalized_side = str(side or "").lower()
+    distance = entry - sl if normalized_side == "long" else sl - entry
+    if distance <= 0:
+        raise ValueError("signal SL is on the wrong side of entry")
+    return distance / entry * 100.0
+
+
 def open_policy_block_reason(
     side: Optional[str],
     now: Optional[datetime] = None,
     style: Optional[str] = None,
     rr1: Optional[float] = None,
+    stop_distance_pct: Optional[float] = None,
     *,
     require_allowed_style: bool = False,
 ) -> Optional[str]:
@@ -2522,6 +2543,15 @@ def open_policy_block_reason(
                 f"effective TP1 RR={effective_rr1:.4f} is blocked; "
                 f"policy requires RR < {RR1_MAX_EXCLUSIVE:g}"
             )
+    if (
+        normalized_style in ENTRY_RULES.allowed_styles
+        and stop_distance_pct is not None
+        and float(stop_distance_pct) + 1e-9 < ENTRY_RULES.min_stop_distance_pct
+    ):
+        return (
+            f"source SL distance={float(stop_distance_pct):.4f}% is blocked; "
+            f"S3 requires >= {ENTRY_RULES.min_stop_distance_pct:g}%"
+        )
     return None
 
 def _parse_message_number_token(raw: str) -> float:
@@ -2622,8 +2652,10 @@ def parse_structured_signal(text: str) -> Optional[dict]:
     if sl is None or tp1 is None:
         return None
 
+    # Preserve all generated SCALP targets for audit/backward compatibility;
+    # S3 execution still uses TP1 only because live_partial_exit_ready=False.
     style_rules = _rules_for_signal_style(style)
-    uses_partial_targets = bool(
+    uses_partial_targets = style == "SCALP" or bool(
         style_rules and getattr(style_rules, "live_partial_exit_ready", False)
     )
 
@@ -2638,6 +2670,8 @@ def parse_structured_signal(text: str) -> Optional[dict]:
         "sl": sl,
         "tp": tp1,
         "signal_rr1": signal_rr1,
+        # Preserve all declared levels for audit and management. The active
+        # strategy decides whether TP2/TP3 are actually sent to the exchange.
         "tp2": tp2 if uses_partial_targets else None,
         "tp3": tp3 if uses_partial_targets else None,
         "position_usdt": position_usdt,
@@ -3184,6 +3218,92 @@ def _format_open_notification(
     return "\n".join(lines)
 
 
+def _register_s2_shadow_if_eligible(cmd: dict) -> bool:
+    """Record S2 independently; this path has no order-placement capability."""
+    text = str(cmd.get("_tg_text") or "")
+    style = str(cmd.get("_signal_style") or "").upper()
+    side = str(cmd.get("side") or "").lower()
+    probability = extract_calibrated_probability(text)
+    now_kyiv = datetime.now(KYIV_TZ)
+    if not qualifies_s2(
+        style=style,
+        side=side,
+        probability=probability,
+        now_kyiv=now_kyiv,
+    ):
+        return False
+    if any(cmd.get(field) is None for field in ("entry", "sl", "tp")):
+        log("WARNING", "S2 SHADOW SKIP: entry/SL/TP1 missing")
+        return False
+    base = _clean_base_from_context(cmd.get("base"), text)
+    if not base or non_crypto_open_block_reason(base, signal_text=text, style=style):
+        log("WARNING", f"S2 SHADOW SKIP {base or 'unknown'}: non-crypto or missing base")
+        return False
+    signal_key = str(cmd.get("_signal_key") or cmd.get("_signal_content_hash") or "")
+    if not signal_key:
+        return False
+    try:
+        added = SHADOW_S2.register(
+            signal_key=signal_key,
+            base=base,
+            entry=float(cmd["entry"]),
+            sl=float(cmd["sl"]),
+            tp1=float(cmd["tp"]),
+            probability=float(probability),
+        )
+    except (TypeError, ValueError, OSError) as exc:
+        log("WARNING", f"S2 SHADOW SKIP {base}: {exc}")
+        return False
+    if added:
+        log(
+            "INFO",
+            f"S2 SHADOW OPEN {base} P(TP1)={probability:g}% "
+            f"entry={cmd['entry']} sl={cmd['sl']} tp1={cmd['tp']}",
+        )
+    return added
+
+
+def execution_strategy_for_position(position_key: str) -> str:
+    row = (EXECUTION_STATE.get("positions") or {}).get(position_key) or {}
+    return str(row.get("strategy") or row.get("style") or "S3").upper()
+
+
+def _format_s2_shadow_close(trade: dict, summary: dict) -> str:
+    status = "🟢 TP1" if trade["status"] == "tp1_hit" else "🔴 STOP LOSS"
+    pf = summary["profit_factor"]
+    pf_text = "∞" if pf is None else f"{pf:.2f}"
+    return (
+        "📊 S2 SHADOW — закрита угода\n\n"
+        f"{status} · {trade['base']}/USDT\n"
+        f"Net: {trade['pnl_balance']:+.4f} virtual units ({trade['net_r']:+.3f}R)\n"
+        f"S2 total: {summary['trades']} trades · {summary['wins']} TP · "
+        f"{summary['losses']} SL · Net {summary['net_pct']:+.2f}% · PF {pf_text}\n"
+        "Mode: SHADOW — реальний ордер не створювався"
+    )
+
+
+async def shadow_s2_watcher():
+    while True:
+        try:
+            for position in SHADOW_S2.open_positions():
+                symbol = await resolve_symbol(position["base"])
+                if not symbol:
+                    continue
+                ticker = await asyncio.to_thread(exchange.fetch_ticker, symbol)
+                price = float(ticker.get("last") or ticker.get("close") or 0)
+                if price <= 0:
+                    continue
+                trade = SHADOW_S2.observe(position["signal_key"], price)
+                if trade:
+                    summary = SHADOW_S2.summary()
+                    message = _format_s2_shadow_close(trade, summary)
+                    await app.send_message(PNL_CHAT_ID, message)
+                    log("INFO", f"S2 SHADOW CLOSE {position['base']} status={trade['status']}")
+        except Exception as exc:
+            log("ERROR", f"S2 shadow watcher error: {exc}")
+        await asyncio.sleep(SHADOW_S2_WATCH_SEC)
+
+
 async def handle_ai_command(cmd: dict):
     action = (cmd.get("action") or "NONE").upper()
     conf = float(cmd.get("confidence") or 0.0)
@@ -3318,6 +3438,8 @@ async def handle_ai_command(cmd: dict):
             update_execution_signal(signal_key, "skipped", reason="side missing/invalid")
             return
 
+        _register_s2_shadow_if_eligible(cmd)
+
         policy_block = open_policy_block_reason(
             side,
             style=cmd.get("_signal_style"),
@@ -3376,10 +3498,19 @@ async def handle_ai_command(cmd: dict):
                     f"POLICY SKIP OPEN {base}: SCALP statistical rule requires signal RR1",
                 )
                 return
+            try:
+                stop_distance_pct = source_stop_distance_pct(cmd, side)
+            except (TypeError, ValueError) as stop_error:
+                log("WARNING", f"POLICY SKIP OPEN {base}: source SL calculation failed: {stop_error}")
+                return
+            if stop_distance_pct is None:
+                log("WARNING", f"POLICY SKIP OPEN {base}: S3 requires signal Entry and SL")
+                return
             source_rr_block = open_policy_block_reason(
                 side,
                 style=signal_style,
                 rr1=source_rr1,
+                stop_distance_pct=stop_distance_pct,
                 require_allowed_style=True,
             )
             if source_rr_block:
@@ -3647,6 +3778,7 @@ async def handle_ai_command(cmd: dict):
                 tp2=tp2_prec,
                 tp3=tp3_prec,
                 style=signal_style,
+                strategy="S3",
             )
             update_execution_signal(
                 signal_key,
@@ -3783,7 +3915,7 @@ async def handle_ai_command(cmd: dict):
             if dca_price and dca_pct:
                 log(
                     "WARNING",
-                    f"POLICY SKIP DCA {base_clean}: fixed 0.5% entry risk; "
+                    f"POLICY SKIP DCA {base_clean}: fixed {FIXED_RISK_PCT:g}% entry risk; "
                     "position additions are disabled",
                 )
 
@@ -4387,11 +4519,13 @@ async def main():
                 PNL_CHAT_ID,
                 BINGX_API_KEY,
                 BINGX_API_SECRET,
+                strategy_resolver=execution_strategy_for_position,
             )
         )
 
         asyncio.create_task(swing_exit_watcher_loop())
         asyncio.create_task(execution_reconcile_loop())
+        asyncio.create_task(shadow_s2_watcher())
 
         log(
             "INFO",
@@ -4400,11 +4534,11 @@ async def main():
             f"styles={sorted(ALLOWED_SIGNAL_STYLES)} "
             f"long_only={TRADE_LONG_ONLY} "
             f"risk={FIXED_RISK_PCT:g}% "
-            f"rule2_rr1={RR1_MIN_INCLUSIVE:g}<=RR<{RR1_MAX_EXCLUSIVE:g} "
-            f"rule2_assets={'ordinary_crypto_only' if ENTRY_RULES.ordinary_crypto_only else 'all_bingx_listed'} "
-            "rule2_exit=40/30/30_TP1/TP2/TP3 "
-            f"rule2_be_buffer={ENTRY_RULES.breakeven_buffer_r:g}R "
-            "rule1_swing=paper_only_existing_positions_managed "
+            f"s3_rr1={RR1_MIN_INCLUSIVE:g}<=RR<{RR1_MAX_EXCLUSIVE:g} "
+            f"s3_min_sl_distance={ENTRY_RULES.min_stop_distance_pct:g}% "
+            f"s3_assets={'ordinary_crypto_only' if ENTRY_RULES.ordinary_crypto_only else 'all_bingx_listed'} "
+            "s3_exit=100%_TP1 s1=disabled "
+            f"s2_shadow=P(TP1)>={SHADOW_S2_RULES.probability_min_inclusive:g}%@16:30-18:30_Kyiv "
             f"additions={ENTRY_RULES.allow_position_additions} "
             f"same_side_reentry={ENTRY_RULES.allow_same_symbol_side_reentry} "
             f"max_positions={ENTRY_RULES.max_concurrent_positions or 'unlimited'} "

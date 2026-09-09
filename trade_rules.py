@@ -6,25 +6,26 @@ from dataclasses import dataclass
 
 @dataclass(frozen=True)
 class LiveEntryRules:
-    """Rule 2A - Scalping Balanced, ordinary crypto assets only."""
+    """S3 - SCALP LONG with a wide source stop and full exit at TP1."""
 
-    version: str = "rule-2a-scalping-balanced-ordinary-crypto"
+    version: str = "s3-scalp-long-wide-stop-full-tp1"
     allowed_styles: tuple[str, ...] = ("SCALP",)
     allowed_side: str = "long"
     ordinary_crypto_only: bool = True
-    risk_per_trade_pct: float = 0.5
-    rr1_min_inclusive: float = 0.8
+    risk_per_trade_pct: float = 1.0
+    rr1_min_inclusive: float = 0.795
     rr1_max_exclusive: float = 1.0
-    target_split: tuple[float, float, float] = (0.40, 0.30, 0.30)
-    move_sl_to_breakeven_after_tp1: bool = True
-    breakeven_buffer_r: float = 0.05
-    live_partial_exit_ready: bool = True
+    min_stop_distance_pct: float = 6.0
+    target_split: tuple[float, float, float] = (1.0, 0.0, 0.0)
+    move_sl_to_breakeven_after_tp1: bool = False
+    breakeven_buffer_r: float = 0.0
+    live_partial_exit_ready: bool = False
     allow_position_additions: bool = False
     # BingX aggregates repeated same-side orders into one position. Rejecting a
-    # duplicate preserves the first trade's SL and its fixed 0.5% risk budget.
+    # duplicate preserves the first trade's SL and its fixed 1% risk budget.
     allow_same_symbol_side_reentry: bool = False
     # None is intentional: the user accepted aggregate risk from any number of
-    # simultaneous signals. Each individual position still risks only 0.5%.
+    # simultaneous signals. Each individual position still risks only 1%.
     max_concurrent_positions: int | None = None
 
     def validate(self) -> None:
@@ -36,12 +37,14 @@ class LiveEntryRules:
             raise ValueError("risk_per_trade_pct must be in (0, 10]")
         if not (0 < self.rr1_min_inclusive < self.rr1_max_exclusive):
             raise ValueError("RR1 range must be positive and ordered")
+        if not (0 < self.min_stop_distance_pct < 100):
+            raise ValueError("min_stop_distance_pct must be in (0, 100)")
         if abs(sum(self.target_split) - 1.0) > 1e-9:
             raise ValueError("target split must sum to 1.0")
-        if not self.live_partial_exit_ready:
-            raise ValueError("Rule 2A requires live 40/30/30 partial exits")
-        if not self.move_sl_to_breakeven_after_tp1:
-            raise ValueError("Rule 2A requires protective SL movement after TP1")
+        if self.live_partial_exit_ready:
+            raise ValueError("S3 must close 100% at TP1")
+        if self.move_sl_to_breakeven_after_tp1:
+            raise ValueError("S3 has no remainder to move after TP1")
         if not (0 <= self.breakeven_buffer_r < 1):
             raise ValueError("breakeven_buffer_r must be in [0, 1)")
         if self.allow_position_additions:
@@ -52,6 +55,30 @@ class LiveEntryRules:
             raise ValueError("live entry policy must not impose a position-count cap")
 
 
+@dataclass(frozen=True)
+class ShadowS2Rules:
+    """S2 observation-only policy; it must never place exchange orders."""
+
+    version: str = "s2-shadow-scalp-long-probability-session"
+    allowed_styles: tuple[str, ...] = ("SCALP",)
+    allowed_side: str = "long"
+    probability_min_inclusive: float = 55.0
+    start_minute_kyiv: int = 16 * 60 + 30
+    end_minute_kyiv: int = 18 * 60 + 30
+    risk_per_trade_pct: float = 0.5
+    round_trip_cost_notional: float = 0.0014
+
+    def validate(self) -> None:
+        if self.allowed_styles != ("SCALP",) or self.allowed_side != "long":
+            raise ValueError("S2 shadow policy must remain SCALP LONG")
+        if not (0 <= self.probability_min_inclusive <= 100):
+            raise ValueError("S2 probability threshold must be in [0, 100]")
+        if not (0 <= self.start_minute_kyiv < self.end_minute_kyiv <= 24 * 60):
+            raise ValueError("S2 Kyiv session is invalid")
+        if not (0 < self.risk_per_trade_pct <= 10):
+            raise ValueError("S2 shadow risk must be in (0, 10]")
+        if not (0 <= self.round_trip_cost_notional < 1):
+            raise ValueError("S2 cost rate must be in [0, 1)")
 @dataclass(frozen=True)
 class SwingTradingRules:
     """Rule 1 - Swing: retained three-target swing execution model."""
@@ -100,6 +127,9 @@ class SwingTradingRules:
 
 ENTRY_RULES = LiveEntryRules()
 ENTRY_RULES.validate()
+
+SHADOW_S2_RULES = ShadowS2Rules()
+SHADOW_S2_RULES.validate()
 
 SWING_RULES = SwingTradingRules()
 SWING_RULES.validate()

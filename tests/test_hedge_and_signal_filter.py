@@ -283,7 +283,7 @@ TF: 1H / 15M / 5M
                 self.assertIsNone(parsed["tp2"])
                 self.assertIsNone(parsed["tp3"])
 
-    def test_open_policy_allows_scalp_long_only_outside_sleep_window(self):
+    def test_open_policy_allows_s3_scalp_long_at_all_hours(self):
         kyiv = ZoneInfo("Europe/Kyiv")
         self.assertIsNotNone(
             self.bot.open_policy_block_reason(
@@ -293,7 +293,7 @@ TF: 1H / 15M / 5M
                 require_allowed_style=True,
             )
         )
-        self.assertIsNotNone(
+        self.assertIsNone(
             self.bot.open_policy_block_reason(
                 "long",
                 datetime(2026, 8, 26, 0, 0, tzinfo=kyiv),
@@ -301,7 +301,7 @@ TF: 1H / 15M / 5M
                 require_allowed_style=True,
             )
         )
-        self.assertIsNotNone(
+        self.assertIsNone(
             self.bot.open_policy_block_reason(
                 "long",
                 datetime(2026, 8, 26, 5, 59, tzinfo=kyiv),
@@ -342,13 +342,13 @@ TF: 1H / 15M / 5M
             )
         )
 
-    def test_full_tp1_rr_policy_is_exactly_point_eight_to_below_one(self):
+    def test_s3_policy_is_rr_point_795_to_below_one_and_wide_stop(self):
         kyiv = ZoneInfo("Europe/Kyiv")
         noon = datetime(2026, 8, 26, 12, 0, tzinfo=kyiv)
 
         self.assertIsNotNone(
             self.bot.open_policy_block_reason(
-                "long", noon, style="SCALP", rr1=0.79, require_allowed_style=True
+                "long", noon, style="SCALP", rr1=0.79, stop_distance_pct=6.0, require_allowed_style=True
             )
         )
         self.assertIsNone(
@@ -356,23 +356,31 @@ TF: 1H / 15M / 5M
                 "long",
                 noon,
                 style="SCALP",
-                rr1=0.799999999,
+                rr1=0.795,
+                stop_distance_pct=6.0,
                 require_allowed_style=True,
             )
         )
-        for rr1 in (0.8, 0.9, 0.999999):
+        for rr1 in (0.795, 0.8, 0.9, 0.999999):
             self.assertIsNone(
                 self.bot.open_policy_block_reason(
                     "long",
                     noon,
                     style="SCALP",
                     rr1=rr1,
+                    stop_distance_pct=6.0,
                     require_allowed_style=True,
                 )
             )
         self.assertIsNotNone(
             self.bot.open_policy_block_reason(
-                "long", noon, style="SCALP", rr1=1.0, require_allowed_style=True
+                "long", noon, style="SCALP", rr1=1.0, stop_distance_pct=6.0, require_allowed_style=True
+            )
+        )
+        self.assertIsNotNone(
+            self.bot.open_policy_block_reason(
+                "long", noon, style="SCALP", rr1=0.8,
+                stop_distance_pct=5.999, require_allowed_style=True,
             )
         )
 
@@ -424,7 +432,7 @@ TF: 1H / 15M / 5M
         self.assertIn("stale SWING entry", reason)
         self.assertIn("exceeds 0.25R", reason)
 
-    def test_auto_plan_risks_half_percent_and_adapts_leverage(self):
+    def test_auto_plan_risks_one_percent_and_adapts_leverage(self):
         plan = self.bot.calculate_auto_trade_plan(
             1000.0,
             0.726500,
@@ -432,10 +440,10 @@ TF: 1H / 15M / 5M
             0.748712,
         )
 
-        self.assertEqual(plan["risk_budget"], 5.0)
-        self.assertAlmostEqual(plan["expected_loss_at_sl"], 5.0, places=8)
+        self.assertEqual(plan["risk_budget"], 10.0)
+        self.assertAlmostEqual(plan["expected_loss_at_sl"], 10.0, places=8)
         self.assertEqual(plan["leverage"], 8)
-        self.assertAlmostEqual(plan["expected_profit_at_tp1"], 4.0, places=2)
+        self.assertAlmostEqual(plan["expected_profit_at_tp1"], 8.0, places=2)
         self.assertLess(plan["margin"], plan["notional"])
 
         wide_target = self.bot.calculate_auto_trade_plan(1000.0, 100.0, 96.0, 120.0)
@@ -443,29 +451,30 @@ TF: 1H / 15M / 5M
 
         tight_stop = self.bot.calculate_auto_trade_plan(1000.0, 100.0, 99.0, 100.8)
         wide_stop = self.bot.calculate_auto_trade_plan(1000.0, 100.0, 90.0, 108.0)
-        self.assertAlmostEqual(tight_stop["expected_loss_at_sl"], 5.0, places=8)
-        self.assertAlmostEqual(wide_stop["expected_loss_at_sl"], 5.0, places=8)
+        self.assertAlmostEqual(tight_stop["expected_loss_at_sl"], 10.0, places=8)
+        self.assertAlmostEqual(wide_stop["expected_loss_at_sl"], 10.0, places=8)
         self.assertGreater(tight_stop["notional"], wide_stop["notional"])
 
     def test_live_entry_rules_are_explicit_and_have_no_position_cap(self):
         rules = self.bot.ENTRY_RULES
-        self.assertEqual(rules.version, "rule-2a-scalping-balanced-ordinary-crypto")
+        self.assertEqual(rules.version, "s3-scalp-long-wide-stop-full-tp1")
         self.assertEqual(rules.allowed_styles, ("SCALP",))
         self.assertEqual(rules.allowed_side, "long")
         self.assertTrue(rules.ordinary_crypto_only)
-        self.assertEqual(rules.risk_per_trade_pct, 0.5)
-        self.assertEqual(rules.rr1_min_inclusive, 0.8)
+        self.assertEqual(rules.risk_per_trade_pct, 1.0)
+        self.assertEqual(rules.rr1_min_inclusive, 0.795)
         self.assertEqual(rules.rr1_max_exclusive, 1.0)
-        self.assertEqual(rules.target_split, (0.40, 0.30, 0.30))
-        self.assertTrue(rules.move_sl_to_breakeven_after_tp1)
-        self.assertEqual(rules.breakeven_buffer_r, 0.05)
-        self.assertTrue(rules.live_partial_exit_ready)
+        self.assertEqual(rules.min_stop_distance_pct, 6.0)
+        self.assertEqual(rules.target_split, (1.0, 0.0, 0.0))
+        self.assertFalse(rules.move_sl_to_breakeven_after_tp1)
+        self.assertEqual(rules.breakeven_buffer_r, 0.0)
+        self.assertFalse(rules.live_partial_exit_ready)
         self.assertFalse(rules.allow_position_additions)
         self.assertFalse(rules.allow_same_symbol_side_reentry)
         self.assertIsNone(rules.max_concurrent_positions)
-        self.assertEqual(self.bot.FIXED_RISK_PCT, 0.5)
+        self.assertEqual(self.bot.FIXED_RISK_PCT, 1.0)
         self.assertEqual(self.bot.ALLOWED_SIGNAL_STYLES, {"SCALP"})
-        self.assertEqual(self.bot.risk_pct_for_style("SCALP", 9.0), 0.5)
+        self.assertEqual(self.bot.risk_pct_for_style("SCALP", 9.0), 1.0)
         self.assertEqual(self.bot.risk_pct_for_style("SWING", 9.0), 0.5)
 
     def test_position_addition_is_rejected_before_exchange_access(self):
@@ -620,39 +629,17 @@ class SwingPartialExitTests(unittest.TestCase):
             self.assertAlmostEqual(state["sl"], 99.68)
             self.assertEqual(calls[-1][3], 3.0)
 
-    def test_rule_2a_scalp_arms_40_30_30_with_point_zero_five_r_buffer(self):
-        calls = []
-
-        def fake_place(
-            symbol, side, price, quantity, kind, *, close_position=False
-        ):
-            calls.append((symbol, side, price, quantity, kind, close_position))
-            return {"data": {"order": {"orderId": f"scalp-{len(calls)}"}}}
-
-        with mock.patch.object(
-            self.bot, "_place_bingx_tpsl_raw_sync", side_effect=fake_place
-        ):
-            result = self.bot.apply_swing_sltp_sync(
+    def test_s3_scalp_cannot_arm_legacy_partial_targets(self):
+        with self.assertRaisesRegex(ValueError, "no live partial-exit rule"):
+            self.bot.apply_swing_sltp_sync(
                 "SUI",
                 entry_price=100.0,
-                sl_price=96.0,
-                tp1_price=103.2,
+                sl_price=94.0,
+                tp1_price=104.8,
                 tp2_price=108.0,
                 tp3_price=112.0,
                 signal_style="SCALP",
             )
-
-        self.assertIn("TP1=103.2/4.0", result)
-        self.assertEqual([call[3] for call in calls], [10.0, 4.0, 3.0, 3.0])
-        self.assertEqual(
-            [call[5] for call in calls],
-            [False, False, False, True],
-        )
-        plan = self.bot.LAST_SLTP["SUI"]["long"]["swing_plan"]
-        self.assertEqual(plan["style"], "SCALP")
-        self.assertEqual(plan["version"], "rule-2a-scalping-balanced-ordinary-crypto")
-        self.assertAlmostEqual(plan["be_sl"], 99.8)
-        self.assertAlmostEqual(plan["buffer_r"], 0.05)
 
     def test_missing_position_must_be_confirmed_before_orders_are_deleted(self):
         self.bot.LAST_SLTP = {

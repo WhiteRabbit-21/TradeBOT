@@ -4,7 +4,10 @@ from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-from shadow_trading import ShadowBook, extract_calibrated_probability, qualifies_s2
+from shadow_trading import (
+    ShadowBook, ShadowS1Book, extract_calibrated_probability,
+    qualifies_s1, qualifies_s2,
+)
 
 
 class ShadowS2Tests(unittest.TestCase):
@@ -27,6 +30,32 @@ class ShadowS2Tests(unittest.TestCase):
             self.assertEqual(trade["status"], "tp1_hit")
             self.assertAlmostEqual(trade["gross_r"], 0.8)
             self.assertEqual(book.summary()["wins"], 1)
+
+
+class ShadowS1Tests(unittest.TestCase):
+    def test_s1_session_and_rr_filter(self):
+        tz = ZoneInfo("Europe/Kiev")
+        self.assertTrue(qualifies_s1(style="SCALP", side="long", rr1=0.8, now_kyiv=datetime(2026, 9, 10, 10, 0, tzinfo=tz)))
+        self.assertFalse(qualifies_s1(style="SCALP", side="long", rr1=0.95, now_kyiv=datetime(2026, 9, 10, 10, 0, tzinfo=tz)))
+        self.assertFalse(qualifies_s1(style="SCALP", side="long", rr1=0.9, now_kyiv=datetime(2026, 9, 10, 23, 0, tzinfo=tz)))
+
+    def test_s1_tracks_partial_then_breakeven_exit(self):
+        with tempfile.TemporaryDirectory() as directory:
+            book = ShadowS1Book(Path(directory) / "s1.json")
+            book.register(signal_key="s1", base="ETH", entry=100, sl=90, tp1=108, tp2=120, tp3=130)
+            self.assertIsNone(book.observe("s1", 108))
+            trade = book.observe("s1", 99.5)
+            self.assertEqual(trade["status"], "breakeven_exit")
+            self.assertAlmostEqual(trade["gross_r"], 0.29)
+            self.assertEqual(book.summary()["wins"], 1)
+
+    def test_s1_tracks_all_three_targets(self):
+        with tempfile.TemporaryDirectory() as directory:
+            book = ShadowS1Book(Path(directory) / "s1.json")
+            book.register(signal_key="s1", base="ETH", entry=100, sl=90, tp1=108, tp2=120, tp3=130)
+            trade = book.observe("s1", 130)
+            self.assertEqual(trade["status"], "tp3_hit")
+            self.assertAlmostEqual(trade["gross_r"], 1.82)
 
 
 if __name__ == "__main__":

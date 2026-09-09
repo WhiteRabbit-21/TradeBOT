@@ -79,6 +79,31 @@ class ShadowS2Rules:
             raise ValueError("S2 shadow risk must be in (0, 10]")
         if not (0 <= self.round_trip_cost_notional < 1):
             raise ValueError("S2 cost rate must be in [0, 1)")
+
+
+@dataclass(frozen=True)
+class ShadowS1Rules:
+    """Disabled live S1 retained as an observation-only balanced strategy."""
+
+    version: str = "s1-shadow-scalp-long-rr-session-balanced"
+    allowed_styles: tuple[str, ...] = ("SCALP",)
+    allowed_side: str = "long"
+    rr1_min_inclusive: float = 0.8
+    rr1_max_exclusive: float = 0.95
+    start_minute_kyiv: int = 10 * 60
+    end_minute_kyiv: int = 23 * 60
+    risk_per_trade_pct: float = 0.5
+    target_split: tuple[float, float, float] = (0.40, 0.30, 0.30)
+    breakeven_buffer_r: float = 0.05
+    round_trip_cost_notional: float = 0.0014
+
+    def validate(self) -> None:
+        if self.allowed_styles != ("SCALP",) or self.allowed_side != "long":
+            raise ValueError("S1 shadow policy must remain SCALP LONG")
+        if not (0 < self.rr1_min_inclusive < self.rr1_max_exclusive):
+            raise ValueError("S1 RR range is invalid")
+        if abs(sum(self.target_split) - 1.0) > 1e-9:
+            raise ValueError("S1 shadow target split must sum to 1")
 @dataclass(frozen=True)
 class SwingTradingRules:
     """Rule 1 - Swing: retained three-target swing execution model."""
@@ -130,6 +155,9 @@ ENTRY_RULES.validate()
 
 SHADOW_S2_RULES = ShadowS2Rules()
 SHADOW_S2_RULES.validate()
+
+SHADOW_S1_RULES = ShadowS1Rules()
+SHADOW_S1_RULES.validate()
 
 SWING_RULES = SwingTradingRules()
 SWING_RULES.validate()

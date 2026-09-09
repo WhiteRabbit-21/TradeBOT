@@ -17,8 +17,14 @@ import requests
 from typing import Optional, Any
 from trade_notifier import pnl_watcher
 from asset_universe import classify_non_crypto_asset
-from trade_rules import ENTRY_RULES, SHADOW_S2_RULES, SWING_RULES, risk_pct_for_style
-from shadow_trading import ShadowBook, extract_calibrated_probability, qualifies_s2
+from trade_rules import (
+    ENTRY_RULES, SHADOW_S1_RULES, SHADOW_S2_RULES, SWING_RULES,
+    risk_pct_for_style,
+)
+from shadow_trading import (
+    ShadowBook, ShadowS1Book, extract_calibrated_probability,
+    qualifies_s1, qualifies_s2,
+)
 import ccxt
 from pyrogram import Client, filters, idle
 from pyrogram.errors import PeerIdInvalid, FloodWait, RPCError
@@ -139,6 +145,8 @@ EXECUTION_STATE_LOCK = threading.RLock()
 EXECUTION_SYNC_SEC = max(10.0, float(os.getenv("EXECUTION_SYNC_SEC", "30")))
 SHADOW_S2_FILE = os.path.join(STATE_DIR, "shadow_s2.json")
 SHADOW_S2 = ShadowBook(SHADOW_S2_FILE)
+SHADOW_S1_FILE = os.path.join(STATE_DIR, "shadow_s1.json")
+SHADOW_S1 = ShadowS1Book(SHADOW_S1_FILE)
 SHADOW_S2_WATCH_SEC = max(2.0, float(os.getenv("SHADOW_S2_WATCH_SEC", "5")))
 
 
@@ -3218,6 +3226,54 @@ def _format_open_notification(
     return "\n".join(lines)
 
 
+def _register_s1_shadow_if_eligible(cmd: dict) -> bool:
+    """Record the disabled S1 policy as a balanced shadow position."""
+    text = str(cmd.get("_tg_text") or "")
+    style = str(cmd.get("_signal_style") or "").upper()
+    side = str(cmd.get("side") or "").lower()
+    try:
+        rr1 = source_signal_rr1(cmd, side)
+    except (TypeError, ValueError):
+        return False
+    if not qualifies_s1(
+        style=style,
+        side=side,
+        rr1=rr1,
+        now_kyiv=datetime.now(KYIV_TZ),
+    ):
+        return False
+    if any(cmd.get(field) is None for field in ("entry", "sl", "tp", "tp2", "tp3")):
+        log("WARNING", "S1 SHADOW SKIP: Entry/SL/TP1/TP2/TP3 missing")
+        return False
+    base = _clean_base_from_context(cmd.get("base"), text)
+    if not base or non_crypto_open_block_reason(base, signal_text=text, style=style):
+        log("WARNING", f"S1 SHADOW SKIP {base or 'unknown'}: non-crypto or missing base")
+        return False
+    signal_key = str(cmd.get("_signal_key") or cmd.get("_signal_content_hash") or "")
+    if not signal_key:
+        return False
+    try:
+        added = SHADOW_S1.register(
+            signal_key=signal_key,
+            base=base,
+            entry=float(cmd["entry"]),
+            sl=float(cmd["sl"]),
+            tp1=float(cmd["tp"]),
+            tp2=float(cmd["tp2"]),
+            tp3=float(cmd["tp3"]),
+        )
+    except (TypeError, ValueError, OSError) as exc:
+        log("WARNING", f"S1 SHADOW SKIP {base}: {exc}")
+        return False
+    if added:
+        log(
+            "INFO",
+            f"S1 SHADOW OPEN {base} RR1={rr1:.4f} entry={cmd['entry']} "
+            f"sl={cmd['sl']} tp1={cmd['tp']} tp2={cmd['tp2']} tp3={cmd['tp3']}",
+        )
+    return added
+
+
 def _register_s2_shadow_if_eligible(cmd: dict) -> bool:
     """Record S2 independently; this path has no order-placement capability."""
     text = str(cmd.get("_tg_text") or "")
@@ -3282,6 +3338,25 @@ def _format_s2_shadow_close(trade: dict, summary: dict) -> str:
     )
 
 
+def _format_s1_shadow_close(trade: dict, summary: dict) -> str:
+    labels = {
+        "tp3_hit": "🟢 TP3",
+        "breakeven_exit": "🟢 PARTIAL + BE",
+        "sl_hit": "🔴 STOP LOSS",
+    }
+    pf = summary["profit_factor"]
+    pf_text = "∞" if pf is None else f"{pf:.2f}"
+    return (
+        "📊 S1 SHADOW — закрита угода\n\n"
+        f"{labels.get(trade['status'], trade['status'])} · {trade['base']}/USDT\n"
+        f"Net: {trade['pnl_balance']:+.4f} virtual units ({trade['net_r']:+.3f}R)\n"
+        f"S1 total: {summary['trades']} trades · {summary['wins']} profit · "
+        f"{summary['losses']} loss · Net {summary['net_pct']:+.2f}% · PF {pf_text}\n"
+        f"Exits: TP3 {summary['tp3_hit']} · BE {summary['breakeven_exit']} · SL {summary['sl_hit']}\n"
+        "Mode: SHADOW — реальний ордер не створювався"
+    )
+
+
 async def shadow_s2_watcher():
     while True:
         try:
@@ -3301,6 +3376,27 @@ async def shadow_s2_watcher():
                     log("INFO", f"S2 SHADOW CLOSE {position['base']} status={trade['status']}")
         except Exception as exc:
             log("ERROR", f"S2 shadow watcher error: {exc}")
+        await asyncio.sleep(SHADOW_S2_WATCH_SEC)
+
+
+async def shadow_s1_watcher():
+    while True:
+        try:
+            for position in SHADOW_S1.open_positions():
+                symbol = await resolve_symbol(position["base"])
+                if not symbol:
+                    continue
+                ticker = await asyncio.to_thread(exchange.fetch_ticker, symbol)
+                price = float(ticker.get("last") or ticker.get("close") or 0)
+                if price <= 0:
+                    continue
+                trade = SHADOW_S1.observe(position["signal_key"], price)
+                if trade:
+                    summary = SHADOW_S1.summary()
+                    await app.send_message(PNL_CHAT_ID, _format_s1_shadow_close(trade, summary))
+                    log("INFO", f"S1 SHADOW CLOSE {position['base']} status={trade['status']}")
+        except Exception as exc:
+            log("ERROR", f"S1 shadow watcher error: {exc}")
         await asyncio.sleep(SHADOW_S2_WATCH_SEC)
 
 
@@ -3438,6 +3534,7 @@ async def handle_ai_command(cmd: dict):
             update_execution_signal(signal_key, "skipped", reason="side missing/invalid")
             return
 
+        _register_s1_shadow_if_eligible(cmd)
         _register_s2_shadow_if_eligible(cmd)
 
         policy_block = open_policy_block_reason(
@@ -4525,6 +4622,7 @@ async def main():
 
         asyncio.create_task(swing_exit_watcher_loop())
         asyncio.create_task(execution_reconcile_loop())
+        asyncio.create_task(shadow_s1_watcher())
         asyncio.create_task(shadow_s2_watcher())
 
         log(
@@ -4538,6 +4636,8 @@ async def main():
             f"s3_min_sl_distance={ENTRY_RULES.min_stop_distance_pct:g}% "
             f"s3_assets={'ordinary_crypto_only' if ENTRY_RULES.ordinary_crypto_only else 'all_bingx_listed'} "
             "s3_exit=100%_TP1 s1=disabled "
+            f"s1_shadow={SHADOW_S1_RULES.rr1_min_inclusive:g}<=RR<"
+            f"{SHADOW_S1_RULES.rr1_max_exclusive:g}@10:00-23:00_Kyiv "
             f"s2_shadow=P(TP1)>={SHADOW_S2_RULES.probability_min_inclusive:g}%@16:30-18:30_Kyiv "
             f"additions={ENTRY_RULES.allow_position_additions} "
             f"same_side_reentry={ENTRY_RULES.allow_same_symbol_side_reentry} "

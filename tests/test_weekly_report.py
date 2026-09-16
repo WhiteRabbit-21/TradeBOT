@@ -48,7 +48,11 @@ class WeeklyReportTests(unittest.TestCase):
             symbol="BTC/USDT:USDT", side="long", pnl=2.5, qty=0.01,
             strategy="S3",
         )
-        self.assertIn("Strategy: S3", message)
+        self.assertIn("УГОДУ ЗАКРИТО НА BINGX", message)
+        self.assertIn("Стратегія: S3", message)
+        self.assertIn("Результат: +2.5000 USDT", message)
+        self.assertIn("фактичний realized PnL BingX", message)
+        self.assertNotIn("SHADOW", message)
 
 
 if __name__ == "__main__":

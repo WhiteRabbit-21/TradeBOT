@@ -261,21 +261,25 @@ def _format_pnl_message(
     liquidation_price: float = 0.0,
     strategy: Optional[str] = None,
 ) -> str:
-    status = "🟢 PROFIT" if pnl > 0 else "🔴 LOSS"
+    status = "🟢 ПРОФІТ" if pnl > 0 else "🔴 ЗБИТОК"
     side_text = side.upper() if side else "UNKNOWN"
+    pnl_sign = "+" if pnl > 0 else ""
 
     lines = [
-        f"{status} #{symbol}",
-        f"Strategy: {strategy}" if strategy else "Strategy: UNKNOWN",
-        f"Side: {side_text}",
-        f"Net PnL: {round(pnl, 4)} USDT",
-        f"Qty: {round(qty, 4)}",
+        "✅ УГОДУ ЗАКРИТО НА BINGX",
+        "",
+        f"{status}",
+        f"Пара: {symbol}",
+        f"Стратегія: {strategy}" if strategy else "Стратегія: UNKNOWN",
+        f"Напрямок: {side_text}",
+        f"Результат: {pnl_sign}{pnl:.4f} USDT",
+        f"Кількість: {qty:.4f}",
     ]
 
     if entry_price > 0:
-        lines.append(f"Entry: {round(entry_price, 6)}")
-    if liquidation_price > 0:
-        lines.append(f"Liquidation: {round(liquidation_price, 6)}")
+        lines.append(f"Вхід: {entry_price:.6g}")
+
+    lines += ["", "Джерело: фактичний realized PnL BingX з комісіями та funding."]
 
     return "\n".join(lines)
 

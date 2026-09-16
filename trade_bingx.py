@@ -3319,7 +3319,7 @@ def _register_s2_shadow_if_eligible(cmd: dict) -> bool:
 
 def execution_strategy_for_position(position_key: str) -> str:
     row = (EXECUTION_STATE.get("positions") or {}).get(position_key) or {}
-    return str(row.get("strategy") or row.get("style") or "S3").upper()
+    return str(row.get("strategy") or row.get("style") or "UNKNOWN").upper()
 
 
 def _format_s2_shadow_close(trade: dict, summary: dict) -> str:
@@ -3368,10 +3368,11 @@ async def shadow_s2_watcher():
                     continue
                 trade = SHADOW_S2.observe(position["signal_key"], price)
                 if trade:
-                    summary = SHADOW_S2.summary()
-                    message = _format_s2_shadow_close(trade, summary)
-                    await app.send_message(PNL_CHAT_ID, message)
-                    log("INFO", f"S2 SHADOW CLOSE {position['base']} status={trade['status']}")
+                    log(
+                        "INFO",
+                        f"S2 SHADOW CLOSE {position['base']} status={trade['status']} "
+                        f"net={trade['pnl_balance']:+.4f}; PNL chat suppressed",
+                    )
         except Exception as exc:
             log("ERROR", f"S2 shadow watcher error: {exc}")
         await asyncio.sleep(SHADOW_S2_WATCH_SEC)
@@ -3390,9 +3391,11 @@ async def shadow_s1_watcher():
                     continue
                 trade = SHADOW_S1.observe(position["signal_key"], price)
                 if trade:
-                    summary = SHADOW_S1.summary()
-                    await app.send_message(PNL_CHAT_ID, _format_s1_shadow_close(trade, summary))
-                    log("INFO", f"S1 SHADOW CLOSE {position['base']} status={trade['status']}")
+                    log(
+                        "INFO",
+                        f"S1 SHADOW CLOSE {position['base']} status={trade['status']} "
+                        f"net={trade['pnl_balance']:+.4f}; PNL chat suppressed",
+                    )
         except Exception as exc:
             log("ERROR", f"S1 shadow watcher error: {exc}")
         await asyncio.sleep(SHADOW_S2_WATCH_SEC)

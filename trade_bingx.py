@@ -428,10 +428,6 @@ async def execution_reconcile_loop():
                 log("INFO", f"EXEC SYNC closed_on_exchange={result['closed']}")
             if result["unmatched"]:
                 log("WARNING", f"EXEC SYNC unmatched_exchange_positions={result['unmatched']}")
-                await _send_to_tg(
-                    "⚠️ На BingX знайдено позиції без прив'язаного сигналу: "
-                    + ", ".join(result["unmatched"])
-                )
         except Exception as e:
             log("ERROR", f"EXEC SYNC failed: {e}")
         await asyncio.sleep(EXECUTION_SYNC_SEC)
@@ -441,7 +437,6 @@ async def execution_reconcile_loop():
 # =========================
 _LEVELS = {"DEBUG": 10, "INFO": 20, "WARNING": 30, "ERROR": 40}
 _min_level = _LEVELS.get(LOG_LEVEL, 20)
-_log_queue: asyncio.Queue[tuple[str, str]] = asyncio.Queue()  # (level, line)
 
 def _ts() -> str:
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -463,6 +458,12 @@ async def _send_to_tg(text: str):
         pass
 
 def log(level: str, msg: str):
+    """Write diagnostics to Railway only.
+
+    Telegram LOG_CHAT_ID is reserved for lifecycle messages belonging to
+    signals that actually reached BingX.  Rejected signals, policy skips and
+    worker diagnostics must never be published there.
+    """
     lvl_name = (level or "INFO").upper()
     lvl = _LEVELS.get(lvl_name, 20)
     if lvl < _min_level:
@@ -470,65 +471,6 @@ def log(level: str, msg: str):
 
     line = f"[{_ts()}] [{lvl_name}] {msg}"
     print(line)
-
-    # ERROR -> immediately
-    if lvl_name == "ERROR":
-        try:
-            loop = asyncio.get_event_loop()
-            loop.create_task(_send_to_tg(line))
-        except Exception:
-            pass
-        return
-
-    # Important WARNING -> immediately
-    if lvl_name == "WARNING" and any(k in msg.lower() for k in ["peer", "invalid", "failed", "error", "denied"]):
-        try:
-            loop = asyncio.get_event_loop()
-            loop.create_task(_send_to_tg(line))
-        except Exception:
-            pass
-        return
-
-    try:
-        _log_queue.put_nowait((lvl_name, line))
-    except Exception:
-        pass
-
-async def log_pump():
-    """Зливає INFO/DEBUG пачкою кожні LOG_FLUSH_SEC."""
-    buf: list[str] = []
-    while True:
-        try:
-            _, line = await _log_queue.get()
-            buf.append(line)
-
-            start = asyncio.get_event_loop().time()
-            while True:
-                now = asyncio.get_event_loop().time()
-                if now - start >= LOG_FLUSH_SEC:
-                    break
-                try:
-                    _, nxt = _log_queue.get_nowait()
-                    buf.append(nxt)
-                except asyncio.QueueEmpty:
-                    await asyncio.sleep(0.2)
-
-            if not buf:
-                continue
-
-            chunk = ""
-            for ln in buf:
-                if len(chunk) + len(ln) + 1 > 3500:
-                    await _send_to_tg(chunk.strip())
-                    chunk = ""
-                chunk += ln + "\n"
-
-            if chunk.strip():
-                await _send_to_tg(chunk.strip())
-
-            buf.clear()
-        except Exception:
-            await asyncio.sleep(1)
 
 # =========================
 # PEER WARMUP
@@ -3695,7 +3637,6 @@ async def handle_ai_command(cmd: dict):
                 drift_block = f"cannot validate SWING entry freshness: {drift_error}"
             if drift_block:
                 log("WARNING", f"POLICY SKIP OPEN {base_clean}: {drift_block}")
-                await _send_to_tg(f"⚠️ {base_clean}/USDT SWING пропущено: {drift_block}")
                 return
 
         sl_fixed = normalize_price_from_tail(float(sl), entry, side, "sl")
@@ -4561,8 +4502,6 @@ async def main():
     load_execution_state()
     await app.start()
 
-    asyncio.create_task(log_pump())
-
     try:
         ok = await ensure_peer_known(TARGET_CHAT_ID)
         while not ok:
@@ -4579,9 +4518,7 @@ async def main():
 
         if LOG_CHAT_ID:
             ok2 = await ensure_peer_known(LOG_CHAT_ID)
-            if ok2:
-                await _send_to_tg(f"[{_ts()}] [INFO] 🧾 Telegram logging ON. log_chat_id={LOG_CHAT_ID}")
-            else:
+            if not ok2:
                 log("ERROR", f"Telegram logging FAILED. log_chat_id={LOG_CHAT_ID}")
 
         pnl_ready = False

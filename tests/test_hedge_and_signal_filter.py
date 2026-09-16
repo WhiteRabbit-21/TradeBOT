@@ -115,13 +115,13 @@ class SignalFilterTests(unittest.TestCase):
     def setUpClass(cls):
         cls.bot = _load_trade_module()
 
-    def test_only_rule_two_scalp_is_allowed_for_new_entries(self):
+    def test_combined_system_styles_are_allowed_for_new_entries(self):
         intraday = "📈 INTRADAY  LONG 🟢 — SUI/USDT:USDT\nTF: 4H / 1H / 15M"
         scalp = "⚡ SCALP  LONG 🟢 — SUI/USDT:USDT\nTF: 1H / 15M / 5M"
         swing = "🌊 SWING  LONG 🟢 — SUI/USDT:USDT\nTF: 1D / 4H / 1H"
         stats = "📊 Paper-trading статистика\n⚡ SCALP: угод 325\n📈 INTRADAY: угод 180"
 
-        self.assertFalse(self.bot.is_allowed_signal_style(intraday))
+        self.assertTrue(self.bot.is_allowed_signal_style(intraday))
         self.assertTrue(self.bot.is_allowed_signal_style(scalp))
         self.assertFalse(self.bot.is_allowed_signal_style(swing))
         self.assertIsNone(self.bot.extract_signal_style(stats))
@@ -276,7 +276,7 @@ TF: 1H / 15M / 5M
             self.assertEqual(parsed["base"], "HYPE")
             self.assertEqual(parsed["side"], "long")
             self.assertEqual(parsed["tp"], 32.1114)
-            if style == "SWING":
+            if style in {"INTRADAY", "SWING"}:
                 self.assertEqual(parsed["tp2"], 32.5164)
                 self.assertEqual(parsed["tp3"], 33.4237)
             else:
@@ -309,7 +309,7 @@ TF: 1H / 15M / 5M
                 require_allowed_style=True,
             )
         )
-        self.assertIsNotNone(
+        self.assertIsNone(
             self.bot.open_policy_block_reason(
                 "long",
                 datetime(2026, 8, 26, 12, 0, tzinfo=kyiv),
@@ -342,47 +342,24 @@ TF: 1H / 15M / 5M
             )
         )
 
-    def test_s3_policy_is_rr_point_795_to_below_one_and_wide_stop(self):
+    def test_combined_strategy_selects_a5_by_rr_and_wide_stop(self):
         kyiv = ZoneInfo("Europe/Kyiv")
         noon = datetime(2026, 8, 26, 12, 0, tzinfo=kyiv)
 
-        self.assertIsNotNone(
-            self.bot.open_policy_block_reason(
-                "long", noon, style="SCALP", rr1=0.79, stop_distance_pct=6.0, require_allowed_style=True
-            )
-        )
-        self.assertIsNone(
-            self.bot.open_policy_block_reason(
-                "long",
-                noon,
-                style="SCALP",
-                rr1=0.795,
-                stop_distance_pct=6.0,
-                require_allowed_style=True,
-            )
-        )
         for rr1 in (0.795, 0.8, 0.9, 0.999999):
-            self.assertIsNone(
-                self.bot.open_policy_block_reason(
-                    "long",
-                    noon,
-                    style="SCALP",
-                    rr1=rr1,
-                    stop_distance_pct=6.0,
-                    require_allowed_style=True,
-                )
+            decision, reason = self.bot.select_strategy(
+                style="SCALP", side="long", signal_text="", rr1=rr1,
+                stop_distance_pct=6.0, now=noon,
             )
-        self.assertIsNotNone(
-            self.bot.open_policy_block_reason(
-                "long", noon, style="SCALP", rr1=1.0, stop_distance_pct=6.0, require_allowed_style=True
+            self.assertIsNone(reason)
+            self.assertEqual(decision.rule_id, "A5")
+        for rr1, stop in ((0.79, 6.0), (1.0, 6.0), (0.8, 5.999)):
+            decision, reason = self.bot.select_strategy(
+                style="SCALP", side="long", signal_text="", rr1=rr1,
+                stop_distance_pct=stop, now=noon,
             )
-        )
-        self.assertIsNotNone(
-            self.bot.open_policy_block_reason(
-                "long", noon, style="SCALP", rr1=0.8,
-                stop_distance_pct=5.999, require_allowed_style=True,
-            )
-        )
+            self.assertIsNone(decision)
+            self.assertIsNotNone(reason)
 
     def test_rule_one_swing_is_paper_only_and_blocked_for_live_entry(self):
         kyiv = ZoneInfo("Europe/Kyiv")
@@ -432,7 +409,7 @@ TF: 1H / 15M / 5M
         self.assertIn("stale SWING entry", reason)
         self.assertIn("exceeds 0.25R", reason)
 
-    def test_auto_plan_risks_one_percent_and_adapts_leverage(self):
+    def test_auto_plan_uses_combined_system_fallback_risk(self):
         plan = self.bot.calculate_auto_trade_plan(
             1000.0,
             0.726500,
@@ -440,10 +417,10 @@ TF: 1H / 15M / 5M
             0.748712,
         )
 
-        self.assertEqual(plan["risk_budget"], 10.0)
-        self.assertAlmostEqual(plan["expected_loss_at_sl"], 10.0, places=8)
+        self.assertAlmostEqual(plan["risk_budget"], 7.0)
+        self.assertAlmostEqual(plan["expected_loss_at_sl"], 7.0, places=8)
         self.assertEqual(plan["leverage"], 8)
-        self.assertAlmostEqual(plan["expected_profit_at_tp1"], 8.0, places=2)
+        self.assertAlmostEqual(plan["expected_profit_at_tp1"], 5.6, places=2)
         self.assertLess(plan["margin"], plan["notional"])
 
         wide_target = self.bot.calculate_auto_trade_plan(1000.0, 100.0, 96.0, 120.0)
@@ -451,31 +428,23 @@ TF: 1H / 15M / 5M
 
         tight_stop = self.bot.calculate_auto_trade_plan(1000.0, 100.0, 99.0, 100.8)
         wide_stop = self.bot.calculate_auto_trade_plan(1000.0, 100.0, 90.0, 108.0)
-        self.assertAlmostEqual(tight_stop["expected_loss_at_sl"], 10.0, places=8)
-        self.assertAlmostEqual(wide_stop["expected_loss_at_sl"], 10.0, places=8)
+        self.assertAlmostEqual(tight_stop["expected_loss_at_sl"], 7.0, places=8)
+        self.assertAlmostEqual(wide_stop["expected_loss_at_sl"], 7.0, places=8)
         self.assertGreater(tight_stop["notional"], wide_stop["notional"])
 
-    def test_live_entry_rules_are_explicit_and_have_no_position_cap(self):
+    def test_live_entry_rules_are_explicit_and_capped(self):
         rules = self.bot.ENTRY_RULES
-        self.assertEqual(rules.version, "s3-scalp-long-wide-stop-full-tp1")
-        self.assertEqual(rules.allowed_styles, ("SCALP",))
+        self.assertEqual(rules.version, "combined-a1-a4-a5-a3-v1")
+        self.assertEqual(rules.allowed_styles, ("SCALP", "INTRADAY"))
         self.assertEqual(rules.allowed_side, "long")
         self.assertTrue(rules.ordinary_crypto_only)
-        self.assertEqual(rules.risk_per_trade_pct, 1.0)
-        self.assertEqual(rules.rr1_min_inclusive, 0.795)
-        self.assertEqual(rules.rr1_max_exclusive, 1.0)
-        self.assertEqual(rules.min_stop_distance_pct, 6.0)
-        self.assertEqual(rules.target_split, (1.0, 0.0, 0.0))
-        self.assertFalse(rules.move_sl_to_breakeven_after_tp1)
-        self.assertEqual(rules.breakeven_buffer_r, 0.0)
-        self.assertFalse(rules.live_partial_exit_ready)
+        self.assertEqual(rules.risk_per_trade_pct, 0.7)
         self.assertFalse(rules.allow_position_additions)
         self.assertFalse(rules.allow_same_symbol_side_reentry)
-        self.assertIsNone(rules.max_concurrent_positions)
-        self.assertEqual(self.bot.FIXED_RISK_PCT, 1.0)
-        self.assertEqual(self.bot.ALLOWED_SIGNAL_STYLES, {"SCALP"})
-        self.assertEqual(self.bot.risk_pct_for_style("SCALP", 9.0), 1.0)
-        self.assertEqual(self.bot.risk_pct_for_style("SWING", 9.0), 0.5)
+        self.assertEqual(rules.max_concurrent_positions, 4)
+        self.assertEqual(rules.max_open_risk_pct, 3.0)
+        self.assertEqual(self.bot.FIXED_RISK_PCT, 0.7)
+        self.assertEqual(self.bot.ALLOWED_SIGNAL_STYLES, {"SCALP", "INTRADAY"})
 
     def test_position_addition_is_rejected_before_exchange_access(self):
         asyncio.run(
@@ -489,6 +458,34 @@ TF: 1H / 15M / 5M
                     "_tg_text": "Add BTC",
                 }
             )
+        )
+
+    def test_portfolio_gate_enforces_coin_slots_and_open_risk(self):
+        rows = {
+            "BTC/USDT:USDT:long": {"status": "open", "symbol": "BTC/USDT:USDT", "risk_pct": 0.7},
+            "ETH/USDT:USDT:long": {"status": "open", "symbol": "ETH/USDT:USDT", "risk_pct": 0.7},
+        }
+        self.assertIsNotNone(
+            self.bot.portfolio_entry_block_reason("BTC/USDT:USDT", 0.5, rows)
+        )
+        self.assertIsNone(
+            self.bot.portfolio_entry_block_reason("SOL/USDT:USDT", 0.6, rows)
+        )
+        full = {
+            **rows,
+            "SOL/USDT:USDT:long": {"status": "open", "symbol": "SOL/USDT:USDT", "risk_pct": 0.6},
+            "XRP/USDT:USDT:long": {"status": "open", "symbol": "XRP/USDT:USDT", "risk_pct": 0.5},
+        }
+        self.assertIn(
+            "slots", self.bot.portfolio_entry_block_reason("ADA/USDT:USDT", 0.5, full)
+        )
+        risk_heavy = {
+            key: {**row, "risk_pct": 1.0} for key, row in list(rows.items())
+        }
+        risk_heavy["SOL"] = {"status": "open", "symbol": "SOL/USDT:USDT", "risk_pct": 0.7}
+        self.assertIn(
+            "open risk",
+            self.bot.portfolio_entry_block_reason("ADA/USDT:USDT", 0.5, risk_heavy),
         )
 
     def test_rule_one_swing_rules_are_retained_for_management_and_statistics(self):

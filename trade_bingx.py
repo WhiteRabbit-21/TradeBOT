@@ -19,7 +19,7 @@ from trade_notifier import pnl_watcher
 from asset_universe import classify_non_crypto_asset
 from trade_rules import (
     ENTRY_RULES, SHADOW_S1_RULES, SHADOW_S2_RULES, SWING_RULES,
-    risk_pct_for_style,
+    A3, StrategyDecision, select_strategy,
 )
 from shadow_trading import (
     ShadowBook, ShadowS1Book, extract_calibrated_probability,
@@ -79,19 +79,15 @@ POSITION_MISSING_CONFIRMATIONS_REQUIRED = max(
     2,
     int(os.getenv("POSITION_MISSING_CONFIRMATIONS_REQUIRED", "3")),
 )
-# Only S3 is allowed to create new live positions. Older positions remain
-# manageable, but S1 and every other entry policy are disabled.
+# Only the combined A1/A4/A5/A3 system may create new live positions.
 # The policy is deliberately code-owned so stale Railway variables cannot
 # silently re-enable a rejected style or side.
 # Existing position management (SL/TP/BE/CLOSE) remains active around the clock.
 ACTIVE_ENTRY_RULES = (ENTRY_RULES,)
 TRADE_LONG_ONLY = all(rules.allowed_side == "long" for rules in ACTIVE_ENTRY_RULES)
-# S3 has no time-of-day filter. Keep this code-owned so stale Railway values
-# from the old S1 policy cannot silently remove qualifying S3 trades.
+# Module-specific session filtering is code-owned in ``select_strategy``.
 ENTRY_BLOCK_START_HOUR_KYIV = 0
 ENTRY_BLOCK_END_HOUR_KYIV = 0
-RR1_MIN_INCLUSIVE = ENTRY_RULES.rr1_min_inclusive
-RR1_MAX_EXCLUSIVE = ENTRY_RULES.rr1_max_exclusive
 RR1_POLICY_EPSILON = 1e-6
 KYIV_TZ = ZoneInfo("Europe/Kyiv")
 
@@ -102,8 +98,8 @@ ALLOWED_SIGNAL_STYLES = {
 
 def _rules_for_signal_style(style: Optional[str]):
     normalized_style = str(style or "").strip().upper()
-    if normalized_style in ENTRY_RULES.allowed_styles:
-        return ENTRY_RULES
+    if normalized_style == "INTRADAY":
+        return A3
     # Retained for protective-order management of SWING positions opened
     # before live Rule 1 was paused. New SWING entries are rejected earlier by
     # ALLOWED_SIGNAL_STYLES.
@@ -396,6 +392,32 @@ def reconcile_execution_state_sync() -> dict:
                 unmatched.append(position_key)
         save_execution_state()
     return {"live": len(live), "closed": closed, "unmatched": unmatched}
+
+
+def portfolio_entry_block_reason(
+    symbol: str,
+    risk_pct: float,
+    positions: Optional[dict[str, dict]] = None,
+) -> Optional[str]:
+    """Enforce one coin, four slots and 3% aggregate open risk."""
+    rows = positions if positions is not None else EXECUTION_STATE.get("positions", {})
+    open_rows = [row for row in rows.values() if row.get("status") == "open"]
+    wanted_base = str(symbol or "").split("/")[0].split(":")[0].upper()
+    for row in open_rows:
+        row_base = str(row.get("symbol") or row.get("base") or "").split("/")[0].split(":")[0].upper()
+        if wanted_base and row_base == wanted_base:
+            return f"position for {wanted_base} already exists; one position per coin"
+    if len(open_rows) >= ENTRY_RULES.max_concurrent_positions:
+        return f"all {ENTRY_RULES.max_concurrent_positions} strategy slots are occupied"
+    # Unknown legacy/exchange positions receive the largest module risk. This
+    # fails safely instead of understating aggregate portfolio exposure.
+    current_risk = sum(float(row.get("risk_pct") or FIXED_RISK_PCT) for row in open_rows)
+    if current_risk + float(risk_pct) > ENTRY_RULES.max_open_risk_pct + 1e-9:
+        return (
+            f"open risk would be {current_risk + float(risk_pct):.2f}% "
+            f"above the {ENTRY_RULES.max_open_risk_pct:.2f}% cap"
+        )
+    return None
 
 
 async def execution_reconcile_loop():
@@ -2535,31 +2557,8 @@ def open_policy_block_reason(
             return f"invalid effective TP1 RR={rr1!r}"
         if not math.isfinite(effective_rr1) or effective_rr1 <= 0:
             return f"invalid effective TP1 RR={effective_rr1}"
-        if (
-            normalized_style in ENTRY_RULES.allowed_styles
-            and effective_rr1 + RR1_POLICY_EPSILON < RR1_MIN_INCLUSIVE
-        ):
-            return (
-                f"effective TP1 RR={effective_rr1:.4f} is blocked; "
-                f"policy requires RR >= {RR1_MIN_INCLUSIVE:g}"
-            )
-        if (
-            normalized_style in ENTRY_RULES.allowed_styles
-            and effective_rr1 >= RR1_MAX_EXCLUSIVE
-        ):
-            return (
-                f"effective TP1 RR={effective_rr1:.4f} is blocked; "
-                f"policy requires RR < {RR1_MAX_EXCLUSIVE:g}"
-            )
-    if (
-        normalized_style in ENTRY_RULES.allowed_styles
-        and stop_distance_pct is not None
-        and float(stop_distance_pct) + 1e-9 < ENTRY_RULES.min_stop_distance_pct
-    ):
-        return (
-            f"source SL distance={float(stop_distance_pct):.4f}% is blocked; "
-            f"S3 requires >= {ENTRY_RULES.min_stop_distance_pct:g}%"
-        )
+    if stop_distance_pct is not None and float(stop_distance_pct) <= 0:
+        return "source SL distance must be positive"
     return None
 
 def _parse_message_number_token(raw: str) -> float:
@@ -2660,10 +2659,9 @@ def parse_structured_signal(text: str) -> Optional[dict]:
     if sl is None or tp1 is None:
         return None
 
-    # Preserve all generated SCALP targets for audit/backward compatibility;
-    # S3 execution still uses TP1 only because live_partial_exit_ready=False.
+    # Preserve all generated targets; the selected strategy decides execution.
     style_rules = _rules_for_signal_style(style)
-    uses_partial_targets = style == "SCALP" or bool(
+    uses_partial_targets = style in {"SCALP", "INTRADAY"} or bool(
         style_rules and getattr(style_rules, "live_partial_exit_ready", False)
     )
 
@@ -3560,60 +3558,44 @@ async def handle_ai_command(cmd: dict):
             return
 
         signal_style = str(cmd.get("_signal_style") or "").upper()
-        partial_rules = _rules_for_signal_style(signal_style)
-        use_partial_exit = bool(
-            partial_rules and getattr(partial_rules, "live_partial_exit_ready", False)
+        try:
+            source_rr1 = source_signal_rr1(cmd, side)
+            stop_distance_pct = source_stop_distance_pct(cmd, side)
+        except (TypeError, ValueError) as source_error:
+            reason = f"source levels are invalid: {source_error}"
+            log("WARNING", f"POLICY SKIP OPEN {base}: {reason}")
+            update_execution_signal(signal_key, "skipped", reason=reason)
+            return
+        if source_rr1 is None or stop_distance_pct is None:
+            reason = "combined strategy requires source Entry, SL and TP1"
+            log("WARNING", f"POLICY SKIP OPEN {base}: {reason}")
+            update_execution_signal(signal_key, "skipped", reason=reason)
+            return
+        strategy_decision, strategy_block = select_strategy(
+            style=signal_style,
+            side=side,
+            signal_text=tg_text,
+            rr1=source_rr1,
+            stop_distance_pct=stop_distance_pct,
         )
-        if use_partial_exit and cmd.get("entry") is None:
-            log(
-                "ERROR",
-                f"SAFE SKIP OPEN {base}: live {signal_style} partial model "
-                "requires signal Entry",
-            )
+        if strategy_block or strategy_decision is None:
+            reason = strategy_block or "no strategy module matched"
+            log("WARNING", f"POLICY SKIP OPEN {base}: {reason}")
+            update_execution_signal(signal_key, "skipped", reason=reason)
             return
+        partial_rules = strategy_decision
+        use_partial_exit = strategy_decision.live_partial_exit_ready
         if use_partial_exit and (tp2 is None or tp3 is None):
-            log(
-                "ERROR",
-                f"SAFE SKIP OPEN {base}: live {signal_style} model requires "
-                "TP1, TP2 and TP3",
-            )
+            reason = f"{strategy_decision.rule_id} requires TP1, TP2 and TP3"
+            log("ERROR", f"SAFE SKIP OPEN {base}: {reason}")
+            update_execution_signal(signal_key, "skipped", reason=reason)
             return
-
-        source_rr1 = None
-        if signal_style in ENTRY_RULES.allowed_styles:
-            try:
-                source_rr1 = source_signal_rr1(cmd, side)
-            except (TypeError, ValueError) as rr_error:
-                log(
-                    "WARNING",
-                    f"POLICY SKIP OPEN {base}: source RR1 calculation failed: {rr_error}",
-                )
-                return
-            if source_rr1 is None:
-                log(
-                    "WARNING",
-                    f"POLICY SKIP OPEN {base}: SCALP statistical rule requires signal RR1",
-                )
-                return
-            try:
-                stop_distance_pct = source_stop_distance_pct(cmd, side)
-            except (TypeError, ValueError) as stop_error:
-                log("WARNING", f"POLICY SKIP OPEN {base}: source SL calculation failed: {stop_error}")
-                return
-            if stop_distance_pct is None:
-                log("WARNING", f"POLICY SKIP OPEN {base}: S3 requires signal Entry and SL")
-                return
-            source_rr_block = open_policy_block_reason(
-                side,
-                style=signal_style,
-                rr1=source_rr1,
-                stop_distance_pct=stop_distance_pct,
-                require_allowed_style=True,
-            )
-            if source_rr_block:
-                log("WARNING", f"POLICY SKIP OPEN {base}: {source_rr_block}")
-                update_execution_signal(signal_key, "skipped", reason=source_rr_block)
-                return
+        log(
+            "INFO",
+            f"STRATEGY MATCH {base}: {strategy_decision.rule_id} "
+            f"risk={strategy_decision.risk_pct:.2f}% source_rr1={source_rr1:.4f} "
+            f"source_sl={stop_distance_pct:.4f}%",
+        )
 
         base_clean = _clean_base_from_context(base, tg_text)
 
@@ -3672,6 +3654,18 @@ async def handle_ai_command(cmd: dict):
         if api_open_issue:
             log("ERROR", api_open_issue)
             update_execution_signal(signal_key, "skipped", reason=api_open_issue)
+            return
+
+        try:
+            await asyncio.to_thread(reconcile_execution_state_sync)
+            portfolio_block = portfolio_entry_block_reason(
+                symbol, strategy_decision.risk_pct
+            )
+        except Exception as portfolio_error:
+            portfolio_block = f"cannot verify portfolio limits: {portfolio_error}"
+        if portfolio_block:
+            log("WARNING", f"PORTFOLIO SKIP OPEN {base_clean}: {portfolio_block}")
+            update_execution_signal(signal_key, "skipped", reason=portfolio_block)
             return
 
         try:
@@ -3773,10 +3767,7 @@ async def handle_ai_command(cmd: dict):
 
         try:
             usdt_total = await get_usdt_total()
-            applied_risk_pct = risk_pct_for_style(
-                cmd.get("_signal_style"),
-                FIXED_RISK_PCT,
-            )
+            applied_risk_pct = strategy_decision.risk_pct
             trade_plan = calculate_auto_trade_plan(
                 usdt_total,
                 entry,
@@ -3875,7 +3866,7 @@ async def handle_ai_command(cmd: dict):
                 tp2=tp2_prec,
                 tp3=tp3_prec,
                 style=signal_style,
-                strategy="S3",
+                strategy=strategy_decision.rule_id,
             )
             update_execution_signal(
                 signal_key,
@@ -3929,7 +3920,12 @@ async def handle_ai_command(cmd: dict):
                     )
                 else:
                     LAST_SLTP.setdefault(base_clean, {})
-                    LAST_SLTP[base_clean][side] = {"sl": sl_prec, "tp": tp_prec}
+                    LAST_SLTP[base_clean][side] = {
+                        "sl": sl_prec,
+                        "tp": tp_prec,
+                        "strategy": strategy_decision.rule_id,
+                        "risk_pct": strategy_decision.risk_pct,
+                    }
                     save_sltp()
                     res = await apply_sltp(
                         base_clean,
@@ -4631,17 +4627,16 @@ async def main():
             f"active_rules={[rules.version for rules in ACTIVE_ENTRY_RULES]} "
             f"styles={sorted(ALLOWED_SIGNAL_STYLES)} "
             f"long_only={TRADE_LONG_ONLY} "
-            f"risk={FIXED_RISK_PCT:g}% "
-            f"s3_rr1={RR1_MIN_INCLUSIVE:g}<=RR<{RR1_MAX_EXCLUSIVE:g} "
-            f"s3_min_sl_distance={ENTRY_RULES.min_stop_distance_pct:g}% "
-            f"s3_assets={'ordinary_crypto_only' if ENTRY_RULES.ordinary_crypto_only else 'all_bingx_listed'} "
-            "s3_exit=100%_TP1 s1=disabled "
+            "modules=A1>A4>A5>A3 risks=0.70/0.70/0.50/0.60% "
+            f"assets={'ordinary_crypto_only' if ENTRY_RULES.ordinary_crypto_only else 'all_bingx_listed'} "
+            "exits=A1/A4/A5_full_TP1,A3_40/30/30 "
             f"s1_shadow={SHADOW_S1_RULES.rr1_min_inclusive:g}<=RR<"
             f"{SHADOW_S1_RULES.rr1_max_exclusive:g}@10:00-23:00_Kyiv "
             f"s2_shadow=P(TP1)>={SHADOW_S2_RULES.probability_min_inclusive:g}%@16:30-18:30_Kyiv "
             f"additions={ENTRY_RULES.allow_position_additions} "
             f"same_side_reentry={ENTRY_RULES.allow_same_symbol_side_reentry} "
-            f"max_positions={ENTRY_RULES.max_concurrent_positions or 'unlimited'} "
+            f"max_positions={ENTRY_RULES.max_concurrent_positions} "
+            f"max_open_risk={ENTRY_RULES.max_open_risk_pct:g}% "
             f"execution_sync={EXECUTION_SYNC_SEC:g}s "
             f"blocked_kyiv={ENTRY_BLOCK_START_HOUR_KYIV:02d}:00-"
             f"{ENTRY_BLOCK_END_HOUR_KYIV:02d}:00",

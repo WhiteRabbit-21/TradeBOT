@@ -2,57 +2,109 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime
+import re
+from typing import Optional
+from zoneinfo import ZoneInfo
 
 
 @dataclass(frozen=True)
 class LiveEntryRules:
-    """S3 - SCALP LONG with a wide source stop and full exit at TP1."""
+    """Code-owned portfolio policy for the combined A1/A4/A5/A3 system."""
 
-    version: str = "s3-scalp-long-wide-stop-full-tp1"
-    allowed_styles: tuple[str, ...] = ("SCALP",)
+    version: str = "combined-a1-a4-a5-a3-v1"
+    allowed_styles: tuple[str, ...] = ("SCALP", "INTRADAY")
     allowed_side: str = "long"
     ordinary_crypto_only: bool = True
-    risk_per_trade_pct: float = 1.0
-    rr1_min_inclusive: float = 0.795
-    rr1_max_exclusive: float = 1.0
-    min_stop_distance_pct: float = 6.0
-    target_split: tuple[float, float, float] = (1.0, 0.0, 0.0)
-    move_sl_to_breakeven_after_tp1: bool = False
-    breakeven_buffer_r: float = 0.0
-    live_partial_exit_ready: bool = False
+    risk_per_trade_pct: float = 0.70  # conservative fallback / largest module risk
     allow_position_additions: bool = False
-    # BingX aggregates repeated same-side orders into one position. Rejecting a
-    # duplicate preserves the first trade's SL and its fixed 1% risk budget.
     allow_same_symbol_side_reentry: bool = False
-    # None is intentional: the user accepted aggregate risk from any number of
-    # simultaneous signals. Each individual position still risks only 1%.
-    max_concurrent_positions: int | None = None
+    max_concurrent_positions: int = 4
+    max_open_risk_pct: float = 3.0
 
     def validate(self) -> None:
-        if self.allowed_styles != ("SCALP",):
-            raise ValueError("live entry policy must remain SCALP-only")
+        if self.allowed_styles != ("SCALP", "INTRADAY"):
+            raise ValueError("live entry policy must remain SCALP/INTRADAY")
         if self.allowed_side != "long":
             raise ValueError("live entry policy must remain LONG-only")
         if not (0 < self.risk_per_trade_pct <= 10):
             raise ValueError("risk_per_trade_pct must be in (0, 10]")
-        if not (0 < self.rr1_min_inclusive < self.rr1_max_exclusive):
-            raise ValueError("RR1 range must be positive and ordered")
-        if not (0 < self.min_stop_distance_pct < 100):
-            raise ValueError("min_stop_distance_pct must be in (0, 100)")
-        if abs(sum(self.target_split) - 1.0) > 1e-9:
-            raise ValueError("target split must sum to 1.0")
-        if self.live_partial_exit_ready:
-            raise ValueError("S3 must close 100% at TP1")
-        if self.move_sl_to_breakeven_after_tp1:
-            raise ValueError("S3 has no remainder to move after TP1")
-        if not (0 <= self.breakeven_buffer_r < 1):
-            raise ValueError("breakeven_buffer_r must be in [0, 1)")
         if self.allow_position_additions:
             raise ValueError("position additions would exceed the fixed entry risk")
         if self.allow_same_symbol_side_reentry:
             raise ValueError("same-side re-entry would aggregate position risk")
-        if self.max_concurrent_positions is not None:
-            raise ValueError("live entry policy must not impose a position-count cap")
+        if self.max_concurrent_positions != 4:
+            raise ValueError("combined system must use four concurrent slots")
+        if self.max_open_risk_pct != 3.0:
+            raise ValueError("combined system must cap open risk at 3%")
+
+
+@dataclass(frozen=True)
+class StrategyDecision:
+    rule_id: str
+    risk_pct: float
+    target_split: tuple[float, float, float]
+    live_partial_exit_ready: bool
+    breakeven_buffer_r: float = 0.0
+
+
+A1 = StrategyDecision("A1", 0.70, (1.0, 0.0, 0.0), False)
+A4 = StrategyDecision("A4", 0.70, (1.0, 0.0, 0.0), False)
+A5 = StrategyDecision("A5", 0.50, (1.0, 0.0, 0.0), False)
+A3 = StrategyDecision("A3", 0.60, (0.40, 0.30, 0.30), True, 0.05)
+KYIV_TZ = ZoneInfo("Europe/Kyiv")
+
+
+def _kyiv_minute(now: Optional[datetime]) -> int:
+    current = now or datetime.now(KYIV_TZ)
+    current = current.replace(tzinfo=KYIV_TZ) if current.tzinfo is None else current.astimezone(KYIV_TZ)
+    return current.hour * 60 + current.minute
+
+
+def _calibrated_probability(text: str) -> Optional[float]:
+    if re.search(r"(?:калібрування|calibration)\s*:\s*(?:навчання|training)", text, re.I):
+        return None
+    match = re.search(r"P\s*\(\s*TP1[^)]*SL\s*\)\s*:\s*(?:<[^>]+>)*\s*(\d+(?:[.,]\d+)?)\s*%", text, re.I)
+    return float(match.group(1).replace(",", ".")) if match else None
+
+
+def _bullish_orderflow(text: str) -> bool:
+    return bool(
+        re.search(r"Order\s*Flow\s*imbalance[^\n]{0,160}(?:на\s+користь\s+bullish|bullish)", text, re.I)
+        or re.search(r"✅\s*Bid\s*/\s*Ask\s+imbalance", text, re.I)
+    )
+
+
+def select_strategy(
+    *, style: str, side: str, signal_text: str, rr1: float,
+    stop_distance_pct: float, now: Optional[datetime] = None,
+) -> tuple[Optional[StrategyDecision], Optional[str]]:
+    """Select exactly one module in priority order A1 > A4 > A5 > A3."""
+    normalized_style = str(style or "").strip().upper()
+    if str(side or "").strip().lower() != "long":
+        return None, "combined strategy allows LONG only"
+    if normalized_style not in ENTRY_RULES.allowed_styles:
+        return None, "combined strategy allows SCALP or INTRADAY only"
+    try:
+        rr = float(rr1)
+        stop_pct = float(stop_distance_pct)
+    except (TypeError, ValueError):
+        return None, "signal Entry, SL and TP1 are required"
+    if rr <= 0 or stop_pct <= 0:
+        return None, "signal RR1 and stop distance must be positive"
+
+    in_session = 16 * 60 + 30 <= _kyiv_minute(now) <= 18 * 60 + 30
+    if normalized_style == "SCALP" and in_session:
+        probability = _calibrated_probability(signal_text or "")
+        if probability is not None and probability >= 55.0:
+            return A1, None
+        if _bullish_orderflow(signal_text or ""):
+            return A4, None
+    if normalized_style == "SCALP" and 0.795 <= rr < 1.0 and stop_pct >= 6.0:
+        return A5, None
+    if normalized_style == "INTRADAY" and rr < 2.0 and 3.0 <= stop_pct < 4.0:
+        return A3, None
+    return None, "signal does not match A1, A4, A5 or A3"
 
 
 @dataclass(frozen=True)

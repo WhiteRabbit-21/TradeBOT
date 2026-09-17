@@ -822,7 +822,8 @@ async def pnl_watcher(
                 symbol = str(prev.get("symbol") or position_key.rsplit(":", 1)[0])
                 close_ts_ms = int(time.time() * 1000)
                 side = str(prev.get("side", ""))
-                close_key = f"{symbol}:{side}:{close_ts_ms // 60000}"
+                normalized_symbol = _normalize_symbol_for_compare(symbol)
+                close_key = f"{normalized_symbol}:{side}:{close_ts_ms // 60000}"
 
                 if not _should_send(close_key):
                     continue

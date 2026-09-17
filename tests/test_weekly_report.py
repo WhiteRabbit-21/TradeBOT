@@ -66,6 +66,12 @@ class WeeklyReportTests(unittest.TestCase):
         self.assertEqual(notifier._extract_fill_rows({"data": rows}), rows)
         self.assertEqual(notifier._extract_fill_rows({"data": {"rows": rows}}), rows)
 
+    def test_symbol_normalization_deduplicates_ccxt_variants(self):
+        self.assertEqual(
+            notifier._normalize_symbol_for_compare("SYN/USDT"),
+            notifier._normalize_symbol_for_compare("SYN/USDT:USDT"),
+        )
+
 
 class PnlFallbackTests(unittest.IsolatedAsyncioTestCase):
     async def test_income_fee_plus_fill_realized_pnl_produces_net_result(self):

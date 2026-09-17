@@ -3326,6 +3326,8 @@ def pending_execution_closures_for_pnl() -> dict[str, dict]:
         for position_key, row in (EXECUTION_STATE.get("positions") or {}).items():
             if row.get("status") != "closed" or not row.get("signal_key"):
                 continue
+            if not row.get("pnl_pending_at"):
+                continue
             if row.get("pnl_notified_at"):
                 continue
             try:
@@ -3346,12 +3348,23 @@ def pending_execution_closures_for_pnl() -> dict[str, dict]:
     return pending
 
 
+def mark_execution_closure_pnl_pending(position_key: str) -> None:
+    with EXECUTION_STATE_LOCK:
+        row = (EXECUTION_STATE.get("positions") or {}).get(position_key)
+        if not row or not row.get("signal_key") or row.get("pnl_notified_at"):
+            return
+        row.setdefault("pnl_pending_at", _utc_iso())
+        row["updated_at"] = _utc_iso()
+        save_execution_state()
+
+
 def mark_execution_closure_pnl_notified(position_key: str, pnl: float) -> None:
     with EXECUTION_STATE_LOCK:
         row = (EXECUTION_STATE.get("positions") or {}).get(position_key)
         if not row:
             return
         row["pnl_notified_at"] = _utc_iso()
+        row.pop("pnl_pending_at", None)
         row["realized_pnl_usdt"] = float(pnl)
         row["updated_at"] = _utc_iso()
         save_execution_state()
@@ -4648,6 +4661,7 @@ async def main():
                 BINGX_API_SECRET,
                 strategy_resolver=execution_strategy_for_position,
                 pending_closed_resolver=pending_execution_closures_for_pnl,
+                closed_detected_callback=mark_execution_closure_pnl_pending,
                 closed_notified_callback=mark_execution_closure_pnl_notified,
             )
         )

@@ -763,6 +763,7 @@ async def pnl_watcher(
     interval: int = 3,
     strategy_resolver=None,
     pending_closed_resolver=None,
+    closed_detected_callback=None,
     closed_notified_callback=None,
 ):
     global LAST_POSITIONS, weekly_pnl, weekly_strategy_pnl, week_start, weekly_start_equity, last_weekly_report_key
@@ -807,6 +808,13 @@ async def pnl_watcher(
 
                 if prev_size > 0 and curr_size == 0:
                     just_closed.append((position_key, prev))
+
+            if closed_detected_callback:
+                for position_key, _ in just_closed:
+                    try:
+                        closed_detected_callback(position_key)
+                    except Exception as exc:
+                        log("WARNING", f"PNL pending marker failed {position_key}: {exc}")
 
             if pending_closed_resolver:
                 try:

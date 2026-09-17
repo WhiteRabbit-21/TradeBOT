@@ -1,10 +1,17 @@
 import unittest
+from unittest.mock import AsyncMock, patch
 from datetime import date
 
 import trade_notifier as notifier
 
 
 class WeeklyReportTests(unittest.TestCase):
+    def test_timestamp_ms_accepts_persisted_iso_time(self):
+        self.assertEqual(
+            notifier._timestamp_ms("2026-09-17T09:34:03+00:00", 0),
+            1789637643000,
+        )
+
     def test_cashflow_classifier_excludes_trading_results(self):
         self.assertEqual(
             notifier._income_cashflow_kind(
@@ -53,6 +60,39 @@ class WeeklyReportTests(unittest.TestCase):
         self.assertIn("Результат: +2.5000 USDT", message)
         self.assertIn("фактичний realized PnL BingX", message)
         self.assertNotIn("SHADOW", message)
+
+    def test_fill_rows_support_list_and_nested_responses(self):
+        rows = [{"symbol": "SYN-USDT", "realizedPnl": "1.25"}]
+        self.assertEqual(notifier._extract_fill_rows({"data": rows}), rows)
+        self.assertEqual(notifier._extract_fill_rows({"data": {"rows": rows}}), rows)
+
+
+class PnlFallbackTests(unittest.IsolatedAsyncioTestCase):
+    async def test_income_fee_plus_fill_realized_pnl_produces_net_result(self):
+        fee_only = {
+            "pnl": -0.12,
+            "count": 1,
+            "rows": [{"incomeType": "TRADING_FEE", "income": "-0.12"}],
+            "has_real_pnl_signal": False,
+        }
+        with patch.object(
+            notifier, "_get_position_income_summary", new=AsyncMock(return_value=fee_only)
+        ), patch.object(
+            notifier, "_get_fill_realized_pnl", new=AsyncMock(return_value=2.0)
+        ), patch.object(notifier.asyncio, "sleep", new=AsyncMock()):
+            result = await notifier._wait_final_income_summary(
+                symbol="SYN/USDT:USDT",
+                api_key="key",
+                api_secret="secret",
+                log=lambda *_: None,
+                opened_at_ms=1_000,
+                close_ts_ms=2_000,
+                position_side="long",
+            )
+
+        self.assertTrue(result["has_real_pnl_signal"])
+        self.assertEqual(result["realized_source"], "fill_history")
+        self.assertAlmostEqual(result["pnl"], 1.88)
 
 
 if __name__ == "__main__":

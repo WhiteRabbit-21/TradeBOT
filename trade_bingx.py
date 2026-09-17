@@ -3318,6 +3318,45 @@ def execution_strategy_for_position(position_key: str) -> str:
     return str(row.get("strategy") or row.get("style") or "UNKNOWN").upper()
 
 
+def pending_execution_closures_for_pnl() -> dict[str, dict]:
+    """Return recent signal-linked BingX closes that still need a PnL message."""
+    cutoff = datetime.now(timezone.utc) - timedelta(days=2)
+    pending = {}
+    with EXECUTION_STATE_LOCK:
+        for position_key, row in (EXECUTION_STATE.get("positions") or {}).items():
+            if row.get("status") != "closed" or not row.get("signal_key"):
+                continue
+            if row.get("pnl_notified_at"):
+                continue
+            try:
+                closed_at = datetime.fromisoformat(
+                    str(row.get("closed_at") or "").replace("Z", "+00:00")
+                )
+            except ValueError:
+                continue
+            if closed_at < cutoff:
+                continue
+            pending[position_key] = {
+                "symbol": row.get("symbol"),
+                "side": row.get("side"),
+                "size": row.get("qty") or row.get("size") or 0.0,
+                "entry": row.get("actual_entry") or row.get("entry") or 0.0,
+                "opened_at": row.get("opened_at"),
+            }
+    return pending
+
+
+def mark_execution_closure_pnl_notified(position_key: str, pnl: float) -> None:
+    with EXECUTION_STATE_LOCK:
+        row = (EXECUTION_STATE.get("positions") or {}).get(position_key)
+        if not row:
+            return
+        row["pnl_notified_at"] = _utc_iso()
+        row["realized_pnl_usdt"] = float(pnl)
+        row["updated_at"] = _utc_iso()
+        save_execution_state()
+
+
 def _format_s2_shadow_close(trade: dict, summary: dict) -> str:
     status = "🟢 TP1" if trade["status"] == "tp1_hit" else "🔴 STOP LOSS"
     pf = summary["profit_factor"]
@@ -4608,6 +4647,8 @@ async def main():
                 BINGX_API_KEY,
                 BINGX_API_SECRET,
                 strategy_resolver=execution_strategy_for_position,
+                pending_closed_resolver=pending_execution_closures_for_pnl,
+                closed_notified_callback=mark_execution_closure_pnl_notified,
             )
         )
 

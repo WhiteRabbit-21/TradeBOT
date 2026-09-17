@@ -37,6 +37,18 @@ def _to_float(value: Any, default: float = 0.0) -> float:
         return default
 
 
+def _timestamp_ms(value: Any, default: int) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        pass
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        return int(parsed.timestamp() * 1000)
+    except (TypeError, ValueError):
+        return default
+
+
 def _extract_pos_side(pos: dict) -> str:
     return str(
         pos.get("side")
@@ -371,6 +383,26 @@ def get_swap_income(
     )
 
 
+def get_swap_fill_history(
+    api_key: str,
+    api_secret: str,
+    start_ms: int,
+    end_ms: int,
+):
+    """Return actual BingX fills, including realizedPnl for closing fills."""
+    return bingx_signed_get(
+        "/openApi/swap/v2/trade/allFillOrders",
+        {
+            "tradingUnit": "COIN",
+            "startTs": start_ms,
+            "endTs": end_ms,
+            "currency": "USDT",
+        },
+        api_key,
+        api_secret,
+    )
+
+
 def _extract_income_rows(resp: dict) -> list:
     if not isinstance(resp, dict):
         return []
@@ -386,6 +418,20 @@ def _extract_income_rows(resp: dict) -> list:
             if isinstance(value, list):
                 return value
 
+    return []
+
+
+def _extract_fill_rows(resp: dict) -> list:
+    if not isinstance(resp, dict):
+        return []
+    data = resp.get("data")
+    if isinstance(data, list):
+        return data
+    if isinstance(data, dict):
+        for key in ("rows", "list", "result", "fills"):
+            value = data.get(key)
+            if isinstance(value, list):
+                return value
     return []
 
 
@@ -478,6 +524,50 @@ def _has_real_pnl_signal(rows: list[dict]) -> bool:
             return True
 
     return False
+
+
+async def _get_fill_realized_pnl(
+    symbol: str,
+    api_key: str,
+    api_secret: str,
+    log,
+    opened_at_ms: int,
+    close_ts_ms: int,
+) -> Optional[float]:
+    """Recover realized PnL when BingX income contains only fees/funding."""
+    start_ms = max(0, opened_at_ms - 300_000)
+    end_ms = close_ts_ms + 600_000
+    try:
+        resp = await asyncio.to_thread(
+            get_swap_fill_history,
+            api_key,
+            api_secret,
+            start_ms,
+            end_ms,
+        )
+    except Exception as exc:
+        log("WARNING", f"PNL fill-history request failed for {symbol}: {exc}")
+        return None
+
+    target_symbol = _normalize_symbol_for_compare(symbol)
+    matched = []
+    for row in _extract_fill_rows(resp):
+        row_symbol = _normalize_symbol_for_compare(_extract_income_symbol(row))
+        ts = _extract_income_time(row)
+        if ts and (ts < start_ms or ts > end_ms):
+            continue
+        if row_symbol and row_symbol != target_symbol:
+            continue
+        matched.append(row)
+
+    if not matched:
+        return None
+
+    realized = sum(
+        _to_float(row.get("realizedPnl") or row.get("realisedPnl"), 0.0)
+        for row in matched
+    )
+    return realized if realized != 0.0 else None
 
 
 async def _get_position_income_summary(
@@ -633,8 +723,32 @@ async def _wait_final_income_summary(
 
         last_signature = signature
 
-        if stable_rounds >= 2 and has_real:
+        # Once the income snapshot is stable, either use its realized PnL or
+        # fall back to fill history below. There is no value in waiting two
+        # minutes when BingX is consistently returning fee-only rows.
+        if stable_rounds >= 2:
             break
+
+    # BingX can publish fees first while REALIZED_PNL is absent from the
+    # income response. Fill history is authoritative for executed closes.
+    if best_income_info is None or not best_income_info.get("has_real_pnl_signal"):
+        realized = await _get_fill_realized_pnl(
+            symbol=symbol,
+            api_key=api_key,
+            api_secret=api_secret,
+            log=log,
+            opened_at_ms=opened_at_ms,
+            close_ts_ms=close_ts_ms,
+        )
+        if realized is not None:
+            income_cashflows = float((best_income_info or {}).get("pnl", 0.0))
+            best_income_info = {
+                "pnl": realized + income_cashflows,
+                "count": int((best_income_info or {}).get("count", 0)),
+                "rows": list((best_income_info or {}).get("rows", [])),
+                "has_real_pnl_signal": True,
+                "realized_source": "fill_history",
+            }
 
     return best_income_info
 
@@ -648,6 +762,8 @@ async def pnl_watcher(
     api_secret: str,
     interval: int = 3,
     strategy_resolver=None,
+    pending_closed_resolver=None,
+    closed_notified_callback=None,
 ):
     global LAST_POSITIONS, weekly_pnl, weekly_strategy_pnl, week_start, weekly_start_equity, last_weekly_report_key
 
@@ -692,6 +808,16 @@ async def pnl_watcher(
                 if prev_size > 0 and curr_size == 0:
                     just_closed.append((position_key, prev))
 
+            if pending_closed_resolver:
+                try:
+                    pending = pending_closed_resolver() or {}
+                    already_queued = {key for key, _ in just_closed}
+                    for position_key, row in pending.items():
+                        if position_key not in already_queued:
+                            just_closed.append((position_key, row))
+                except Exception as exc:
+                    log("WARNING", f"PNL pending-close recovery failed: {exc}")
+
             for position_key, prev in just_closed:
                 symbol = str(prev.get("symbol") or position_key.rsplit(":", 1)[0])
                 close_ts_ms = int(time.time() * 1000)
@@ -704,8 +830,9 @@ async def pnl_watcher(
                 qty = float(prev.get("size", 0.0))
                 entry_price = float(prev.get("entry", 0.0))
                 liquidation_price = float(prev.get("liquidation", 0.0))
-                opened_at_ms = int(
-                    prev.get("opened_at", int(time.time() * 1000) - 10 * 60 * 1000)
+                opened_at_ms = _timestamp_ms(
+                    prev.get("opened_at_ms") or prev.get("opened_at"),
+                    int(time.time() * 1000) - 10 * 60 * 1000,
                 )
 
                 log("INFO", f"PNL close detected: {symbol}")
@@ -764,6 +891,11 @@ async def pnl_watcher(
                         "last_report_key": last_weekly_report_key,
                     })
                     _save_weekly_state(state)
+                    if closed_notified_callback:
+                        try:
+                            closed_notified_callback(position_key, pnl)
+                        except Exception as exc:
+                            log("WARNING", f"PNL notified marker failed {position_key}: {exc}")
                     log("INFO", f"PNL notifier sent: {symbol} net_pnl={pnl} qty={qty}")
                 except Exception as e:
                     log("ERROR", f"PNL send failed for {symbol}: {e}")

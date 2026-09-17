@@ -1,11 +1,34 @@
 import unittest
 from unittest.mock import AsyncMock, patch
-from datetime import date
+from datetime import date, datetime
+import json
+import tempfile
 
 import trade_notifier as notifier
 
 
 class WeeklyReportTests(unittest.TestCase):
+    def test_real_pnl_statistics_group_days_months_and_year(self):
+        rows = [
+            {"trade_id": "a", "pnl": 3.0, "closed_at": "2026-09-17T08:00:00+00:00"},
+            {"trade_id": "b", "pnl": -1.0, "closed_at": "2026-09-16T08:00:00+00:00"},
+        ]
+        with tempfile.TemporaryDirectory() as tmp, patch.object(
+            notifier, "PNL_TRADES_FILE", tmp + "/pnl.json"
+        ):
+            with open(notifier.PNL_TRADES_FILE, "w", encoding="utf-8") as handle:
+                json.dump(rows, handle)
+            stats = notifier.build_pnl_statistics_payload(
+                datetime.fromisoformat("2026-09-17T12:00:00+03:00")
+            )
+
+        self.assertEqual(len(stats["days"]), 7)
+        self.assertEqual(len(stats["weeks"]), 8)
+        self.assertEqual(len(stats["months"]), 6)
+        self.assertEqual(stats["days"][-1]["pnl"], 3.0)
+        self.assertEqual(stats["days"][-2]["pnl"], -1.0)
+        self.assertEqual(stats["year"]["pnl"], 2.0)
+
     def test_timestamp_ms_accepts_persisted_iso_time(self):
         self.assertEqual(
             notifier._timestamp_ms("2026-09-17T09:34:03+00:00", 0),

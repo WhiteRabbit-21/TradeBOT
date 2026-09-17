@@ -5,8 +5,9 @@ import time
 import hmac
 import hashlib
 import urllib.parse
+import threading
 from typing import Any, Dict, Optional
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 import requests
@@ -26,6 +27,8 @@ _STATE_DIR = (
     os.getenv("DATA_DIR") or os.getenv("RAILWAY_VOLUME_MOUNT_PATH") or "/data"
 ).rstrip("/\\")
 WEEKLY_STATE_FILE = os.path.join(_STATE_DIR, "weekly_report_state.json")
+PNL_TRADES_FILE = os.path.join(_STATE_DIR, "realized_pnl_trades.json")
+PNL_TRADES_LOCK = threading.RLock()
 
 
 def _to_float(value: Any, default: float = 0.0) -> float:
@@ -153,6 +156,101 @@ def _save_weekly_state(state: dict) -> None:
     except OSError:
         # Reporting persistence must never stop position protection/notifying.
         return
+
+
+def _load_pnl_trades() -> list[dict]:
+    with PNL_TRADES_LOCK:
+        try:
+            with open(PNL_TRADES_FILE, "r", encoding="utf-8") as f:
+                rows = json.load(f)
+            return [row for row in rows if isinstance(row, dict)] if isinstance(rows, list) else []
+        except (FileNotFoundError, ValueError, OSError):
+            return []
+
+
+def _record_pnl_trade(row: dict) -> None:
+    """Persist one actual BingX close once, across restarts and retries."""
+    with PNL_TRADES_LOCK:
+        rows = _load_pnl_trades()
+        trade_id = str(row.get("trade_id") or "")
+        if trade_id and any(str(item.get("trade_id") or "") == trade_id for item in rows):
+            return
+        rows.append(dict(row))
+        os.makedirs(_STATE_DIR, exist_ok=True)
+        tmp_path = PNL_TRADES_FILE + ".tmp"
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            json.dump(rows, f, ensure_ascii=False, indent=2)
+        os.replace(tmp_path, PNL_TRADES_FILE)
+
+
+def _period_summary(rows: list[dict]) -> dict:
+    pnl = round(sum(_to_float(row.get("pnl")) for row in rows), 8)
+    wins = sum(_to_float(row.get("pnl")) > 0 for row in rows)
+    losses = sum(_to_float(row.get("pnl")) < 0 for row in rows)
+    return {
+        "trades": len(rows),
+        "wins": wins,
+        "losses": losses,
+        "flat": len(rows) - wins - losses,
+        "pnl": pnl,
+        "profitable": pnl > 0,
+    }
+
+
+def _shift_month(year: int, month: int, delta: int) -> tuple[int, int]:
+    index = year * 12 + (month - 1) + delta
+    return index // 12, index % 12 + 1
+
+
+def build_pnl_statistics_payload(now: Optional[datetime] = None) -> dict:
+    """Calendar PnL summaries based only on persisted real BingX closes."""
+    now_local = (now or datetime.now(KYIV_TZ)).astimezone(KYIV_TZ)
+    parsed = []
+    for row in _load_pnl_trades():
+        try:
+            closed = datetime.fromisoformat(str(row.get("closed_at") or "").replace("Z", "+00:00"))
+            if closed.tzinfo is None:
+                closed = closed.replace(tzinfo=ZoneInfo("UTC"))
+        except ValueError:
+            continue
+        parsed.append((closed.astimezone(KYIV_TZ), row))
+
+    days = []
+    today = now_local.date()
+    for offset in range(6, -1, -1):
+        day = today - timedelta(days=offset)
+        summary = _period_summary([row for closed, row in parsed if closed.date() == day])
+        days.append({"label": day.strftime("%d.%m"), "date": day.isoformat(), **summary})
+
+    weeks = []
+    current_monday = today - timedelta(days=today.weekday())
+    for offset in range(7, -1, -1):
+        start = current_monday - timedelta(weeks=offset)
+        end = start + timedelta(days=6)
+        summary = _period_summary([row for closed, row in parsed if start <= closed.date() <= end])
+        weeks.append({
+            "label": f"{start.strftime('%d.%m')}–{end.strftime('%d.%m')}",
+            "start": start.isoformat(), "end": end.isoformat(), **summary,
+        })
+
+    months = []
+    for delta in range(-5, 1):
+        year, month = _shift_month(now_local.year, now_local.month, delta)
+        summary = _period_summary([
+            row for closed, row in parsed if closed.year == year and closed.month == month
+        ])
+        months.append({"label": f"{month:02d}.{year}", "year": year, "month": month, **summary})
+
+    year_start = today - timedelta(days=364)
+    year_rows = [row for closed, row in parsed if year_start <= closed.date() <= today]
+    return {
+        "days": days,
+        "weeks": weeks,
+        "months": months,
+        "year": {"label": f"{year_start.strftime('%d.%m.%Y')}–{today.strftime('%d.%m.%Y')}", **_period_summary(year_rows)},
+        "total_recorded": len(parsed),
+        "generated_at": now_local.isoformat(),
+    }
 
 
 def _income_cashflow_kind(row: dict) -> Optional[str]:
@@ -900,6 +998,16 @@ async def pnl_watcher(
                         "last_report_key": last_weekly_report_key,
                     })
                     _save_weekly_state(state)
+                    _record_pnl_trade({
+                        "trade_id": close_key,
+                        "position_key": position_key,
+                        "symbol": symbol,
+                        "side": side,
+                        "strategy": strategy,
+                        "qty": qty,
+                        "pnl": pnl,
+                        "closed_at": datetime.now(timezone.utc).isoformat(),
+                    })
                     if closed_notified_callback:
                         try:
                             closed_notified_callback(position_key, pnl)

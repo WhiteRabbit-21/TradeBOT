@@ -16,7 +16,7 @@ from zoneinfo import ZoneInfo
 
 import requests
 from typing import Optional, Any
-from trade_notifier import pnl_watcher
+from trade_notifier import pnl_watcher, build_pnl_statistics_payload
 from asset_universe import classify_non_crypto_asset
 from trade_rules import (
     ENTRY_RULES, SHADOW_S1_RULES, SHADOW_S2_RULES, SWING_RULES,
@@ -419,7 +419,8 @@ def executed_open_positions_payload() -> dict:
 
 class _PositionStatusHandler(BaseHTTPRequestHandler):
     def do_GET(self):
-        if self.path.split("?", 1)[0] != "/positions":
+        path = self.path.split("?", 1)[0]
+        if path not in {"/positions", "/pnl-stats"}:
             self.send_error(404)
             return
         supplied = self.headers.get("Authorization", "")
@@ -428,7 +429,12 @@ class _PositionStatusHandler(BaseHTTPRequestHandler):
         ):
             self.send_error(401)
             return
-        body = json.dumps(executed_open_positions_payload(), ensure_ascii=False).encode("utf-8")
+        payload = (
+            executed_open_positions_payload()
+            if path == "/positions"
+            else build_pnl_statistics_payload()
+        )
+        body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         self.send_response(200)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))

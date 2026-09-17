@@ -999,6 +999,41 @@ class ExecutionSynchronizationTests(unittest.TestCase):
         self.assertEqual(row["origin"], "unmatched_exchange_position")
         self.assertEqual(row["qty"], 3.0)
 
+    def test_position_api_returns_only_signal_linked_open_positions(self):
+        self.bot.EXECUTION_STATE = {
+            "signals": {"tg:1:10": {"status": "open_protected"}},
+            "positions": {
+                "LTC/USDT:USDT:long": {
+                    "position_key": "LTC/USDT:USDT:long",
+                    "signal_key": "tg:1:10",
+                    "symbol": "LTC/USDT:USDT",
+                    "side": "long",
+                    "status": "open",
+                    "strategy": "A3",
+                    "risk_pct": 0.6,
+                },
+                "DASH/USDT:USDT:long": {
+                    "position_key": "DASH/USDT:USDT:long",
+                    "signal_key": None,
+                    "symbol": "DASH/USDT:USDT",
+                    "side": "long",
+                    "status": "open",
+                    "origin": "unmatched_exchange_position",
+                },
+                "OLD/USDT:USDT:long": {
+                    "position_key": "OLD/USDT:USDT:long",
+                    "signal_key": "tg:1:9",
+                    "symbol": "OLD/USDT:USDT",
+                    "side": "long",
+                    "status": "closed",
+                },
+            },
+        }
+        payload = self.bot.executed_open_positions_payload()
+        self.assertEqual(payload["count"], 1)
+        self.assertEqual(payload["positions"][0]["symbol"], "LTC/USDT:USDT")
+        self.assertEqual(payload["positions"][0]["execution_status"], "open_protected")
+
 
 class NotifierHedgeTests(unittest.IsolatedAsyncioTestCase):
     async def test_notifier_tracks_both_sides_of_same_symbol(self):

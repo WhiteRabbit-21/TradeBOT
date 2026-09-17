@@ -8,6 +8,7 @@ import hashlib
 import hmac
 import math
 import threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from decimal import Decimal
 from urllib.parse import urlencode
 from datetime import datetime, timezone
@@ -139,6 +140,8 @@ EXECUTION_STATE_FILE = os.path.join(STATE_DIR, "execution_state.json")
 EXECUTION_STATE = {"signals": {}, "positions": {}}
 EXECUTION_STATE_LOCK = threading.RLock()
 EXECUTION_SYNC_SEC = max(10.0, float(os.getenv("EXECUTION_SYNC_SEC", "30")))
+POSITION_API_TOKEN = os.getenv("POSITION_API_TOKEN", "").strip()
+POSITION_API_PORT = int(os.getenv("POSITION_API_PORT", "8080"))
 SHADOW_S2_FILE = os.path.join(STATE_DIR, "shadow_s2.json")
 SHADOW_S2 = ShadowBook(SHADOW_S2_FILE)
 SHADOW_S1_FILE = os.path.join(STATE_DIR, "shadow_s1.json")
@@ -392,6 +395,57 @@ def reconcile_execution_state_sync() -> dict:
                 unmatched.append(position_key)
         save_execution_state()
     return {"live": len(live), "closed": closed, "unmatched": unmatched}
+
+
+def executed_open_positions_payload() -> dict:
+    """Expose only signal-linked positions confirmed open by BingX sync."""
+    with EXECUTION_STATE_LOCK:
+        rows = []
+        for position in EXECUTION_STATE.get("positions", {}).values():
+            if position.get("status") != "open" or not position.get("signal_key"):
+                continue
+            signal = EXECUTION_STATE.get("signals", {}).get(position["signal_key"]) or {}
+            rows.append({
+                key: position.get(key)
+                for key in (
+                    "position_key", "symbol", "base", "side", "qty", "entry",
+                    "actual_entry", "risk_pct", "risk_budget", "sl", "tp1", "tp2",
+                    "tp3", "style", "strategy", "opened_at", "last_seen_at",
+                )
+            } | {"execution_status": signal.get("status")})
+    rows.sort(key=lambda row: str(row.get("opened_at") or ""))
+    return {"positions": rows, "count": len(rows), "generated_at": _utc_iso()}
+
+
+class _PositionStatusHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        if self.path.split("?", 1)[0] != "/positions":
+            self.send_error(404)
+            return
+        supplied = self.headers.get("Authorization", "")
+        if not POSITION_API_TOKEN or not hmac.compare_digest(
+            supplied, f"Bearer {POSITION_API_TOKEN}"
+        ):
+            self.send_error(401)
+            return
+        body = json.dumps(executed_open_positions_payload(), ensure_ascii=False).encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, _format, *_args):
+        return
+
+
+def start_position_status_server() -> None:
+    if not POSITION_API_TOKEN:
+        log("WARNING", "POSITION API disabled: POSITION_API_TOKEN is missing")
+        return
+    server = ThreadingHTTPServer(("0.0.0.0", POSITION_API_PORT), _PositionStatusHandler)
+    threading.Thread(target=server.serve_forever, daemon=True, name="position-api").start()
+    log("INFO", f"POSITION API listening on port {POSITION_API_PORT}")
 
 
 def portfolio_entry_block_reason(
@@ -4500,6 +4554,7 @@ async def main():
     load_sltp()
     load_order_ids()
     load_execution_state()
+    start_position_status_server()
     await app.start()
 
     try:

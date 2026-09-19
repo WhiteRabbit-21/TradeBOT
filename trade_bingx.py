@@ -464,7 +464,7 @@ def portfolio_entry_block_reason(
     risk_pct: float,
     positions: Optional[dict[str, dict]] = None,
 ) -> Optional[str]:
-    """Enforce one coin, four slots and 3% aggregate open risk."""
+    """Prevent an exchange-merged duplicate; do not cap slots or open risk."""
     rows = positions if positions is not None else EXECUTION_STATE.get("positions", {})
     open_rows = [row for row in rows.values() if row.get("status") == "open"]
     wanted_base = str(symbol or "").split("/")[0].split(":")[0].upper()
@@ -472,16 +472,6 @@ def portfolio_entry_block_reason(
         row_base = str(row.get("symbol") or row.get("base") or "").split("/")[0].split(":")[0].upper()
         if wanted_base and row_base == wanted_base:
             return f"position for {wanted_base} already exists; one position per coin"
-    if len(open_rows) >= ENTRY_RULES.max_concurrent_positions:
-        return f"all {ENTRY_RULES.max_concurrent_positions} strategy slots are occupied"
-    # Unknown legacy/exchange positions receive the largest module risk. This
-    # fails safely instead of understating aggregate portfolio exposure.
-    current_risk = sum(float(row.get("risk_pct") or FIXED_RISK_PCT) for row in open_rows)
-    if current_risk + float(risk_pct) > ENTRY_RULES.max_open_risk_pct + 1e-9:
-        return (
-            f"open risk would be {current_risk + float(risk_pct):.2f}% "
-            f"above the {ENTRY_RULES.max_open_risk_pct:.2f}% cap"
-        )
     return None
 
 
@@ -759,9 +749,6 @@ def set_leverage_sync(symbol: str, lev: int, side: str):
 
     pos_side = "LONG" if side == "long" else "SHORT"
 
-    # 🔥 важливо
-    exchange.set_margin_mode("cross", symbol)
-
     # 🔥 пробуємо різні варіанти (бо BingX кривий)
     variants = [
         {"positionSide": pos_side},
@@ -955,10 +942,7 @@ async def close_position_full(base: str, position_side: Optional[str] = None):
     return await asyncio.to_thread(close_position_full_sync, base, position_side)
 
 def set_margin_mode_sync(symbol: str):
-    try:
-        exchange.set_margin_mode("cross", symbol)
-    except Exception:
-        pass
+    exchange.set_margin_mode(ENTRY_RULES.margin_mode, symbol)
 
 async def set_margin_mode(symbol: str):
     await asyncio.to_thread(set_margin_mode_sync, symbol)
@@ -1119,7 +1103,7 @@ def _extract_position_liquidation(pos: Optional[dict]) -> Optional[float]:
         return None
 
 def estimate_liquidation_price(entry: float, side: str, leverage: int) -> Optional[float]:
-    """Fallback estimate; the exchange value is preferred in cross-margin mode."""
+    """Fallback estimate; the exchange-reported liquidation price is preferred."""
     try:
         entry_f = float(entry)
         leverage_i = int(leverage)
@@ -3982,9 +3966,15 @@ async def handle_ai_command(cmd: dict):
             await set_margin_mode(symbol)
             await set_leverage(symbol, int(lev), side)
             await asyncio.sleep(1.0)
-            log("INFO", "LEVERAGE SET OK")
+            log(
+                "INFO",
+                f"MARGIN/LEVERAGE SET OK mode={ENTRY_RULES.margin_mode} leverage={int(lev)}",
+            )
         except Exception as e:
-            log("ERROR", f"LEVERAGE FAILED: {e}")
+            reason = f"cannot confirm {ENTRY_RULES.margin_mode} margin/leverage: {e}"
+            log("ERROR", f"SAFE SKIP OPEN {base_clean}: {reason}")
+            update_execution_signal(signal_key, "skipped", reason=reason)
+            return
 
         log("INFO", f"TRY OPEN {symbol} side={side} qty={qty}")
 
@@ -4784,8 +4774,8 @@ async def main():
             f"s2_shadow=P(TP1)>={SHADOW_S2_RULES.probability_min_inclusive:g}%@16:30-18:30_Kyiv "
             f"additions={ENTRY_RULES.allow_position_additions} "
             f"same_side_reentry={ENTRY_RULES.allow_same_symbol_side_reentry} "
-            f"max_positions={ENTRY_RULES.max_concurrent_positions} "
-            f"max_open_risk={ENTRY_RULES.max_open_risk_pct:g}% "
+            "max_positions=unlimited max_open_risk=unlimited "
+            f"margin_mode={ENTRY_RULES.margin_mode} "
             f"execution_sync={EXECUTION_SYNC_SEC:g}s "
             f"blocked_kyiv={ENTRY_BLOCK_START_HOUR_KYIV:02d}:00-"
             f"{ENTRY_BLOCK_END_HOUR_KYIV:02d}:00",

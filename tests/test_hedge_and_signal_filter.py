@@ -51,6 +51,8 @@ class _BingX:
         self.markets = {}
         self.refreshed_markets = None
         self.load_markets_calls = []
+        self.margin_mode_calls = []
+        self.leverage_calls = []
 
     def load_markets(self, reload=False):
         self.load_markets_calls.append(bool(reload))
@@ -69,6 +71,12 @@ class _BingX:
 
     def cancel_order(self, order_id, _symbol):
         self.canceled.append(str(order_id))
+
+    def set_margin_mode(self, mode, symbol):
+        self.margin_mode_calls.append((mode, symbol))
+
+    def set_leverage(self, leverage, symbol, params):
+        self.leverage_calls.append((leverage, symbol, params))
 
     @staticmethod
     def amount_to_precision(_symbol, qty):
@@ -432,17 +440,21 @@ TF: 1H / 15M / 5M
         self.assertAlmostEqual(wide_stop["expected_loss_at_sl"], 10.0, places=8)
         self.assertGreater(tight_stop["notional"], wide_stop["notional"])
 
-    def test_live_entry_rules_are_explicit_and_capped(self):
+    def test_live_entry_rules_are_explicit_and_uncapped(self):
         rules = self.bot.ENTRY_RULES
-        self.assertEqual(rules.version, "rr1-3-intraday-weekdays-v1")
+        self.assertEqual(
+            rules.version,
+            "rr1-3-intraday-weekdays-unlimited-isolated-v2",
+        )
         self.assertEqual(rules.allowed_styles, ("INTRADAY",))
         self.assertEqual(rules.allowed_side, "long")
         self.assertTrue(rules.ordinary_crypto_only)
         self.assertEqual(rules.risk_per_trade_pct, 1.0)
         self.assertFalse(rules.allow_position_additions)
         self.assertFalse(rules.allow_same_symbol_side_reentry)
-        self.assertEqual(rules.max_concurrent_positions, 4)
-        self.assertEqual(rules.max_open_risk_pct, 3.0)
+        self.assertIsNone(rules.max_concurrent_positions)
+        self.assertIsNone(rules.max_open_risk_pct)
+        self.assertEqual(rules.margin_mode, "isolated")
         self.assertEqual(self.bot.FIXED_RISK_PCT, 1.0)
         self.assertEqual(self.bot.ALLOWED_SIGNAL_STYLES, {"INTRADAY"})
         self.assertEqual(self.bot.TRACKED_SIGNAL_STYLES, {"SCALP", "INTRADAY"})
@@ -461,7 +473,7 @@ TF: 1H / 15M / 5M
             )
         )
 
-    def test_portfolio_gate_enforces_coin_slots_and_open_risk(self):
+    def test_portfolio_gate_only_blocks_duplicate_coin(self):
         rows = {
             "BTC/USDT:USDT:long": {"status": "open", "symbol": "BTC/USDT:USDT", "risk_pct": 0.7},
             "ETH/USDT:USDT:long": {"status": "open", "symbol": "ETH/USDT:USDT", "risk_pct": 0.7},
@@ -472,22 +484,35 @@ TF: 1H / 15M / 5M
         self.assertIsNone(
             self.bot.portfolio_entry_block_reason("SOL/USDT:USDT", 0.6, rows)
         )
-        full = {
+        many_open = {
             **rows,
             "SOL/USDT:USDT:long": {"status": "open", "symbol": "SOL/USDT:USDT", "risk_pct": 0.6},
             "XRP/USDT:USDT:long": {"status": "open", "symbol": "XRP/USDT:USDT", "risk_pct": 0.5},
         }
-        self.assertIn(
-            "slots", self.bot.portfolio_entry_block_reason("ADA/USDT:USDT", 0.5, full)
+        self.assertIsNone(
+            self.bot.portfolio_entry_block_reason("ADA/USDT:USDT", 1.0, many_open)
         )
         risk_heavy = {
             key: {**row, "risk_pct": 1.0} for key, row in list(rows.items())
         }
         risk_heavy["SOL"] = {"status": "open", "symbol": "SOL/USDT:USDT", "risk_pct": 0.7}
-        self.assertIn(
-            "open risk",
-            self.bot.portfolio_entry_block_reason("ADA/USDT:USDT", 0.5, risk_heavy),
+        self.assertIsNone(
+            self.bot.portfolio_entry_block_reason("ADA/USDT:USDT", 1.0, risk_heavy),
         )
+
+    def test_margin_and_leverage_are_set_in_isolated_mode(self):
+        exchange = self.bot.exchange
+        exchange.margin_mode_calls.clear()
+        exchange.leverage_calls.clear()
+
+        self.bot.set_margin_mode_sync("BTC/USDT:USDT")
+        self.bot.set_leverage_sync("BTC/USDT:USDT", 5, "long")
+
+        self.assertEqual(
+            exchange.margin_mode_calls,
+            [("isolated", "BTC/USDT:USDT")],
+        )
+        self.assertEqual(exchange.leverage_calls[0][0:2], (5, "BTC/USDT:USDT"))
 
     def test_rule_one_swing_rules_are_retained_for_management_and_statistics(self):
         rules = self.bot.SWING_RULES

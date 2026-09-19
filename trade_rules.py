@@ -12,15 +12,16 @@ from zoneinfo import ZoneInfo
 class LiveEntryRules:
     """Code-owned portfolio policy for the live RR1-3 weekday system."""
 
-    version: str = "rr1-3-intraday-weekdays-v1"
+    version: str = "rr1-3-intraday-weekdays-unlimited-isolated-v2"
     allowed_styles: tuple[str, ...] = ("INTRADAY",)
     allowed_side: str = "long"
     ordinary_crypto_only: bool = True
     risk_per_trade_pct: float = 1.0
     allow_position_additions: bool = False
     allow_same_symbol_side_reentry: bool = False
-    max_concurrent_positions: int = 4
-    max_open_risk_pct: float = 3.0
+    max_concurrent_positions: int | None = None
+    max_open_risk_pct: float | None = None
+    margin_mode: str = "isolated"
 
     def validate(self) -> None:
         if self.allowed_styles != ("INTRADAY",):
@@ -33,10 +34,12 @@ class LiveEntryRules:
             raise ValueError("position additions would exceed the fixed entry risk")
         if self.allow_same_symbol_side_reentry:
             raise ValueError("same-side re-entry would aggregate position risk")
-        if self.max_concurrent_positions != 4:
-            raise ValueError("live system must use four concurrent slots")
-        if self.max_open_risk_pct != 3.0:
-            raise ValueError("live system must cap open risk at 3%")
+        if self.max_concurrent_positions is not None:
+            raise ValueError("live system must not cap the number of concurrent positions")
+        if self.max_open_risk_pct is not None:
+            raise ValueError("live system must not cap aggregate open risk")
+        if self.margin_mode != "isolated":
+            raise ValueError("new live entries must use isolated margin")
 
 
 @dataclass(frozen=True)

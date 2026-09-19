@@ -14,7 +14,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
-from trade_rules import SHADOW_S1_RULES, SHADOW_S2_RULES
+from trade_rules import SHADOW_S1_RULES, SHADOW_S2_RULES, StrategyDecision
 
 _LOCK = threading.RLock()
 
@@ -275,4 +275,147 @@ class ShadowS1Book(ShadowBook):
                 "net_pct": (float(self.state["balance"]) / 100.0 - 1) * 100,
                 "profit_factor": gross_win / gross_loss if gross_loss else None,
                 "open": len(self.state["positions"]), **statuses,
+            }
+
+
+class LegacyCombinedShadowBook(ShadowBook):
+    """Observation-only book for the former A1/A4/A5/A3 live system."""
+
+    @staticmethod
+    def _empty() -> dict:
+        return {"version": 1, "balance": 1000.0, "positions": {}, "trades": []}
+
+    def register(
+        self, *, signal_key: str, base: str, entry: float, sl: float,
+        tp1: float, tp2: Optional[float], tp3: Optional[float],
+        decision: StrategyDecision, opened_at: Optional[str] = None,
+    ) -> bool:
+        entry, sl, tp1 = float(entry), float(sl), float(tp1)
+        if not (sl < entry < tp1):
+            raise ValueError("legacy LONG levels must satisfy SL < entry < TP1")
+        partial = bool(decision.live_partial_exit_ready)
+        if partial:
+            if tp2 is None or tp3 is None:
+                raise ValueError(f"{decision.rule_id} shadow needs TP2 and TP3")
+            tp2, tp3 = float(tp2), float(tp3)
+            if not (tp1 <= tp2 <= tp3):
+                raise ValueError("legacy partial targets must satisfy TP1 <= TP2 <= TP3")
+        else:
+            tp2 = tp3 = tp1
+
+        with _LOCK:
+            if signal_key in self.state["positions"] or any(
+                row.get("signal_key") == signal_key for row in self.state["trades"]
+            ):
+                return False
+            balance = float(self.state["balance"])
+            risk_distance = entry - sl
+            self.state["positions"][signal_key] = {
+                "signal_key": signal_key,
+                "strategy": decision.rule_id,
+                "mode": "shadow",
+                "base": str(base).upper(),
+                "entry": entry,
+                "sl": sl,
+                "tp1": tp1,
+                "tp2": tp2,
+                "tp3": tp3,
+                "target_split": list(decision.target_split),
+                "breakeven_buffer_r": float(decision.breakeven_buffer_r),
+                "partial": partial,
+                "be_sl": entry - float(decision.breakeven_buffer_r) * risk_distance,
+                "risk_pct": float(decision.risk_pct),
+                "risk_amount": balance * float(decision.risk_pct) / 100.0,
+                "stage": 0,
+                "realized_r": 0.0,
+                "opened_at": opened_at or datetime.now(timezone.utc).isoformat(),
+            }
+            self._save()
+            return True
+
+    def observe(self, signal_key: str, price: float, observed_at: Optional[str] = None) -> Optional[dict]:
+        with _LOCK:
+            position = self.state["positions"].get(signal_key)
+            if not position:
+                return None
+            price = float(price)
+            risk_distance = float(position["entry"]) - float(position["sl"])
+            stage = int(position.get("stage", 0))
+            outcome = None
+
+            if not position.get("partial"):
+                if price <= float(position["sl"]):
+                    position["realized_r"] = -1.0
+                    self.state["balance"] += float(position["risk_amount"]) * -1.0
+                    outcome = "sl_hit"
+                elif price >= float(position["tp1"]):
+                    target_r = (float(position["tp1"]) - float(position["entry"])) / risk_distance
+                    position["realized_r"] = target_r
+                    self.state["balance"] += float(position["risk_amount"]) * target_r
+                    outcome = "tp1_hit"
+            else:
+                split = tuple(float(value) for value in position["target_split"])
+                protective_sl = float(position["sl"]) if stage == 0 else float(position["be_sl"])
+                if price <= protective_sl:
+                    remaining = 1.0 - sum(split[:stage])
+                    stop_r = -1.0 if stage == 0 else -float(position["breakeven_buffer_r"])
+                    delta_r = remaining * stop_r
+                    position["realized_r"] += delta_r
+                    self.state["balance"] += float(position["risk_amount"]) * delta_r
+                    outcome = "sl_hit" if stage == 0 else "breakeven_exit"
+                else:
+                    for index, target_name in enumerate(("tp1", "tp2", "tp3"), start=1):
+                        if stage >= index or price < float(position[target_name]):
+                            continue
+                        target_r = (float(position[target_name]) - float(position["entry"])) / risk_distance
+                        delta_r = split[index - 1] * target_r
+                        position["realized_r"] += delta_r
+                        self.state["balance"] += float(position["risk_amount"]) * delta_r
+                        position["stage"] = index
+                        stage = index
+                    if stage == 3:
+                        outcome = "tp3_hit"
+
+            if not outcome:
+                self._save()
+                return None
+
+            stop_fraction = risk_distance / float(position["entry"])
+            cost_r = 0.0014 / stop_fraction
+            self.state["balance"] -= float(position["risk_amount"]) * cost_r
+            net_r = float(position["realized_r"]) - cost_r
+            trade = {
+                **position,
+                "status": outcome,
+                "exit_price": price,
+                "closed_at": observed_at or datetime.now(timezone.utc).isoformat(),
+                "gross_r": float(position["realized_r"]),
+                "cost_r": cost_r,
+                "net_r": net_r,
+                "pnl_balance": float(position["risk_amount"]) * net_r,
+                "balance_after": float(self.state["balance"]),
+            }
+            self.state["trades"].append(trade)
+            del self.state["positions"][signal_key]
+            self._save()
+            return dict(trade)
+
+    def summary(self) -> dict:
+        with _LOCK:
+            trades = self.state["trades"]
+            wins = sum(float(row.get("net_r", 0)) > 0 for row in trades)
+            losses = sum(float(row.get("net_r", 0)) < 0 for row in trades)
+            gross_win = sum(max(float(row.get("net_r", 0)), 0) for row in trades)
+            gross_loss = -sum(min(float(row.get("net_r", 0)), 0) for row in trades)
+            by_rule = {
+                rule: sum(row.get("strategy") == rule for row in trades)
+                for rule in ("A1", "A4", "A5", "A3")
+            }
+            return {
+                "trades": len(trades), "wins": wins, "losses": losses,
+                "win_rate_pct": 100 * wins / len(trades) if trades else None,
+                "balance": float(self.state["balance"]),
+                "net_pct": (float(self.state["balance"]) / 1000.0 - 1) * 100,
+                "profit_factor": gross_win / gross_loss if gross_loss else None,
+                "open": len(self.state["positions"]), "by_rule": by_rule,
             }

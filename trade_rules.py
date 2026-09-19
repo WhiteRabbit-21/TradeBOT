@@ -10,21 +10,21 @@ from zoneinfo import ZoneInfo
 
 @dataclass(frozen=True)
 class LiveEntryRules:
-    """Code-owned portfolio policy for the combined A1/A4/A5/A3 system."""
+    """Code-owned portfolio policy for the live RR1-3 weekday system."""
 
-    version: str = "combined-a1-a4-a5-a3-v1"
-    allowed_styles: tuple[str, ...] = ("SCALP", "INTRADAY")
+    version: str = "rr1-3-intraday-weekdays-v1"
+    allowed_styles: tuple[str, ...] = ("INTRADAY",)
     allowed_side: str = "long"
     ordinary_crypto_only: bool = True
-    risk_per_trade_pct: float = 0.70  # conservative fallback / largest module risk
+    risk_per_trade_pct: float = 1.0
     allow_position_additions: bool = False
     allow_same_symbol_side_reentry: bool = False
     max_concurrent_positions: int = 4
     max_open_risk_pct: float = 3.0
 
     def validate(self) -> None:
-        if self.allowed_styles != ("SCALP", "INTRADAY"):
-            raise ValueError("live entry policy must remain SCALP/INTRADAY")
+        if self.allowed_styles != ("INTRADAY",):
+            raise ValueError("live entry policy must remain INTRADAY-only")
         if self.allowed_side != "long":
             raise ValueError("live entry policy must remain LONG-only")
         if not (0 < self.risk_per_trade_pct <= 10):
@@ -34,9 +34,9 @@ class LiveEntryRules:
         if self.allow_same_symbol_side_reentry:
             raise ValueError("same-side re-entry would aggregate position risk")
         if self.max_concurrent_positions != 4:
-            raise ValueError("combined system must use four concurrent slots")
+            raise ValueError("live system must use four concurrent slots")
         if self.max_open_risk_pct != 3.0:
-            raise ValueError("combined system must cap open risk at 3%")
+            raise ValueError("live system must cap open risk at 3%")
 
 
 @dataclass(frozen=True)
@@ -52,6 +52,7 @@ A1 = StrategyDecision("A1", 0.70, (1.0, 0.0, 0.0), False)
 A4 = StrategyDecision("A4", 0.70, (1.0, 0.0, 0.0), False)
 A5 = StrategyDecision("A5", 0.50, (1.0, 0.0, 0.0), False)
 A3 = StrategyDecision("A3", 0.60, (0.40, 0.30, 0.30), True, 0.05)
+RR1_3 = StrategyDecision("RR1_3", 1.0, (1.0, 0.0, 0.0), False)
 KYIV_TZ = ZoneInfo("Europe/Kyiv")
 
 
@@ -79,12 +80,42 @@ def select_strategy(
     *, style: str, side: str, signal_text: str, rr1: float,
     stop_distance_pct: float, now: Optional[datetime] = None,
 ) -> tuple[Optional[StrategyDecision], Optional[str]]:
-    """Select exactly one module in priority order A1 > A4 > A5 > A3."""
+    """Select the only live setup: weekday LONG INTRADAY with 1<=RR1<=3."""
     normalized_style = str(style or "").strip().upper()
     if str(side or "").strip().lower() != "long":
-        return None, "combined strategy allows LONG only"
+        return None, "live RR1-3 strategy allows LONG only"
     if normalized_style not in ENTRY_RULES.allowed_styles:
-        return None, "combined strategy allows SCALP or INTRADAY only"
+        return None, "live RR1-3 strategy allows INTRADAY only"
+    try:
+        rr = float(rr1)
+        stop_pct = float(stop_distance_pct)
+    except (TypeError, ValueError):
+        return None, "signal Entry, SL and TP1 are required"
+    if rr <= 0 or stop_pct <= 0:
+        return None, "signal RR1 and stop distance must be positive"
+
+    current = now or datetime.now(KYIV_TZ)
+    current = current.replace(tzinfo=KYIV_TZ) if current.tzinfo is None else current.astimezone(KYIV_TZ)
+    minute = current.hour * 60 + current.minute
+    if current.weekday() >= 5:
+        return None, "live RR1-3 strategy trades Monday-Friday only"
+    if not (10 * 60 <= minute <= 16 * 60 + 30):
+        return None, "live RR1-3 strategy trades 10:00-16:30 Kyiv only"
+    if not (1.0 <= rr <= 3.0):
+        return None, "live RR1-3 strategy requires 1<=RR1<=3"
+    return RR1_3, None
+
+
+def select_legacy_combined_strategy(
+    *, style: str, side: str, signal_text: str, rr1: float,
+    stop_distance_pct: float, now: Optional[datetime] = None,
+) -> tuple[Optional[StrategyDecision], Optional[str]]:
+    """Select the former A1>A4>A5>A3 system for shadow tracking only."""
+    normalized_style = str(style or "").strip().upper()
+    if str(side or "").strip().lower() != "long":
+        return None, "legacy shadow strategy allows LONG only"
+    if normalized_style not in ("SCALP", "INTRADAY"):
+        return None, "legacy shadow strategy allows SCALP or INTRADAY only"
     try:
         rr = float(rr1)
         stop_pct = float(stop_distance_pct)
@@ -104,7 +135,7 @@ def select_strategy(
         return A5, None
     if normalized_style == "INTRADAY" and rr < 2.0 and 3.0 <= stop_pct < 4.0:
         return A3, None
-    return None, "signal does not match A1, A4, A5 or A3"
+    return None, "signal does not match legacy A1, A4, A5 or A3"
 
 
 @dataclass(frozen=True)

@@ -5,9 +5,10 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 from shadow_trading import (
-    ShadowBook, ShadowS1Book, extract_calibrated_probability,
+    LegacyCombinedShadowBook, ShadowBook, ShadowS1Book, extract_calibrated_probability,
     qualifies_s1, qualifies_s2,
 )
+from trade_rules import A3, A5
 
 
 class ShadowS2Tests(unittest.TestCase):
@@ -56,6 +57,32 @@ class ShadowS1Tests(unittest.TestCase):
             trade = book.observe("s1", 130)
             self.assertEqual(trade["status"], "tp3_hit")
             self.assertAlmostEqual(trade["gross_r"], 1.82)
+
+
+class LegacyCombinedShadowBookTests(unittest.TestCase):
+    def test_tracks_full_tp1_module_from_1000_balance(self):
+        with tempfile.TemporaryDirectory() as directory:
+            book = LegacyCombinedShadowBook(Path(directory) / "legacy.json")
+            book.register(
+                signal_key="a5", base="SOL", entry=100, sl=90, tp1=108,
+                tp2=None, tp3=None, decision=A5,
+            )
+            trade = book.observe("a5", 108)
+            self.assertEqual(trade["strategy"], "A5")
+            self.assertEqual(trade["status"], "tp1_hit")
+            self.assertGreater(book.summary()["balance"], 1000)
+
+    def test_tracks_balanced_a3_module(self):
+        with tempfile.TemporaryDirectory() as directory:
+            book = LegacyCombinedShadowBook(Path(directory) / "legacy.json")
+            book.register(
+                signal_key="a3", base="ETH", entry=100, sl=90,
+                tp1=108, tp2=120, tp3=130, decision=A3,
+            )
+            self.assertIsNone(book.observe("a3", 108))
+            trade = book.observe("a3", 99.5)
+            self.assertEqual(trade["strategy"], "A3")
+            self.assertEqual(trade["status"], "breakeven_exit")
 
 
 if __name__ == "__main__":

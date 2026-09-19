@@ -20,10 +20,10 @@ from trade_notifier import pnl_watcher, build_pnl_statistics_payload
 from asset_universe import classify_non_crypto_asset
 from trade_rules import (
     ENTRY_RULES, SHADOW_S1_RULES, SHADOW_S2_RULES, SWING_RULES,
-    A3, StrategyDecision, select_strategy,
+    A3, StrategyDecision, select_strategy, select_legacy_combined_strategy,
 )
 from shadow_trading import (
-    ShadowBook, ShadowS1Book, extract_calibrated_probability,
+    LegacyCombinedShadowBook, ShadowBook, ShadowS1Book, extract_calibrated_probability,
     qualifies_s1, qualifies_s2,
 )
 import ccxt
@@ -80,7 +80,7 @@ POSITION_MISSING_CONFIRMATIONS_REQUIRED = max(
     2,
     int(os.getenv("POSITION_MISSING_CONFIRMATIONS_REQUIRED", "3")),
 )
-# Only the combined A1/A4/A5/A3 system may create new live positions.
+# Only the RR1-3 weekday INTRADAY system may create new live positions.
 # The policy is deliberately code-owned so stale Railway variables cannot
 # silently re-enable a rejected style or side.
 # Existing position management (SL/TP/BE/CLOSE) remains active around the clock.
@@ -95,6 +95,9 @@ KYIV_TZ = ZoneInfo("Europe/Kyiv")
 ALLOWED_SIGNAL_STYLES = {
     style for rules in ACTIVE_ENTRY_RULES for style in rules.allowed_styles
 }
+# SCALP cards still reach the observation path for the retired A1/A4/A5/A3
+# strategy, but ``open_policy_block_reason`` cannot authorize them for BingX.
+TRACKED_SIGNAL_STYLES = ALLOWED_SIGNAL_STYLES | {"SCALP"}
 
 
 def _rules_for_signal_style(style: Optional[str]):
@@ -146,6 +149,8 @@ SHADOW_S2_FILE = os.path.join(STATE_DIR, "shadow_s2.json")
 SHADOW_S2 = ShadowBook(SHADOW_S2_FILE)
 SHADOW_S1_FILE = os.path.join(STATE_DIR, "shadow_s1.json")
 SHADOW_S1 = ShadowS1Book(SHADOW_S1_FILE)
+SHADOW_LEGACY_FILE = os.path.join(STATE_DIR, "shadow_legacy_a1_a4_a5_a3.json")
+SHADOW_LEGACY = LegacyCombinedShadowBook(SHADOW_LEGACY_FILE)
 SHADOW_S2_WATCH_SEC = max(2.0, float(os.getenv("SHADOW_S2_WATCH_SEC", "5")))
 
 
@@ -2429,7 +2434,7 @@ def extract_signal_style(text: str) -> Optional[str]:
 
 def is_allowed_signal_style(text: str) -> bool:
     style = extract_signal_style(text)
-    return style is None or style in ALLOWED_SIGNAL_STYLES
+    return style is None or style in TRACKED_SIGNAL_STYLES
 
 
 def is_new_entry_signal_text(text: str) -> bool:
@@ -3226,6 +3231,65 @@ def _format_open_notification(
     return "\n".join(lines)
 
 
+def _register_legacy_shadow_if_eligible(cmd: dict) -> bool:
+    """Track the retired A1/A4/A5/A3 system without exchange access."""
+    text = str(cmd.get("_tg_text") or "")
+    style = str(cmd.get("_signal_style") or "").upper()
+    side = str(cmd.get("side") or "").lower()
+    try:
+        rr1 = source_signal_rr1(cmd, side)
+        stop_distance_pct = source_stop_distance_pct(cmd, side)
+    except (TypeError, ValueError):
+        return False
+    if rr1 is None or stop_distance_pct is None:
+        return False
+    decision, _ = select_legacy_combined_strategy(
+        style=style,
+        side=side,
+        signal_text=text,
+        rr1=rr1,
+        stop_distance_pct=stop_distance_pct,
+        now=datetime.now(KYIV_TZ),
+    )
+    if decision is None:
+        return False
+    required = ("entry", "sl", "tp")
+    if any(cmd.get(field) is None for field in required):
+        log("WARNING", f"LEGACY SHADOW SKIP {decision.rule_id}: Entry/SL/TP1 missing")
+        return False
+    if decision.live_partial_exit_ready and any(cmd.get(field) is None for field in ("tp2", "tp3")):
+        log("WARNING", f"LEGACY SHADOW SKIP {decision.rule_id}: TP2/TP3 missing")
+        return False
+    base = _clean_base_from_context(cmd.get("base"), text)
+    if not base or non_crypto_open_block_reason(base, signal_text=text, style=style):
+        log("WARNING", f"LEGACY SHADOW SKIP {base or 'unknown'}: non-crypto or missing base")
+        return False
+    signal_key = str(cmd.get("_signal_key") or cmd.get("_signal_content_hash") or "")
+    if not signal_key:
+        return False
+    try:
+        added = SHADOW_LEGACY.register(
+            signal_key=signal_key,
+            base=base,
+            entry=float(cmd["entry"]),
+            sl=float(cmd["sl"]),
+            tp1=float(cmd["tp"]),
+            tp2=float(cmd["tp2"]) if cmd.get("tp2") is not None else None,
+            tp3=float(cmd["tp3"]) if cmd.get("tp3") is not None else None,
+            decision=decision,
+        )
+    except (TypeError, ValueError, OSError) as exc:
+        log("WARNING", f"LEGACY SHADOW SKIP {base}: {exc}")
+        return False
+    if added:
+        log(
+            "INFO",
+            f"LEGACY SHADOW OPEN {base} rule={decision.rule_id} "
+            f"risk={decision.risk_pct:.2f}% RR1={rr1:.4f}",
+        )
+    return added
+
+
 def _register_s1_shadow_if_eligible(cmd: dict) -> bool:
     """Record the disabled S1 policy as a balanced shadow position."""
     text = str(cmd.get("_tg_text") or "")
@@ -3455,6 +3519,32 @@ async def shadow_s1_watcher():
         await asyncio.sleep(SHADOW_S2_WATCH_SEC)
 
 
+async def shadow_legacy_watcher():
+    while True:
+        try:
+            for position in SHADOW_LEGACY.open_positions():
+                symbol = await resolve_symbol(position["base"])
+                if not symbol:
+                    continue
+                ticker = await asyncio.to_thread(exchange.fetch_ticker, symbol)
+                price = float(ticker.get("last") or ticker.get("close") or 0)
+                if price <= 0:
+                    continue
+                trade = SHADOW_LEGACY.observe(position["signal_key"], price)
+                if trade:
+                    summary = SHADOW_LEGACY.summary()
+                    log(
+                        "INFO",
+                        f"LEGACY SHADOW CLOSE {position['base']} rule={position['strategy']} "
+                        f"status={trade['status']} net={trade['pnl_balance']:+.4f} "
+                        f"total={summary['trades']} WR={summary['win_rate_pct'] or 0:.2f}% "
+                        f"balance={summary['balance']:.2f}; PNL chat suppressed",
+                    )
+        except Exception as exc:
+            log("ERROR", f"legacy shadow watcher error: {exc}")
+        await asyncio.sleep(SHADOW_S2_WATCH_SEC)
+
+
 async def handle_ai_command(cmd: dict):
     action = (cmd.get("action") or "NONE").upper()
     conf = float(cmd.get("confidence") or 0.0)
@@ -3589,6 +3679,7 @@ async def handle_ai_command(cmd: dict):
             update_execution_signal(signal_key, "skipped", reason="side missing/invalid")
             return
 
+        _register_legacy_shadow_if_eligible(cmd)
         _register_s1_shadow_if_eligible(cmd)
         _register_s2_shadow_if_eligible(cmd)
 
@@ -3624,7 +3715,7 @@ async def handle_ai_command(cmd: dict):
             update_execution_signal(signal_key, "skipped", reason=reason)
             return
         if source_rr1 is None or stop_distance_pct is None:
-            reason = "combined strategy requires source Entry, SL and TP1"
+            reason = "live RR1-3 strategy requires source Entry, SL and TP1"
             log("WARNING", f"POLICY SKIP OPEN {base}: {reason}")
             update_execution_signal(signal_key, "skipped", reason=reason)
             return
@@ -4674,6 +4765,7 @@ async def main():
 
         asyncio.create_task(swing_exit_watcher_loop())
         asyncio.create_task(execution_reconcile_loop())
+        asyncio.create_task(shadow_legacy_watcher())
         asyncio.create_task(shadow_s1_watcher())
         asyncio.create_task(shadow_s2_watcher())
 
@@ -4683,9 +4775,10 @@ async def main():
             f"active_rules={[rules.version for rules in ACTIVE_ENTRY_RULES]} "
             f"styles={sorted(ALLOWED_SIGNAL_STYLES)} "
             f"long_only={TRADE_LONG_ONLY} "
-            "modules=A1>A4>A5>A3 risks=0.70/0.70/0.50/0.60% "
+            "live=RR1_3_LONG_INTRADAY_10:00-16:30_Kyiv_Mon-Fri risk=1.00% "
             f"assets={'ordinary_crypto_only' if ENTRY_RULES.ordinary_crypto_only else 'all_bingx_listed'} "
-            "exits=A1/A4/A5_full_TP1,A3_40/30/30 "
+            "exit=full_TP1 "
+            "legacy_shadow=A1>A4>A5>A3 risks=0.70/0.70/0.50/0.60% "
             f"s1_shadow={SHADOW_S1_RULES.rr1_min_inclusive:g}<=RR<"
             f"{SHADOW_S1_RULES.rr1_max_exclusive:g}@10:00-23:00_Kyiv "
             f"s2_shadow=P(TP1)>={SHADOW_S2_RULES.probability_min_inclusive:g}%@16:30-18:30_Kyiv "

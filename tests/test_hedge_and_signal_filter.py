@@ -283,7 +283,7 @@ TF: 1H / 15M / 5M
                 self.assertIsNone(parsed["tp2"])
                 self.assertIsNone(parsed["tp3"])
 
-    def test_open_policy_allows_s3_scalp_long_at_all_hours(self):
+    def test_open_policy_allows_only_intraday_for_live_entry(self):
         kyiv = ZoneInfo("Europe/Kyiv")
         self.assertIsNotNone(
             self.bot.open_policy_block_reason(
@@ -293,7 +293,7 @@ TF: 1H / 15M / 5M
                 require_allowed_style=True,
             )
         )
-        self.assertIsNone(
+        self.assertIsNotNone(
             self.bot.open_policy_block_reason(
                 "long",
                 datetime(2026, 8, 26, 0, 0, tzinfo=kyiv),
@@ -301,7 +301,7 @@ TF: 1H / 15M / 5M
                 require_allowed_style=True,
             )
         )
-        self.assertIsNone(
+        self.assertIsNotNone(
             self.bot.open_policy_block_reason(
                 "long",
                 datetime(2026, 8, 26, 5, 59, tzinfo=kyiv),
@@ -325,7 +325,7 @@ TF: 1H / 15M / 5M
                 require_allowed_style=True,
             )
         )
-        self.assertIsNone(
+        self.assertIsNotNone(
             self.bot.open_policy_block_reason(
                 "long",
                 datetime(2026, 8, 26, 6, 0, tzinfo=kyiv),
@@ -333,7 +333,7 @@ TF: 1H / 15M / 5M
                 require_allowed_style=True,
             )
         )
-        self.assertIsNone(
+        self.assertIsNotNone(
             self.bot.open_policy_block_reason(
                 "long",
                 datetime(2026, 8, 26, 23, 59, tzinfo=kyiv),
@@ -342,19 +342,19 @@ TF: 1H / 15M / 5M
             )
         )
 
-    def test_combined_strategy_selects_a5_by_rr_and_wide_stop(self):
+    def test_legacy_shadow_strategy_selects_a5_by_rr_and_wide_stop(self):
         kyiv = ZoneInfo("Europe/Kyiv")
         noon = datetime(2026, 8, 26, 12, 0, tzinfo=kyiv)
 
         for rr1 in (0.795, 0.8, 0.9, 0.999999):
-            decision, reason = self.bot.select_strategy(
+            decision, reason = self.bot.select_legacy_combined_strategy(
                 style="SCALP", side="long", signal_text="", rr1=rr1,
                 stop_distance_pct=6.0, now=noon,
             )
             self.assertIsNone(reason)
             self.assertEqual(decision.rule_id, "A5")
         for rr1, stop in ((0.79, 6.0), (1.0, 6.0), (0.8, 5.999)):
-            decision, reason = self.bot.select_strategy(
+            decision, reason = self.bot.select_legacy_combined_strategy(
                 style="SCALP", side="long", signal_text="", rr1=rr1,
                 stop_distance_pct=stop, now=noon,
             )
@@ -417,10 +417,10 @@ TF: 1H / 15M / 5M
             0.748712,
         )
 
-        self.assertAlmostEqual(plan["risk_budget"], 7.0)
-        self.assertAlmostEqual(plan["expected_loss_at_sl"], 7.0, places=8)
+        self.assertAlmostEqual(plan["risk_budget"], 10.0)
+        self.assertAlmostEqual(plan["expected_loss_at_sl"], 10.0, places=8)
         self.assertEqual(plan["leverage"], 8)
-        self.assertAlmostEqual(plan["expected_profit_at_tp1"], 5.6, places=2)
+        self.assertAlmostEqual(plan["expected_profit_at_tp1"], 8.0, places=2)
         self.assertLess(plan["margin"], plan["notional"])
 
         wide_target = self.bot.calculate_auto_trade_plan(1000.0, 100.0, 96.0, 120.0)
@@ -428,23 +428,24 @@ TF: 1H / 15M / 5M
 
         tight_stop = self.bot.calculate_auto_trade_plan(1000.0, 100.0, 99.0, 100.8)
         wide_stop = self.bot.calculate_auto_trade_plan(1000.0, 100.0, 90.0, 108.0)
-        self.assertAlmostEqual(tight_stop["expected_loss_at_sl"], 7.0, places=8)
-        self.assertAlmostEqual(wide_stop["expected_loss_at_sl"], 7.0, places=8)
+        self.assertAlmostEqual(tight_stop["expected_loss_at_sl"], 10.0, places=8)
+        self.assertAlmostEqual(wide_stop["expected_loss_at_sl"], 10.0, places=8)
         self.assertGreater(tight_stop["notional"], wide_stop["notional"])
 
     def test_live_entry_rules_are_explicit_and_capped(self):
         rules = self.bot.ENTRY_RULES
-        self.assertEqual(rules.version, "combined-a1-a4-a5-a3-v1")
-        self.assertEqual(rules.allowed_styles, ("SCALP", "INTRADAY"))
+        self.assertEqual(rules.version, "rr1-3-intraday-weekdays-v1")
+        self.assertEqual(rules.allowed_styles, ("INTRADAY",))
         self.assertEqual(rules.allowed_side, "long")
         self.assertTrue(rules.ordinary_crypto_only)
-        self.assertEqual(rules.risk_per_trade_pct, 0.7)
+        self.assertEqual(rules.risk_per_trade_pct, 1.0)
         self.assertFalse(rules.allow_position_additions)
         self.assertFalse(rules.allow_same_symbol_side_reentry)
         self.assertEqual(rules.max_concurrent_positions, 4)
         self.assertEqual(rules.max_open_risk_pct, 3.0)
-        self.assertEqual(self.bot.FIXED_RISK_PCT, 0.7)
-        self.assertEqual(self.bot.ALLOWED_SIGNAL_STYLES, {"SCALP", "INTRADAY"})
+        self.assertEqual(self.bot.FIXED_RISK_PCT, 1.0)
+        self.assertEqual(self.bot.ALLOWED_SIGNAL_STYLES, {"INTRADAY"})
+        self.assertEqual(self.bot.TRACKED_SIGNAL_STYLES, {"SCALP", "INTRADAY"})
 
     def test_position_addition_is_rejected_before_exchange_access(self):
         asyncio.run(

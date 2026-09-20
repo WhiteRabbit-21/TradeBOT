@@ -405,17 +405,61 @@ class LegacyCombinedShadowBook(ShadowBook):
             trades = self.state["trades"]
             wins = sum(float(row.get("net_r", 0)) > 0 for row in trades)
             losses = sum(float(row.get("net_r", 0)) < 0 for row in trades)
+            flat = len(trades) - wins - losses
             gross_win = sum(max(float(row.get("net_r", 0)), 0) for row in trades)
             gross_loss = -sum(min(float(row.get("net_r", 0)), 0) for row in trades)
+            open_positions = list(self.state["positions"].values())
             by_rule = {
                 rule: sum(row.get("strategy") == rule for row in trades)
                 for rule in ("A1", "A4", "A5", "A3")
             }
+            breakdown = {}
+            for rule in ("A1", "A4", "A5", "A3"):
+                rows = [row for row in trades if row.get("strategy") == rule]
+                rule_wins = sum(float(row.get("net_r", 0)) > 0 for row in rows)
+                rule_losses = sum(float(row.get("net_r", 0)) < 0 for row in rows)
+                rule_gross_win = sum(max(float(row.get("net_r", 0)), 0) for row in rows)
+                rule_gross_loss = -sum(min(float(row.get("net_r", 0)), 0) for row in rows)
+                breakdown[rule] = {
+                    "trades": len(rows),
+                    "wins": rule_wins,
+                    "losses": rule_losses,
+                    "flat": len(rows) - rule_wins - rule_losses,
+                    "win_rate_pct": 100 * rule_wins / len(rows) if rows else None,
+                    "pnl_usdt": sum(float(row.get("pnl_balance", 0)) for row in rows),
+                    "profit_factor": rule_gross_win / rule_gross_loss if rule_gross_loss else None,
+                    "open": sum(row.get("strategy") == rule for row in open_positions),
+                }
+
+            peak = 1000.0
+            max_drawdown_usdt = 0.0
+            max_drawdown_pct = 0.0
+            for row in trades:
+                balance_after = float(row.get("balance_after", peak))
+                peak = max(peak, balance_after)
+                drawdown = max(0.0, peak - balance_after)
+                max_drawdown_usdt = max(max_drawdown_usdt, drawdown)
+                if peak > 0:
+                    max_drawdown_pct = max(max_drawdown_pct, 100 * drawdown / peak)
+
+            timestamps = [
+                str(row.get("opened_at"))
+                for row in [*trades, *open_positions]
+                if row.get("opened_at")
+            ]
+            balance = float(self.state["balance"])
             return {
-                "trades": len(trades), "wins": wins, "losses": losses,
+                "start_balance": 1000.0,
+                "trades": len(trades), "wins": wins, "losses": losses, "flat": flat,
                 "win_rate_pct": 100 * wins / len(trades) if trades else None,
-                "balance": float(self.state["balance"]),
-                "net_pct": (float(self.state["balance"]) / 1000.0 - 1) * 100,
+                "balance": balance,
+                "pnl_usdt": balance - 1000.0,
+                "net_pct": (balance / 1000.0 - 1) * 100,
                 "profit_factor": gross_win / gross_loss if gross_loss else None,
-                "open": len(self.state["positions"]), "by_rule": by_rule,
+                "max_drawdown_usdt": max_drawdown_usdt,
+                "max_drawdown_pct": max_drawdown_pct,
+                "first_opened_at": min(timestamps) if timestamps else None,
+                "open": len(open_positions),
+                "by_rule": by_rule,
+                "breakdown": breakdown,
             }

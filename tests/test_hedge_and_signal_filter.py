@@ -1060,6 +1060,28 @@ class ExecutionSynchronizationTests(unittest.TestCase):
         self.assertEqual(payload["positions"][0]["symbol"], "LTC/USDT:USDT")
         self.assertEqual(payload["positions"][0]["execution_status"], "open_protected")
 
+    def test_shadow_statistics_payload_is_explicitly_virtual(self):
+        with mock.patch.object(
+            self.bot.SHADOW_LEGACY,
+            "summary",
+            return_value={
+                "start_balance": 1000.0,
+                "balance": 1012.5,
+                "pnl_usdt": 12.5,
+                "trades": 3,
+                "open": 1,
+                "breakdown": {},
+            },
+        ):
+            payload = self.bot.legacy_shadow_statistics_payload()
+
+        self.assertEqual(payload["mode"], "shadow")
+        self.assertEqual(payload["strategy"], "A1/A4/A5/A3")
+        self.assertEqual(payload["start_balance"], 1000.0)
+        self.assertEqual(payload["balance"], 1012.5)
+        self.assertEqual(payload["round_trip_cost_pct"], 0.14)
+        self.assertIn("generated_at", payload)
+
 
 class NotifierHedgeTests(unittest.IsolatedAsyncioTestCase):
     async def test_notifier_tracks_both_sides_of_same_symbol(self):

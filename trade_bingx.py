@@ -422,10 +422,21 @@ def executed_open_positions_payload() -> dict:
     return {"positions": rows, "count": len(rows), "generated_at": _utc_iso()}
 
 
+def legacy_shadow_statistics_payload() -> dict:
+    """Expose observation-only A1/A4/A5/A3 results separately from real PnL."""
+    return {
+        "strategy": "A1/A4/A5/A3",
+        "mode": "shadow",
+        "round_trip_cost_pct": 0.14,
+        **SHADOW_LEGACY.summary(),
+        "generated_at": _utc_iso(),
+    }
+
+
 class _PositionStatusHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         path = self.path.split("?", 1)[0]
-        if path not in {"/positions", "/pnl-stats"}:
+        if path not in {"/positions", "/pnl-stats", "/shadow-stats"}:
             self.send_error(404)
             return
         supplied = self.headers.get("Authorization", "")
@@ -434,11 +445,12 @@ class _PositionStatusHandler(BaseHTTPRequestHandler):
         ):
             self.send_error(401)
             return
-        payload = (
-            executed_open_positions_payload()
-            if path == "/positions"
-            else build_pnl_statistics_payload()
-        )
+        if path == "/positions":
+            payload = executed_open_positions_payload()
+        elif path == "/pnl-stats":
+            payload = build_pnl_statistics_payload()
+        else:
+            payload = legacy_shadow_statistics_payload()
         body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         self.send_response(200)
         self.send_header("Content-Type", "application/json; charset=utf-8")

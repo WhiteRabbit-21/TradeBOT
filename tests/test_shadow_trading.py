@@ -84,6 +84,37 @@ class LegacyCombinedShadowBookTests(unittest.TestCase):
             self.assertEqual(trade["strategy"], "A3")
             self.assertEqual(trade["status"], "breakeven_exit")
 
+    def test_summary_reports_balance_drawdown_and_per_rule_breakdown(self):
+        with tempfile.TemporaryDirectory() as directory:
+            book = LegacyCombinedShadowBook(Path(directory) / "legacy.json")
+            book.register(
+                signal_key="winner", base="SOL", entry=100, sl=90, tp1=108,
+                tp2=None, tp3=None, decision=A5,
+            )
+            book.observe("winner", 108)
+            book.register(
+                signal_key="loser", base="ETH", entry=100, sl=90, tp1=108,
+                tp2=None, tp3=None, decision=A5,
+            )
+            book.observe("loser", 90)
+            book.register(
+                signal_key="open-a3", base="BTC", entry=100, sl=90,
+                tp1=108, tp2=120, tp3=130, decision=A3,
+            )
+
+            summary = book.summary()
+
+            self.assertEqual(summary["start_balance"], 1000.0)
+            self.assertEqual(summary["trades"], 2)
+            self.assertEqual((summary["wins"], summary["losses"], summary["flat"]), (1, 1, 0))
+            self.assertEqual(summary["open"], 1)
+            self.assertEqual(summary["breakdown"]["A5"]["trades"], 2)
+            self.assertEqual(summary["breakdown"]["A5"]["wins"], 1)
+            self.assertEqual(summary["breakdown"]["A5"]["losses"], 1)
+            self.assertEqual(summary["breakdown"]["A3"]["open"], 1)
+            self.assertGreater(summary["max_drawdown_usdt"], 0)
+            self.assertAlmostEqual(summary["pnl_usdt"], summary["balance"] - 1000.0)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -29,6 +29,7 @@ _STATE_DIR = (
 WEEKLY_STATE_FILE = os.path.join(_STATE_DIR, "weekly_report_state.json")
 PNL_TRADES_FILE = os.path.join(_STATE_DIR, "realized_pnl_trades.json")
 PNL_TRADES_LOCK = threading.RLock()
+PNL_STATS_STRATEGY = "RR1_3"
 
 
 def _to_float(value: Any, default: float = 0.0) -> float:
@@ -203,10 +204,13 @@ def _shift_month(year: int, month: int, delta: int) -> tuple[int, int]:
 
 
 def build_pnl_statistics_payload(now: Optional[datetime] = None) -> dict:
-    """Calendar PnL summaries based only on persisted real BingX closes."""
+    """Calendar PnL for real closes belonging to the current live strategy."""
     now_local = (now or datetime.now(KYIV_TZ)).astimezone(KYIV_TZ)
     parsed = []
-    for row in _load_pnl_trades():
+    all_rows = _load_pnl_trades()
+    for row in all_rows:
+        if str(row.get("strategy") or "").strip().upper() != PNL_STATS_STRATEGY:
+            continue
         try:
             closed = datetime.fromisoformat(str(row.get("closed_at") or "").replace("Z", "+00:00"))
             if closed.tzinfo is None:
@@ -249,6 +253,8 @@ def build_pnl_statistics_payload(now: Optional[datetime] = None) -> dict:
         "months": months,
         "year": {"label": f"{year_start.strftime('%d.%m.%Y')}–{today.strftime('%d.%m.%Y')}", **_period_summary(year_rows)},
         "total_recorded": len(parsed),
+        "total_all_strategies": len(all_rows),
+        "strategy": PNL_STATS_STRATEGY,
         "generated_at": now_local.isoformat(),
     }
 

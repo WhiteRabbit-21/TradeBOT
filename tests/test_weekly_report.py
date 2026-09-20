@@ -10,8 +10,9 @@ import trade_notifier as notifier
 class WeeklyReportTests(unittest.TestCase):
     def test_real_pnl_statistics_group_days_months_and_year(self):
         rows = [
-            {"trade_id": "a", "pnl": 3.0, "closed_at": "2026-09-17T08:00:00+00:00"},
-            {"trade_id": "b", "pnl": -1.0, "closed_at": "2026-09-16T08:00:00+00:00"},
+            {"trade_id": "a", "strategy": "RR1_3", "pnl": 3.0, "closed_at": "2026-09-17T08:00:00+00:00"},
+            {"trade_id": "b", "strategy": "RR1_3", "pnl": -1.0, "closed_at": "2026-09-16T08:00:00+00:00"},
+            {"trade_id": "old", "strategy": "A5", "pnl": 100.0, "closed_at": "2026-09-17T09:00:00+00:00"},
         ]
         with tempfile.TemporaryDirectory() as tmp, patch.object(
             notifier, "PNL_TRADES_FILE", tmp + "/pnl.json"
@@ -28,6 +29,9 @@ class WeeklyReportTests(unittest.TestCase):
         self.assertEqual(stats["days"][-1]["pnl"], 3.0)
         self.assertEqual(stats["days"][-2]["pnl"], -1.0)
         self.assertEqual(stats["year"]["pnl"], 2.0)
+        self.assertEqual(stats["strategy"], "RR1_3")
+        self.assertEqual(stats["total_recorded"], 2)
+        self.assertEqual(stats["total_all_strategies"], 3)
 
     def test_timestamp_ms_accepts_persisted_iso_time(self):
         self.assertEqual(

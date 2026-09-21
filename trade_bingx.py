@@ -112,6 +112,21 @@ def _rules_for_signal_style(style: Optional[str]):
     return None
 
 
+def _asset_policy_rules_for_signal_style(style: Optional[str]):
+    """Return entry-policy rules used only for asset classification.
+
+    ``_rules_for_signal_style`` intentionally maps INTRADAY to the retired A3
+    decision because existing A3 positions still need its partial-exit
+    management.  A ``StrategyDecision`` does not own entry-universe fields,
+    so using that helper for a new-entry asset check caused every matching
+    INTRADAY signal to fail after ``STRATEGY MATCH``.
+    """
+    normalized_style = str(style or "").strip().upper()
+    if normalized_style in SWING_RULES.allowed_styles:
+        return SWING_RULES
+    return ENTRY_RULES
+
+
 SWING_MAX_ENTRY_DRIFT_R = float(
     os.getenv(
         "SWING_MAX_ENTRY_DRIFT_R",
@@ -298,6 +313,35 @@ def update_execution_signal(signal_key: Optional[str], status: str, **fields):
         row["status"] = status
         row["updated_at"] = _utc_iso()
         save_execution_state()
+
+
+def record_open_workflow_failure(signal_key: Optional[str], reason: str, **fields):
+    """Record an OPEN failure without erasing evidence of a placed order."""
+    if not signal_key:
+        return
+    order_seen_statuses = {
+        "order_placed", "order_unconfirmed", "open", "open_protected",
+        "closed", "emergency_closed",
+    }
+    with EXECUTION_STATE_LOCK:
+        current_status = str(
+            (EXECUTION_STATE.get("signals", {}).get(signal_key) or {}).get("status")
+            or ""
+        )
+        if current_status in order_seen_statuses:
+            update_execution_signal(
+                signal_key,
+                current_status,
+                workflow_error=reason,
+                **fields,
+            )
+        else:
+            update_execution_signal(
+                signal_key,
+                "processing_failed",
+                reason=reason,
+                **fields,
+            )
 
 
 def execution_signal_is_duplicate(
@@ -679,7 +723,7 @@ def non_crypto_open_block_reason(
     style: Optional[str] = None,
 ) -> Optional[str]:
     """Apply the asset universe of the selected trading rule."""
-    rules = _rules_for_signal_style(style) or SWING_RULES
+    rules = _asset_policy_rules_for_signal_style(style)
     if not rules.ordinary_crypto_only:
         return None
 
@@ -3541,7 +3585,7 @@ async def shadow_legacy_watcher():
         await asyncio.sleep(SHADOW_S2_WATCH_SEC)
 
 
-async def handle_ai_command(cmd: dict):
+async def _handle_ai_command(cmd: dict):
     action = (cmd.get("action") or "NONE").upper()
     conf = float(cmd.get("confidence") or 0.0)
 
@@ -3695,10 +3739,12 @@ async def handle_ai_command(cmd: dict):
 
         if sl is None:
             log("INFO", "AI SKIP OPEN: sl missing")
+            update_execution_signal(signal_key, "skipped", reason="SL missing")
             return
 
         if tp is None and rr_value is None:
             log("INFO", "AI SKIP OPEN: tp/rr missing")
+            update_execution_signal(signal_key, "skipped", reason="TP/RR missing")
             return
 
         signal_style = str(cmd.get("_signal_style") or "").upper()
@@ -3815,7 +3861,9 @@ async def handle_ai_command(cmd: dict):
         try:
             entry = float((await asyncio.to_thread(exchange.fetch_ticker, symbol))["last"])
         except Exception as e:
+            reason = f"cannot fetch current BingX price: {e}"
             log("ERROR", f"fetch_ticker failed: {e}")
+            update_execution_signal(signal_key, "skipped", reason=reason)
             return
 
         if signal_style == "SWING" and cmd.get("entry") is not None:
@@ -3836,6 +3884,7 @@ async def handle_ai_command(cmd: dict):
                 drift_block = f"cannot validate SWING entry freshness: {drift_error}"
             if drift_block:
                 log("WARNING", f"POLICY SKIP OPEN {base_clean}: {drift_block}")
+                update_execution_signal(signal_key, "skipped", reason=drift_block)
                 return
 
         sl_fixed = normalize_price_from_tail(float(sl), entry, side, "sl")
@@ -3845,7 +3894,9 @@ async def handle_ai_command(cmd: dict):
                 tp = calc_tp_from_rr(entry, sl_fixed, float(rr_value), side)
                 log("INFO", f"TP_FROM_RR {base_clean} entry={entry} sl={sl_fixed} rr={rr_value} -> tp={tp}")
             except Exception as e:
+                reason = f"cannot calculate TP from RR: {e}"
                 log("ERROR", f"TP_FROM_RR failed: {e}")
+                update_execution_signal(signal_key, "skipped", reason=reason)
                 return
 
         tp_fixed = normalize_price_from_tail(float(tp), entry, side, "tp")
@@ -3885,20 +3936,29 @@ async def handle_ai_command(cmd: dict):
                 tp3_prec = float(tp3_fixed)
 
         if not validate_sl_tp(side, entry, sl_prec, tp_prec):
+            reason = f"invalid SL/TP vs entry: entry={entry} SL={sl_prec} TP={tp_prec}"
             log("INFO", f"SKIP Bad SL/TP vs entry. entry={entry} SL={sl_prec} TP={tp_prec}")
+            update_execution_signal(signal_key, "skipped", reason=reason)
             return
         if use_partial_exit and not (tp_prec < tp2_prec < tp3_prec):
+            reason = (
+                f"invalid {signal_style} target order: "
+                f"TP1={tp_prec} TP2={tp2_prec} TP3={tp3_prec}"
+            )
             log(
                 "INFO",
                 f"SKIP Bad {signal_style} target order: "
                 f"TP1={tp_prec} TP2={tp2_prec} TP3={tp3_prec}",
             )
+            update_execution_signal(signal_key, "skipped", reason=reason)
             return
 
         try:
             effective_rr1 = calculate_rr_from_prices(entry, sl_prec, tp_prec, side)
         except (TypeError, ValueError) as e:
+            reason = f"live RR1 calculation failed: {e}"
             log("WARNING", f"POLICY SKIP OPEN {base_clean}: RR1 calculation failed: {e}")
+            update_execution_signal(signal_key, "skipped", reason=reason)
             return
 
         log(
@@ -3931,14 +3991,24 @@ async def handle_ai_command(cmd: dict):
                 f"notional={target_notional} margin={trade_plan['margin']} qty={qty}",
             )
             if min_amount is not None and qty_raw < min_amount:
-                log("WARNING", f"SKIP {symbol}: exchange minimum qty={min_amount} would exceed the {FIXED_RISK_PCT}% risk limit")
+                reason = (
+                    f"exchange minimum qty={min_amount} would exceed the "
+                    f"{applied_risk_pct:g}% risk limit"
+                )
+                log("WARNING", f"SKIP {symbol}: {reason}")
+                update_execution_signal(signal_key, "skipped", reason=reason)
                 return
         except Exception as e:
+            reason = f"balance/position-size calculation failed: {e}"
             log("ERROR", f"balance/qty failed: {e}")
+            update_execution_signal(signal_key, "skipped", reason=reason)
             return
 
         if qty <= 0:
             log("INFO", "SKIP qty became 0")
+            update_execution_signal(
+                signal_key, "skipped", reason="normalized order quantity is zero"
+            )
             return
 
 
@@ -4163,6 +4233,13 @@ async def handle_ai_command(cmd: dict):
 
         except Exception as e:
             log("ERROR", f"OPEN FAILED: {e}")
+            record_open_workflow_failure(
+                signal_key,
+                f"BingX open/protection workflow failed: {e}",
+                symbol=symbol,
+                base=base_clean,
+                side=side,
+            )
             return
         return
 
@@ -4386,6 +4463,27 @@ async def handle_ai_command(cmd: dict):
         return
 
     log("INFO", f"Unknown/unsupported action: {action}")
+
+
+async def handle_ai_command(cmd: dict):
+    """Run one parsed command and make unexpected OPEN failures observable."""
+    try:
+        return await _handle_ai_command(cmd)
+    except Exception as exc:
+        action = str(cmd.get("action") or "NONE").upper()
+        log("ERROR", f"COMMAND FAILED action={action} base={cmd.get('base')}: {exc}")
+        if action == "OPEN":
+            try:
+                record_open_workflow_failure(
+                    cmd.get("_signal_key"),
+                    f"unexpected OPEN processing failure: {exc}",
+                    base=cmd.get("base"),
+                    side=cmd.get("side"),
+                )
+            except Exception as journal_error:
+                log("ERROR", f"EXECUTION JOURNAL update failed: {journal_error}")
+        return None
+
 
 def detect_add_mode(cmd: dict, tg_text: str = "") -> str:
     """

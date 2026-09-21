@@ -194,13 +194,23 @@ class SignalFilterTests(unittest.TestCase):
 
     def test_non_crypto_assets_are_blocked_but_crypto_is_allowed(self):
         for base in ("HOOD", "SNDK", "MU", "MUU", "SKHY", "ZHIPU", "SPY", "XAU"):
-            for style in ("SCALP", "SWING"):
+            for style in ("SCALP", "INTRADAY", "SWING"):
                 reason = self.bot.non_crypto_open_block_reason(base, style=style)
                 self.assertIsNotNone(reason, f"{style} {base}")
                 self.assertIn("ordinary crypto assets only", reason)
 
         for base in ("BTC", "HYPE", "ONDO", "1000SHIB", "DOGE"):
             self.assertIsNone(self.bot.non_crypto_open_block_reason(base), base)
+
+    def test_intraday_asset_policy_is_separate_from_legacy_a3_exit_rules(self):
+        self.assertIs(self.bot._rules_for_signal_style("INTRADAY"), self.bot.A3)
+        self.assertIs(
+            self.bot._asset_policy_rules_for_signal_style("INTRADAY"),
+            self.bot.ENTRY_RULES,
+        )
+        self.assertTrue(
+            self.bot._asset_policy_rules_for_signal_style("INTRADAY").ordinary_crypto_only
+        )
 
     def test_non_crypto_filter_uses_signal_marker_and_market_metadata(self):
         marked = "🌊 SWING LONG\n🏷 Тип активу: TradFi — акція"
@@ -472,6 +482,90 @@ TF: 1H / 15M / 5M
                 }
             )
         )
+
+    def test_open_failure_journal_preserves_a_placed_order_status(self):
+        key = "test:placed-order"
+        self.bot.EXECUTION_STATE["signals"][key] = {"status": "order_placed"}
+        try:
+            with mock.patch.object(self.bot, "save_execution_state"):
+                self.bot.record_open_workflow_failure(key, "notification failed")
+            row = self.bot.EXECUTION_STATE["signals"][key]
+            self.assertEqual(row["status"], "order_placed")
+            self.assertEqual(row["workflow_error"], "notification failed")
+        finally:
+            self.bot.EXECUTION_STATE["signals"].pop(key, None)
+
+    def test_open_failure_journal_marks_pre_order_processing_failure(self):
+        key = "test:pre-order"
+        self.bot.EXECUTION_STATE["signals"][key] = {"status": "evaluating"}
+        try:
+            with mock.patch.object(self.bot, "save_execution_state"):
+                self.bot.record_open_workflow_failure(key, "bad live price")
+            row = self.bot.EXECUTION_STATE["signals"][key]
+            self.assertEqual(row["status"], "processing_failed")
+            self.assertEqual(row["reason"], "bad live price")
+        finally:
+            self.bot.EXECUTION_STATE["signals"].pop(key, None)
+
+    def test_matching_intraday_crypto_reaches_dry_run_execution(self):
+        key = "test:rr1-3-dry-run"
+        decision = self.bot.StrategyDecision(
+            "RR1_3", 1.0, (1.0, 0.0, 0.0), False
+        )
+        command = {
+            "action": "OPEN",
+            "confidence": 1.0,
+            "base": "BTC",
+            "side": "long",
+            "entry": 100.0,
+            "sl": 96.0,
+            "tp": 104.0,
+            "signal_rr1": 1.0,
+            "_signal_style": "INTRADAY",
+            "_signal_key": key,
+            "_tg_text": "INTRADAY LONG BTC/USDT Entry 100 SL 96 TP1 104",
+        }
+        try:
+            with (
+                mock.patch.object(self.bot, "DRY_RUN", True),
+                mock.patch.object(self.bot, "save_execution_state"),
+                mock.patch.object(
+                    self.bot, "select_strategy", return_value=(decision, None)
+                ),
+                mock.patch.object(self.bot, "_register_legacy_shadow_if_eligible"),
+                mock.patch.object(self.bot, "_register_s1_shadow_if_eligible"),
+                mock.patch.object(self.bot, "_register_s2_shadow_if_eligible"),
+                mock.patch.object(
+                    self.bot, "resolve_symbol", new=mock.AsyncMock(
+                        return_value="BTC/USDT:USDT"
+                    )
+                ),
+                mock.patch.object(
+                    self.bot, "fetch_position_oneway", new=mock.AsyncMock(return_value=None)
+                ),
+                mock.patch.object(
+                    self.bot, "reconcile_execution_state_sync",
+                    return_value={"closed": [], "unmatched": []},
+                ),
+                mock.patch.object(
+                    self.bot.exchange, "fetch_ticker", return_value={"last": 100.0},
+                    create=True,
+                ),
+                mock.patch.object(
+                    self.bot, "get_usdt_total", new=mock.AsyncMock(return_value=1000.0)
+                ),
+                mock.patch.object(
+                    self.bot, "normalize_order_qty",
+                    new=mock.AsyncMock(return_value=(2.5, 0.001)),
+                ),
+            ):
+                asyncio.run(self.bot.handle_ai_command(command))
+
+            row = self.bot.EXECUTION_STATE["signals"][key]
+            self.assertEqual(row["status"], "dry_run")
+            self.assertEqual(row["symbol"], "BTC/USDT:USDT")
+        finally:
+            self.bot.EXECUTION_STATE["signals"].pop(key, None)
 
     def test_portfolio_gate_only_blocks_duplicate_coin(self):
         rows = {

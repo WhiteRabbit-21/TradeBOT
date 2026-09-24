@@ -15,10 +15,11 @@ from typing import Any
 # database and common equity/ETF contracts.  Exchange metadata and the signal
 # marker below are the primary future-proof detection paths.
 EQUITY_BASES = {
-    "AAPL", "AMD", "AMZN", "ARM", "ASML", "AVGO", "COIN", "GOOG",
-    "GOOGL", "HK0700", "HK1810", "HOOD", "INTC", "META", "MSFT", "MSTR", "MU",
-    "NFLX", "NVDA", "PLTR", "SNDK", "SKHY", "SKHYNIX", "TSLA", "TSM",
-    "TENCENT", "XIAOMI", "ZHIPU",
+    "AAOI", "AAPL", "AMD", "AMZN", "ARM", "ASML", "AVGO", "AXTI", "BABA",
+    "BE", "CBRS", "COIN", "CRCL", "DELL", "DRAM", "GOOG", "GOOGL",
+    "HK0700", "HK1810", "HOOD", "INTC", "LITE", "META", "MRVL", "MSFT",
+    "MSTR", "MU", "MVLL", "NBIS", "NFLX", "NVDA", "ORCL", "PLTR", "SNDK",
+    "SKHY", "SKHYNIX", "SNXX", "TSLA", "TSM", "TENCENT", "XIAOMI", "ZHIPU",
 }
 
 ETF_BASES = {
@@ -27,13 +28,13 @@ ETF_BASES = {
 }
 
 COMMODITY_BASES = {
-    "BRENT", "COPPER", "GOLD", "NG", "SILVER", "UKOIL", "USOIL", "WTI",
+    "BRENT", "BZ", "CL", "COPPER", "GOLD", "NG", "SILVER", "UKOIL", "USOIL", "WTI",
     "XAG", "XAU",
 }
 
 INDEX_BASES = {"DJI", "NDX", "SPX", "US30", "US100", "US500", "VIX"}
 
-PRE_IPO_BASES = {"MINIMEX", "OPENAI", "SPCX"}
+PRE_IPO_BASES = {"MINIMAX", "MINIMEX", "OPENAI", "SPCX", "UNITREE"}
 
 FOREX_BASES = {
     "AUDUSD", "EURGBP", "EURUSD", "GBPUSD", "NZDUSD", "USDCAD", "USDCHF",

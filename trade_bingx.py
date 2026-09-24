@@ -19,12 +19,13 @@ from typing import Optional, Any
 from trade_notifier import pnl_watcher, build_pnl_statistics_payload
 from asset_universe import classify_non_crypto_asset
 from trade_rules import (
-    ENTRY_RULES, SHADOW_S1_RULES, SHADOW_S2_RULES, SWING_RULES,
+    ENTRY_RULES, SHADOW_S1_RULES, SHADOW_S2_RULES,
+    SHADOW_SWING_PROBABILITY_RULES, SWING_RULES,
     A3, StrategyDecision, select_strategy, select_legacy_combined_strategy,
 )
 from shadow_trading import (
     LegacyCombinedShadowBook, ShadowBook, ShadowS1Book, extract_calibrated_probability,
-    qualifies_s1, qualifies_s2,
+    qualifies_s1, qualifies_s2, qualifies_swing_probability,
 )
 import ccxt
 from pyrogram import Client, filters, idle
@@ -166,6 +167,13 @@ SHADOW_S1_FILE = os.path.join(STATE_DIR, "shadow_s1.json")
 SHADOW_S1 = ShadowS1Book(SHADOW_S1_FILE)
 SHADOW_LEGACY_FILE = os.path.join(STATE_DIR, "shadow_legacy_a1_a4_a5_a3.json")
 SHADOW_LEGACY = LegacyCombinedShadowBook(SHADOW_LEGACY_FILE)
+SHADOW_SWING_PROBABILITY_FILE = os.path.join(STATE_DIR, "shadow_swing_probability.json")
+SHADOW_SWING_PROBABILITY = ShadowBook(
+    SHADOW_SWING_PROBABILITY_FILE,
+    rules=SHADOW_SWING_PROBABILITY_RULES,
+    strategy="SWING_PROBABILITY",
+    start_balance=1000.0,
+)
 SHADOW_S2_WATCH_SEC = max(2.0, float(os.getenv("SHADOW_S2_WATCH_SEC", "5")))
 
 
@@ -468,13 +476,27 @@ def executed_open_positions_payload() -> dict:
 
 def legacy_shadow_statistics_payload() -> dict:
     """Expose observation-only A1/A4/A5/A3 results separately from real PnL."""
-    return {
+    payload = {
         "strategy": "A1/A4/A5/A3",
         "mode": "shadow",
         "round_trip_cost_pct": 0.14,
         **SHADOW_LEGACY.summary(),
         "generated_at": _utc_iso(),
     }
+    payload["swing_probability"] = {
+        "strategy": "LONG SWING · P<=36% or P>45%",
+        "mode": "shadow",
+        "risk_per_trade_pct": SHADOW_SWING_PROBABILITY_RULES.risk_per_trade_pct,
+        "round_trip_cost_pct": 100 * SHADOW_SWING_PROBABILITY_RULES.round_trip_cost_notional,
+        "probability_low_max_inclusive": (
+            SHADOW_SWING_PROBABILITY_RULES.probability_low_max_inclusive
+        ),
+        "probability_high_min_exclusive": (
+            SHADOW_SWING_PROBABILITY_RULES.probability_high_min_exclusive
+        ),
+        **SHADOW_SWING_PROBABILITY.summary(),
+    }
+    return payload
 
 
 class _PositionStatusHandler(BaseHTTPRequestHandler):
@@ -3423,6 +3445,52 @@ def _register_s2_shadow_if_eligible(cmd: dict) -> bool:
     return added
 
 
+def _register_swing_probability_shadow_if_eligible(cmd: dict) -> bool:
+    """Record the SWING probability anomaly without any exchange order path."""
+    text = str(cmd.get("_tg_text") or "")
+    style = str(cmd.get("_signal_style") or "").upper()
+    side = str(cmd.get("side") or "").lower()
+    probability = extract_calibrated_probability(text)
+    if not qualifies_swing_probability(
+        style=style,
+        side=side,
+        probability=probability,
+    ):
+        return False
+    if any(cmd.get(field) is None for field in ("entry", "sl", "tp")):
+        log("WARNING", "SWING PROBABILITY SHADOW SKIP: entry/SL/TP1 missing")
+        return False
+    base = _clean_base_from_context(cmd.get("base"), text)
+    if not base or non_crypto_open_block_reason(base, signal_text=text, style=style):
+        log(
+            "WARNING",
+            f"SWING PROBABILITY SHADOW SKIP {base or 'unknown'}: non-crypto or missing base",
+        )
+        return False
+    signal_key = str(cmd.get("_signal_key") or cmd.get("_signal_content_hash") or "")
+    if not signal_key:
+        return False
+    try:
+        added = SHADOW_SWING_PROBABILITY.register(
+            signal_key=signal_key,
+            base=base,
+            entry=float(cmd["entry"]),
+            sl=float(cmd["sl"]),
+            tp1=float(cmd["tp"]),
+            probability=float(probability),
+        )
+    except (TypeError, ValueError, OSError) as exc:
+        log("WARNING", f"SWING PROBABILITY SHADOW SKIP {base}: {exc}")
+        return False
+    if added:
+        log(
+            "INFO",
+            f"SWING PROBABILITY SHADOW OPEN {base} P(TP1)={probability:g}% "
+            f"entry={cmd['entry']} sl={cmd['sl']} tp1={cmd['tp']}",
+        )
+    return added
+
+
 def execution_strategy_for_position(position_key: str) -> str:
     row = (EXECUTION_STATE.get("positions") or {}).get(position_key) or {}
     return str(row.get("strategy") or row.get("style") or "UNKNOWN").upper()
@@ -3556,6 +3624,32 @@ async def shadow_s1_watcher():
                     )
         except Exception as exc:
             log("ERROR", f"S1 shadow watcher error: {exc}")
+        await asyncio.sleep(SHADOW_S2_WATCH_SEC)
+
+
+async def shadow_swing_probability_watcher():
+    while True:
+        try:
+            for position in SHADOW_SWING_PROBABILITY.open_positions():
+                symbol = await resolve_symbol(position["base"])
+                if not symbol:
+                    continue
+                ticker = await asyncio.to_thread(exchange.fetch_ticker, symbol)
+                price = float(ticker.get("last") or ticker.get("close") or 0)
+                if price <= 0:
+                    continue
+                trade = SHADOW_SWING_PROBABILITY.observe(position["signal_key"], price)
+                if trade:
+                    summary = SHADOW_SWING_PROBABILITY.summary()
+                    log(
+                        "INFO",
+                        f"SWING PROBABILITY SHADOW CLOSE {position['base']} "
+                        f"status={trade['status']} net={trade['pnl_balance']:+.4f} "
+                        f"total={summary['trades']} WR={summary['win_rate_pct'] or 0:.2f}% "
+                        f"balance={summary['balance']:.2f}; PNL chat suppressed",
+                    )
+        except Exception as exc:
+            log("ERROR", f"SWING probability shadow watcher error: {exc}")
         await asyncio.sleep(SHADOW_S2_WATCH_SEC)
 
 
@@ -3722,6 +3816,7 @@ async def _handle_ai_command(cmd: dict):
         _register_legacy_shadow_if_eligible(cmd)
         _register_s1_shadow_if_eligible(cmd)
         _register_s2_shadow_if_eligible(cmd)
+        _register_swing_probability_shadow_if_eligible(cmd)
 
         policy_block = open_policy_block_reason(
             side,
@@ -4868,6 +4963,7 @@ async def main():
         asyncio.create_task(shadow_legacy_watcher())
         asyncio.create_task(shadow_s1_watcher())
         asyncio.create_task(shadow_s2_watcher())
+        asyncio.create_task(shadow_swing_probability_watcher())
 
         log(
             "INFO",
@@ -4882,6 +4978,7 @@ async def main():
             f"s1_shadow={SHADOW_S1_RULES.rr1_min_inclusive:g}<=RR<"
             f"{SHADOW_S1_RULES.rr1_max_exclusive:g}@10:00-23:00_Kyiv "
             f"s2_shadow=P(TP1)>={SHADOW_S2_RULES.probability_min_inclusive:g}%@16:30-18:30_Kyiv "
+            "swing_probability_shadow=LONG_SWING_P<=36_or_P>45 risk=0.50% "
             f"additions={ENTRY_RULES.allow_position_additions} "
             f"same_side_reentry={ENTRY_RULES.allow_same_symbol_side_reentry} "
             "max_positions=unlimited max_open_risk=unlimited "

@@ -190,6 +190,34 @@ class ShadowS1Rules:
             raise ValueError("S1 RR range is invalid")
         if abs(sum(self.target_split) - 1.0) > 1e-9:
             raise ValueError("S1 shadow target split must sum to 1")
+
+
+@dataclass(frozen=True)
+class ShadowSwingProbabilityRules:
+    """Observation-only LONG SWING probability anomaly under validation."""
+
+    version: str = "swing-probability-outside-36-45-shadow-v1"
+    allowed_styles: tuple[str, ...] = ("SWING",)
+    allowed_side: str = "long"
+    probability_low_max_inclusive: float = 36.0
+    probability_high_min_exclusive: float = 45.0
+    risk_per_trade_pct: float = 0.5
+    round_trip_cost_notional: float = 0.0014
+
+    def validate(self) -> None:
+        if self.allowed_styles != ("SWING",) or self.allowed_side != "long":
+            raise ValueError("SWING probability shadow policy must remain SWING LONG")
+        if not (
+            0 <= self.probability_low_max_inclusive
+            < self.probability_high_min_exclusive <= 100
+        ):
+            raise ValueError("SWING probability shadow thresholds are invalid")
+        if not (0 < self.risk_per_trade_pct <= 10):
+            raise ValueError("SWING probability shadow risk must be in (0, 10]")
+        if not (0 <= self.round_trip_cost_notional < 1):
+            raise ValueError("SWING probability shadow cost rate must be in [0, 1)")
+
+
 @dataclass(frozen=True)
 class SwingTradingRules:
     """Rule 1 - Swing: retained three-target swing execution model."""
@@ -244,6 +272,9 @@ SHADOW_S2_RULES.validate()
 
 SHADOW_S1_RULES = ShadowS1Rules()
 SHADOW_S1_RULES.validate()
+
+SHADOW_SWING_PROBABILITY_RULES = ShadowSwingProbabilityRules()
+SHADOW_SWING_PROBABILITY_RULES.validate()
 
 SWING_RULES = SwingTradingRules()
 SWING_RULES.validate()

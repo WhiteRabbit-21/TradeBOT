@@ -1166,6 +1166,16 @@ class ExecutionSynchronizationTests(unittest.TestCase):
                 "open": 1,
                 "breakdown": {},
             },
+        ), mock.patch.object(
+            self.bot.SHADOW_SWING_PROBABILITY,
+            "summary",
+            return_value={
+                "start_balance": 1000.0,
+                "balance": 1005.0,
+                "pnl_usdt": 5.0,
+                "trades": 1,
+                "open": 0,
+            },
         ):
             payload = self.bot.legacy_shadow_statistics_payload()
 
@@ -1174,6 +1184,9 @@ class ExecutionSynchronizationTests(unittest.TestCase):
         self.assertEqual(payload["start_balance"], 1000.0)
         self.assertEqual(payload["balance"], 1012.5)
         self.assertEqual(payload["round_trip_cost_pct"], 0.14)
+        self.assertEqual(payload["swing_probability"]["mode"], "shadow")
+        self.assertEqual(payload["swing_probability"]["risk_per_trade_pct"], 0.5)
+        self.assertEqual(payload["swing_probability"]["balance"], 1005.0)
         self.assertIn("generated_at", payload)
 
 

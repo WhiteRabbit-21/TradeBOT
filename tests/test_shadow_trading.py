@@ -6,9 +6,9 @@ from zoneinfo import ZoneInfo
 
 from shadow_trading import (
     LegacyCombinedShadowBook, ShadowBook, ShadowS1Book, extract_calibrated_probability,
-    qualifies_s1, qualifies_s2,
+    qualifies_s1, qualifies_s2, qualifies_swing_probability,
 )
-from trade_rules import A3, A5
+from trade_rules import A3, A5, SHADOW_SWING_PROBABILITY_RULES
 
 
 class ShadowS2Tests(unittest.TestCase):
@@ -57,6 +57,38 @@ class ShadowS1Tests(unittest.TestCase):
             trade = book.observe("s1", 130)
             self.assertEqual(trade["status"], "tp3_hit")
             self.assertAlmostEqual(trade["gross_r"], 1.82)
+
+
+class ShadowSwingProbabilityTests(unittest.TestCase):
+    def test_probability_outside_middle_band_only(self):
+        self.assertTrue(qualifies_swing_probability(style="SWING", side="long", probability=36))
+        self.assertFalse(qualifies_swing_probability(style="SWING", side="long", probability=40))
+        self.assertFalse(qualifies_swing_probability(style="SWING", side="long", probability=45))
+        self.assertTrue(qualifies_swing_probability(style="SWING", side="long", probability=45.1))
+        self.assertFalse(qualifies_swing_probability(style="INTRADAY", side="long", probability=30))
+        self.assertFalse(qualifies_swing_probability(style="SWING", side="short", probability=50))
+        self.assertFalse(qualifies_swing_probability(style="SWING", side="long", probability=None))
+
+    def test_tracks_full_tp1_from_1000_without_exchange_access(self):
+        with tempfile.TemporaryDirectory() as directory:
+            book = ShadowBook(
+                Path(directory) / "swing-probability.json",
+                rules=SHADOW_SWING_PROBABILITY_RULES,
+                strategy="SWING_PROBABILITY",
+                start_balance=1000.0,
+            )
+            self.assertTrue(
+                book.register(
+                    signal_key="swing-x", base="ETH", entry=100,
+                    sl=90, tp1=120, probability=35,
+                )
+            )
+            trade = book.observe("swing-x", 120)
+            self.assertEqual(trade["strategy"], "SWING_PROBABILITY")
+            self.assertEqual(trade["status"], "tp1_hit")
+            self.assertAlmostEqual(trade["gross_r"], 2.0)
+            self.assertEqual(book.summary()["start_balance"], 1000.0)
+            self.assertGreater(book.summary()["balance"], 1000.0)
 
 
 class LegacyCombinedShadowBookTests(unittest.TestCase):

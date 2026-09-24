@@ -14,7 +14,12 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
-from trade_rules import SHADOW_S1_RULES, SHADOW_S2_RULES, StrategyDecision
+from trade_rules import (
+    SHADOW_S1_RULES,
+    SHADOW_S2_RULES,
+    SHADOW_SWING_PROBABILITY_RULES,
+    StrategyDecision,
+)
 
 _LOCK = threading.RLock()
 
@@ -53,20 +58,44 @@ def qualifies_s1(*, style: str, side: str, rr1: Optional[float], now_kyiv: datet
     )
 
 
+def qualifies_swing_probability(
+    *, style: str, side: str, probability: Optional[float]
+) -> bool:
+    """Select the non-monotonic SWING probability cohort for shadow only."""
+    return (
+        str(style or "").upper() in SHADOW_SWING_PROBABILITY_RULES.allowed_styles
+        and str(side or "").lower() == SHADOW_SWING_PROBABILITY_RULES.allowed_side
+        and probability is not None
+        and (
+            probability <= SHADOW_SWING_PROBABILITY_RULES.probability_low_max_inclusive
+            or probability > SHADOW_SWING_PROBABILITY_RULES.probability_high_min_exclusive
+        )
+    )
+
+
 class ShadowBook:
-    def __init__(self, path: str | Path):
+    def __init__(
+        self,
+        path: str | Path,
+        *,
+        rules=SHADOW_S2_RULES,
+        strategy: str = "S2",
+        start_balance: float = 100.0,
+    ):
         self.path = Path(path)
+        self.rules = rules
+        self.strategy = str(strategy)
+        self.start_balance = float(start_balance)
         self.state = self._load()
 
-    @staticmethod
-    def _empty() -> dict:
-        return {"version": 1, "balance": 100.0, "positions": {}, "trades": []}
+    def _empty(self) -> dict:
+        return {"version": 1, "balance": self.start_balance, "positions": {}, "trades": []}
 
     def _load(self) -> dict:
         try:
             value = json.loads(self.path.read_text(encoding="utf-8"))
             if isinstance(value, dict):
-                value.setdefault("balance", 100.0)
+                value.setdefault("balance", self.start_balance)
                 value.setdefault("positions", {})
                 value.setdefault("trades", [])
                 return value
@@ -84,7 +113,7 @@ class ShadowBook:
                  probability: float, opened_at: Optional[str] = None) -> bool:
         entry, sl, tp1 = float(entry), float(sl), float(tp1)
         if not (sl < entry < tp1):
-            raise ValueError("S2 LONG levels must satisfy SL < entry < TP1")
+            raise ValueError(f"{self.strategy} LONG levels must satisfy SL < entry < TP1")
         with _LOCK:
             if signal_key in self.state["positions"] or any(
                 row.get("signal_key") == signal_key for row in self.state["trades"]
@@ -93,14 +122,14 @@ class ShadowBook:
             balance = float(self.state["balance"])
             self.state["positions"][signal_key] = {
                 "signal_key": signal_key,
-                "strategy": "S2",
+                "strategy": self.strategy,
                 "mode": "shadow",
                 "base": str(base).upper(),
                 "entry": entry,
                 "sl": sl,
                 "tp1": tp1,
                 "probability": float(probability),
-                "risk_amount": balance * SHADOW_S2_RULES.risk_per_trade_pct / 100.0,
+                "risk_amount": balance * self.rules.risk_per_trade_pct / 100.0,
                 "opened_at": opened_at or datetime.now(timezone.utc).isoformat(),
             }
             self._save()
@@ -123,7 +152,7 @@ class ShadowBook:
             gross_r = -1.0 if outcome == "sl_hit" else (
                 (position["tp1"] - position["entry"]) / (position["entry"] - position["sl"])
             )
-            cost_r = SHADOW_S2_RULES.round_trip_cost_notional / stop_fraction
+            cost_r = self.rules.round_trip_cost_notional / stop_fraction
             net_r = gross_r - cost_r
             before = float(self.state["balance"])
             pnl = float(position["risk_amount"]) * net_r
@@ -153,14 +182,30 @@ class ShadowBook:
             losses = sum(row.get("status") == "sl_hit" for row in trades)
             gross_win = sum(max(float(row.get("net_r", 0)), 0) for row in trades)
             gross_loss = -sum(min(float(row.get("net_r", 0)), 0) for row in trades)
+            peak = self.start_balance
+            max_drawdown = 0.0
+            max_drawdown_pct = 0.0
+            for row in trades:
+                balance_after = float(row.get("balance_after", peak))
+                peak = max(peak, balance_after)
+                drawdown = max(0.0, peak - balance_after)
+                max_drawdown = max(max_drawdown, drawdown)
+                if peak > 0:
+                    max_drawdown_pct = max(max_drawdown_pct, 100 * drawdown / peak)
+            balance = float(self.state["balance"])
             return {
+                "start_balance": self.start_balance,
                 "trades": len(trades),
                 "wins": wins,
                 "losses": losses,
+                "flat": len(trades) - wins - losses,
                 "win_rate_pct": 100 * wins / len(trades) if trades else None,
-                "balance": float(self.state["balance"]),
-                "net_pct": (float(self.state["balance"]) / 100.0 - 1) * 100,
+                "balance": balance,
+                "pnl_usdt": balance - self.start_balance,
+                "net_pct": (balance / self.start_balance - 1) * 100,
                 "profit_factor": gross_win / gross_loss if gross_loss else None,
+                "max_drawdown_usdt": max_drawdown,
+                "max_drawdown_pct": max_drawdown_pct,
                 "open": len(self.state["positions"]),
             }
 

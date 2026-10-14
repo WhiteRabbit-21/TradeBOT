@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime
+import os
 import re
 from typing import Optional
 from zoneinfo import ZoneInfo
@@ -58,6 +59,16 @@ A3 = StrategyDecision("A3", 0.60, (0.40, 0.30, 0.30), True, 0.05)
 RR1_3 = StrategyDecision("RR1_3", 1.0, (1.0, 0.0, 0.0), False)
 KYIV_TZ = ZoneInfo("Europe/Kyiv")
 
+# Kill switch for NEW live entries. Paused by default after the October 2026
+# drawdown: a 13-month replay showed RR1-3 entries have negative expectancy.
+# Open positions keep being managed (SL/TP/close). Resume only deliberately by
+# setting LIVE_ENTRIES_PAUSED=0 in the service environment.
+PAUSED_REASON = "live entries paused (LIVE_ENTRIES_PAUSED=1): RR1-3 under review"
+
+
+def live_entries_paused() -> bool:
+    return os.getenv("LIVE_ENTRIES_PAUSED", "1").strip() != "0"
+
 
 def _kyiv_minute(now: Optional[datetime]) -> int:
     current = now or datetime.now(KYIV_TZ)
@@ -84,6 +95,8 @@ def select_strategy(
     stop_distance_pct: float, now: Optional[datetime] = None,
 ) -> tuple[Optional[StrategyDecision], Optional[str]]:
     """Select the only live setup: weekday LONG INTRADAY with 1<=RR1<=3."""
+    if live_entries_paused():
+        return None, PAUSED_REASON
     normalized_style = str(style or "").strip().upper()
     if str(side or "").strip().lower() != "long":
         return None, "live RR1-3 strategy allows LONG only"

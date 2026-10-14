@@ -1,14 +1,21 @@
+import os
 import unittest
+from unittest import mock
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
-from trade_rules import select_legacy_combined_strategy, select_strategy
+from trade_rules import PAUSED_REASON, select_legacy_combined_strategy, select_strategy
 
 
 KYIV = ZoneInfo("Europe/Kyiv")
 
 
 class LiveRRStrategyTests(unittest.TestCase):
+    def setUp(self):
+        patcher = mock.patch.dict(os.environ, {"LIVE_ENTRIES_PAUSED": "0"})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
     def select(self, **overrides):
         values = {
             "style": "INTRADAY",
@@ -67,3 +74,29 @@ class LegacyCombinedShadowTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class LiveEntriesPauseTests(unittest.TestCase):
+    VALID = {
+        "style": "INTRADAY", "side": "long", "signal_text": "", "rr1": 2.0,
+        "stop_distance_pct": 4.0, "now": datetime(2026, 9, 16, 12, 0, tzinfo=KYIV),
+    }
+
+    def test_paused_by_default_when_env_missing(self):
+        with mock.patch.dict(os.environ, {}, clear=True):
+            decision, reason = select_strategy(**self.VALID)
+        self.assertIsNone(decision)
+        self.assertEqual(reason, PAUSED_REASON)
+
+    def test_paused_for_any_value_except_zero(self):
+        for value in ("1", "true", "", "yes"):
+            with mock.patch.dict(os.environ, {"LIVE_ENTRIES_PAUSED": value}):
+                decision, reason = select_strategy(**self.VALID)
+            self.assertIsNone(decision)
+            self.assertEqual(reason, PAUSED_REASON)
+
+    def test_resumes_only_with_explicit_zero(self):
+        with mock.patch.dict(os.environ, {"LIVE_ENTRIES_PAUSED": "0"}):
+            decision, reason = select_strategy(**self.VALID)
+        self.assertIsNone(reason)
+        self.assertEqual(decision.rule_id, "RR1_3")

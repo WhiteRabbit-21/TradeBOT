@@ -18,7 +18,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     env:
-      DATA_DIR: ${{ runner.temp }}/tradebot-tests
+      DATA_DIR: .ci-data
       DRY_RUN: "1"
       WAIT_FOR_CONFIG: "0"
     steps:
